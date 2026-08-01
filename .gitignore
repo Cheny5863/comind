@@ -1,0 +1,16 @@
+node_modules
+.DS_Store
+dist_electron
+dist/
+build/
+simple-mind-map/dist
+simple-mind-map/types
+utools/dist
+__pycache__/
+data/
+private/
+.pytest_cache/
+*.log
+dist-release/
+*.bak
+*.spec

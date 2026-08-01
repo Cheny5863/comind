@@ -1,0 +1,14 @@
+---
+name: Feature request
+about: 建议新功能 / Suggest a feature
+title: '[feat] '
+labels: enhancement
+---
+
+**你想解决什么问题？ What problem does this solve?**
+
+**你的想法 / Your idea**
+
+**其他 / Additional context**
+
+<!-- 注意：面向用户的新功能需同步提供中英双语文案（见 CONTRIBUTING.md i18n 要求） -->

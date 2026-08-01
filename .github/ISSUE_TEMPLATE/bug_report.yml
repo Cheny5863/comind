@@ -1,0 +1,25 @@
+---
+name: Bug report
+about: 报告问题 / Report a bug
+title: '[bug] '
+labels: bug
+---
+
+**环境 Environment**（必填 required）
+- OS: （如 Ubuntu 24.04 / macOS / Windows）
+- 浏览器 Browser: （如 Chrome 130）
+- 安装方式 Install method: （一键部署 binary / 源码 source）
+
+**复现步骤 Steps to reproduce**
+
+1.
+2.
+3.
+
+**期望行为 Expected behavior**
+
+**实际行为 Actual behavior**
+
+**日志/截图 Logs or screenshots**
+
+<!-- 后端日志：systemctl status smm / journalctl --user -u smm -n 50 -->

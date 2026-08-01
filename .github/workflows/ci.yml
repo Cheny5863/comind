@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          pip install fastapi uvicorn pydantic pytest httpx2
+          cd simple-mind-map && npm ci --production && cd ../web && npm ci && ln -s ../../simple-mind-map node_modules/simple-mind-map
+
+      - name: Backend tests (pytest)
+        run: pytest
+
+      - name: Frontend build
+        run: cd web && npm run build
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          pip install fastapi uvicorn pydantic pyinstaller
+          cd simple-mind-map && npm ci --production && cd ../web && npm ci && ln -s ../../simple-mind-map node_modules/simple-mind-map
+
+      - name: Build release package
+        run: |
+          echo "${GITHUB_REF#refs/tags/v}" > VERSION
+          bash scripts/release.sh
+
+      - name: Smoke test (extract, start, check endpoints)
+        run: |
+          cd dist-release && rm -rf smoke && mkdir smoke
+          tar xzf comind--linux-x64-*.tar.gz -C smoke --strip-components=1
+          ./smoke/comind-server/comind-server & sleep 8
+          curl -fsS localhost:8789/api/version
+          curl -fsS -o /dev/null localhost:8789/
+          curl -fsS -o /dev/null localhost:8789/dist/js/app.js
+          curl -fsS -o /dev/null localhost:8789/ai-assistant/ai-assistant.js
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/comind--linux-x64-*.tar.gz
+          generate_release_notes: true

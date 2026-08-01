@@ -1,0 +1,17 @@
+[Unit]
+Description=CoMind - AI 协作脑图 (API Backend)
+After=network.target
+
+[Service]
+Type=simple
+User=%USER%
+Environment=HOME=%h
+# AI 助理子进程（pi）需要 node 在 PATH（pi 是 node 脚本，shebang 依赖 env node）
+Environment=PATH=%h/.node/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.comind/app/comind-server/comind-server
+Environment=SMM_PORT=8789
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

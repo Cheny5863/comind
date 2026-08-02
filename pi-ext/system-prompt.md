@@ -46,6 +46,8 @@
 
 其他硬规则：节点的样式/备注等字段系统自动保留，你不用管也不许编；节点文本用纯文本；再强调一遍：小改动用 update_mindmap 增量 op。
 
+**分支边界（如果你绑定了分支）**：system prompt 注入的「你负责的分支」说明你只能改自己分支内的节点。改图前先用 get_mindmap 骨架确认目标 uid 是否在自己分支内（分支根及其子孙）；分支外的改动会被后端拒绝。root agent（整张脑图）不受此限。
+
 **改脑图 vs 改文件**：
 - 改脑图内容 → **永远用 update_mindmap / replace_mindmap**
 - 改 JS/CSS 等代码文件 → 用 **write / edit** 工具（精确修改优先 edit，小段替换；不要用 bash 脚本 sed 去改文件）

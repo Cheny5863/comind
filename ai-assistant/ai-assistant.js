@@ -6,12 +6,18 @@
   const I18N = {
     zh: {
       assistant: "AI 助理",
-      newChat: "新建对话",
-      history: "历史会话",
+      newChat: "新建 Agent（绑定当前选中节点分支；未选中 = 整张脑图）",
+      history: "Agent / 历史会话",
       modelSettings: "模型设置",
       modelTitle: "切换模型",
       background: "背景信息",
       close: "关闭",
+      agents: "Agents",
+      rootAgent: "整张脑图",
+      newAgentBranch: "新建分支 Agent",
+      noAgents: "暂无其他 Agent",
+      switchAgent: "切换 Agent",
+      activeAgent: "当前",
       inputPlaceholder: "输入问题…（Ctrl+J 求助当前节点）",
       send: "发送 ➤",
       abort: "中止 ■",
@@ -23,6 +29,7 @@
       thinking: "思考中…",
       mapUpdated: "🗺️ <em>脑图已更新</em>",
       noHistory: "暂无历史会话",
+      noNodeSelected: "请先选中一个节点，再新建分支 Agent",
       nMessages: " 条",
       aborting: "正在终止…",
       switchingModel: "切换模型…",
@@ -40,12 +47,18 @@
     },
     en: {
       assistant: "AI Assistant",
-      newChat: "New chat",
-      history: "History",
+      newChat: "New Agent (bind to selected node's branch; none = whole map)",
+      history: "Agents / History",
       modelSettings: "Model Settings",
       modelTitle: "Switch model",
       background: "Background",
       close: "Close",
+      agents: "Agents",
+      rootAgent: "Whole map",
+      newAgentBranch: "New branch agent",
+      noAgents: "No other agents",
+      switchAgent: "Switch agent",
+      activeAgent: "Active",
       inputPlaceholder: "Ask a question… (Ctrl+J to assist the current node)",
       send: "Send ➤",
       abort: "Stop ■",
@@ -57,6 +70,7 @@
       thinking: "Thinking…",
       mapUpdated: "🗺️ <em>Mind map updated</em>",
       noHistory: "No sessions yet",
+      noNodeSelected: "Select a node first to create a branch agent",
       nMessages: " msgs",
       aborting: "Stopping…",
       switchingModel: "Switching model…",
@@ -113,10 +127,15 @@
   let _streaming = false;
   let _currentBubble = null;
   let _mindMap = null;
+  let _currentBranch = "";   // "" = root agent（整张脑图）；非空 = 绑定分支 uid
+  let _agents = [];          // 该脑图的所有 agent 列表（root + 各分支）
 
   function mapKey() { return window.currentFileName || ""; }
-  function api(suffix) {
-    return "/api/chat/" + encodeURIComponent(mapKey()) + "/" + suffix;
+  function api(suffix, branch) {
+    const b = branch !== undefined ? branch : _currentBranch;
+    let url = "/api/chat/" + encodeURIComponent(mapKey()) + "/" + suffix;
+    if (b) url += (url.indexOf("?") >= 0 ? "&" : "?") + "branch=" + encodeURIComponent(b);
+    return url;
   }
   function esc(s) {
     const d = document.createElement("div");
@@ -140,7 +159,8 @@
     panel.id = "ai-panel"; panel.className = "ai-panel hidden";
     panel.innerHTML = `
       <div class="ai-header" id="ai-header">
-        <span class="ai-title">${t("assistant")}</span>
+        <span class="ai-title" id="ai-title">${t("assistant")}</span>
+        <span class="ai-agent-label" id="ai-agent-label" title="${t("switchAgent")}"></span>
         <span class="ai-status" id="ai-status"></span>
         <select class="ai-model-select" id="ai-model" title="${t("modelTitle")}"></select>
         <button class="ai-btn-sm" id="ai-new" title="${t("newChat")}">＋</button>
@@ -150,6 +170,7 @@
         <button class="ai-btn-sm" id="ai-close" title="${t("close")}">✕</button>
       </div>
       <div class="ai-session-list hidden" id="ai-session-list"></div>
+      <div class="ai-agent-list hidden" id="ai-agent-list"></div>
       <div class="ai-messages" id="ai-messages"></div>
       <div class="ai-input-area">
         <div class="ai-input-wrap">
@@ -182,8 +203,8 @@
     document.getElementById("ai-close").addEventListener("click", togglePanel);
     document.getElementById("ai-send").addEventListener("click", sendMessage);
     document.getElementById("ai-abort").addEventListener("click", abortChat);
-    document.getElementById("ai-new").addEventListener("click", resetChat);
-    document.getElementById("ai-hist").addEventListener("click", toggleSessions);
+    document.getElementById("ai-new").addEventListener("click", newAgent);
+    document.getElementById("ai-hist").addEventListener("click", toggleAgents);
     document.getElementById("ai-bg").addEventListener("click", openBg);
     document.getElementById("ai-bg-close").addEventListener("click", closeBg);
     document.getElementById("ai-bg-save").addEventListener("click", saveBg);
@@ -191,6 +212,8 @@
     document.getElementById("ai-keys-close").addEventListener("click", closeKeys);
     document.getElementById("ai-keys-list").addEventListener("click", onKeysListClick);
     document.getElementById("ai-model").addEventListener("change", onModelChange);
+    // agent 列表事件委托：切换 agent / 展开该 agent 的历史会话
+    document.getElementById("ai-agent-list").addEventListener("click", onAgentListClick);
 
     const input = document.getElementById("ai-input");
     input.addEventListener("keydown", onInputKeydown);
@@ -231,7 +254,7 @@
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ open: !nowHidden }),
     }).catch(() => {});
-    if (!nowHidden) { loadHistory(); connectSSE(); loadModels(); recoverStreamState(); } else { disconnectSSE(); }
+    if (!nowHidden) { loadHistory(); connectSSE(); loadModels(); recoverStreamState(); refreshAgents(); } else { disconnectSSE(); }
   }
   function openPanelFlash() {
     const panel = document.getElementById("ai-panel");
@@ -388,30 +411,136 @@
     }).catch(() => {});
   }
 
-  /* ── 会话列表 ── */
-  function toggleSessions() {
-    const list = document.getElementById("ai-session-list");
-    if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
-    fetch(api("sessions")).then((r) => r.json()).then((items) => {
-      list.innerHTML = "";
-      if (!items.length) {
-        list.innerHTML = '<div class="ai-session-item">' + t("noHistory") + '</div>';
-      }
-      items.forEach((it) => {
-        const div = document.createElement("div");
-        div.className = "ai-session-item" + (it.active ? " active" : "");
-        const d = new Date(it.modified * 1000);
-        div.innerHTML = "<span>" + d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" }) +
-          "</span><span>" + it.user_messages + t("nMessages") + "</span>";
-        div.title = it.name;
-        div.addEventListener("click", () => switchSession(it.file));
-        list.appendChild(div);
-      });
-      list.classList.remove("hidden");
+  /* ── Agent 列表（多 agent 并行）── */
+  function loadAgentLabel() {
+    const el = document.getElementById("ai-agent-label");
+    if (!el) return;
+    const ag = _agents.find((a) => (a.branch_uid || "") === _currentBranch);
+    el.textContent = (ag && ag.label) ? ag.label : (_currentBranch ? _currentBranch.slice(0, 8) : t("rootAgent"));
+    el.classList.toggle("is-branch", !!_currentBranch);
+  }
+  function refreshAgents(cb) {
+    fetch(api("agents")).then((r) => r.json()).then((list) => {
+      _agents = list || [];
+      loadAgentLabel();
+      if (cb) cb(_agents);
     }).catch(() => {});
   }
-  function switchSession(file) {
-    fetch(api("switch"), {
+  function toggleAgents() {
+    const list = document.getElementById("ai-agent-list");
+    const sl = document.getElementById("ai-session-list");
+    if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
+    sl.classList.add("hidden");
+    refreshAgents((agents) => {
+      list.innerHTML = "";
+      const title = document.createElement("div");
+      title.className = "ai-agent-group";
+      title.textContent = t("agents");
+      list.appendChild(title);
+      agents.forEach((ag) => {
+        const div = document.createElement("div");
+        const isActive = (ag.branch_uid || "") === _currentBranch;
+        div.className = "ai-agent-item" + (isActive ? " active" : "") +
+          (ag.streaming ? " streaming" : "");
+        div.dataset.branch = ag.branch_uid || "";
+        const label = ag.label || (ag.branch_uid ? ag.branch_uid.slice(0, 8) : t("rootAgent"));
+        const badge = ag.streaming ? ' <span class="ai-agent-badge">💭</span>' : "";
+        const act = isActive ? ' <span class="ai-agent-badge">' + t("activeAgent") + "</span>" : "";
+        div.innerHTML = "<span class='ai-agent-name'>" + esc(label) + badge + act + "</span>" +
+          (ag.branch_uid ? "<span class='ai-agent-hist' data-role='hist'>📂</span>" : "");
+        list.appendChild(div);
+      });
+      const newRow = document.createElement("div");
+      newRow.className = "ai-agent-item ai-agent-new";
+      newRow.textContent = "＋ " + t("newAgentBranch");
+      newRow.addEventListener("click", () => {
+        const node = activeNode();
+        if (node) {
+          newAgentFor(node.nodeData.data.uid || "");
+        } else {
+          toast(t("noNodeSelected"));
+        }
+      });
+      list.appendChild(newRow);
+      list.classList.remove("hidden");
+    });
+  }
+  function onAgentListClick(e) {
+    const item = e.target.closest(".ai-agent-item");
+    if (!item || item.classList.contains("ai-agent-new")) return;
+    const histBtn = e.target.closest("[data-role='hist']");
+    if (histBtn) {
+      // 展开该 agent 的历史会话（分支 agent 专用）
+      const branch = item.dataset.branch || "";
+      toggleSessions(branch);
+      return;
+    }
+    switchAgent(item.dataset.branch || "");
+  }
+  function switchAgent(branch) {
+    if ((branch || "") === _currentBranch) {
+      document.getElementById("ai-agent-list").classList.add("hidden");
+      return;
+    }
+    _currentBranch = branch || "";
+    disconnectSSE();
+    document.getElementById("ai-messages").innerHTML = "";
+    document.getElementById("ai-session-list").classList.add("hidden");
+    document.getElementById("ai-agent-list").classList.add("hidden");
+    loadAgentLabel();
+    loadHistory();
+    connectSSE();
+    recoverStreamState();
+  }
+  function newAgent() {
+    // 新建 agent：绑定当前选中节点所在分支；未选中 = 整张脑图（root）
+    const node = activeNode();
+    newAgentFor(node ? (node.nodeData.data.uid || "") : "");
+  }
+  function newAgentFor(branch) {
+    // reset 该 (map, branch) 的会话 = 新开一个空会话；旧会话文件保留在历史里
+    fetch(api("reset", branch), { method: "POST" }).then(() => {
+      _currentBranch = branch || "";
+      disconnectSSE();
+      document.getElementById("ai-messages").innerHTML = "";
+      document.getElementById("ai-session-list").classList.add("hidden");
+      document.getElementById("ai-agent-list").classList.add("hidden");
+      loadAgentLabel();
+      refreshAgents();
+      connectSSE();
+      recoverStreamState();
+    }).catch(() => {});
+  }
+
+  /* ── 历史会话（当前 agent 的）── */
+  function toggleSessions(branch) {
+    const list = document.getElementById("ai-session-list");
+    if (!list.classList.contains("hidden") && (branch || "") === _currentBranch) {
+      list.classList.add("hidden"); return;
+    }
+    fetch(api("sessions", branch !== undefined ? branch : _currentBranch))
+      .then((r) => r.json()).then((items) => {
+        list.innerHTML = "";
+        if (!items.length) {
+          list.innerHTML = '<div class="ai-session-item">' + t("noHistory") + '</div>';
+        }
+        items.forEach((it) => {
+          const div = document.createElement("div");
+          div.className = "ai-session-item" + (it.active ? " active" : "");
+          const d = new Date(it.modified * 1000);
+          div.innerHTML = "<span>" + d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" }) +
+            "</span><span>" + it.user_messages + t("nMessages") + "</span>";
+          div.title = it.name;
+          div.dataset.file = it.file;
+          div.dataset.branch = branch !== undefined ? branch : _currentBranch;
+          div.addEventListener("click", () => switchSession(it.file, branch !== undefined ? branch : _currentBranch));
+          list.appendChild(div);
+        });
+        list.classList.remove("hidden");
+      }).catch(() => {});
+  }
+  function switchSession(file, branch) {
+    fetch(api("switch", branch), {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_file: file }),
     }).then(() => {
@@ -452,7 +581,7 @@
     syncMap().then(() => {
       fetch(api("prompt"), {
         method: "POST", headers: { "Content-Type": "application/json", "X-Lang": lang() },
-        body: JSON.stringify({ message: msg || t("nodeAssistFallback"), context }),
+        body: JSON.stringify({ message: msg || t("nodeAssistFallback"), context, branch_uid: _currentBranch }),
       }).catch(() => {});
     });
   }
@@ -470,11 +599,6 @@
     }, 1000);
     // Safety: stop polling after 10s regardless
     setTimeout(function() { clearInterval(_abortPoll); }, 10000);
-  }
-  function resetChat() {
-    fetch(api("reset"), { method: "POST" }).then(() => {
-      document.getElementById("ai-messages").innerHTML = "";
-    }).catch(() => {});
   }
 
   function onInputKeydown(e) {

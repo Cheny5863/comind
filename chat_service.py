@@ -75,6 +75,41 @@ def _background_text(map_key: str) -> str:
     return ""
 
 
+def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> str:
+    """取分支根节点的文本标签，用于注入 system prompt 分支职责说明。
+
+    state 是 _map_state 中该脑图的 mindMapData（可选）；优先用它，找不到
+    兜底从磁盘脑图文件找。都找不到返回 uid 本身。
+    """
+    label = branch_uid
+    try:
+        if state:
+            root = _state_root(state)
+            if isinstance(root, dict):
+                idx = _index_by_uid(root)
+                node = idx.get(branch_uid)
+                if node and isinstance(node.get("data"), dict):
+                    t = _strip_html(node["data"].get("text", ""))
+                    if t:
+                        return t[:40]
+        # 磁盘兜底
+        fpath = Path(PROJECT_CWD) / map_key
+        if map_key.endswith(".smm.json") and fpath.is_file():
+            doc = json.loads(fpath.read_text())
+            md = doc.get("mindMapData") or {}
+            root = _state_root(md)
+            if isinstance(root, dict):
+                idx = _index_by_uid(root)
+                node = idx.get(branch_uid)
+                if node and isinstance(node.get("data"), dict):
+                    t = _strip_html(node["data"].get("text", ""))
+                    if t:
+                        return t[:40]
+    except Exception:
+        pass
+    return label
+
+
 # provider id → 环境变量名（也用作 private/keys.json 的键名）
 PROVIDER_ENV = {
     "deepseek": "DEEPSEEK_API_KEY",
@@ -177,19 +212,41 @@ def safe_key_slug(map_key: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", map_key)
 
 
-def _new_session_filename(map_key: str) -> str:
+def _new_session_filename(map_key: str, branch_uid: str = "") -> str:
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y-%m-%dT%H-%M-%S") + f"-{now.microsecond // 1000:03d}Z"
-    return f"{safe_key_slug(map_key)}__{stamp}.jsonl"
+    slug = safe_key_slug(map_key)
+    if branch_uid:
+        # 分支 session 文件带分支标识，避免与 root 会话混淆；root 保持原名（兼容旧数据）
+        branch_slug = safe_key_slug(branch_uid)[:8]
+        return f"{slug}__{branch_slug}__{stamp}.jsonl"
+    return f"{slug}__{stamp}.jsonl"
+
+
+def session_key(map_key: str, branch_uid: str = "") -> str:
+    """多 agent 的会话键：map_key::branch_uid（root agent 的 branch_uid 为空串）。"""
+    return f"{map_key}::{branch_uid}" if branch_uid else map_key
+
+
+def split_session_key(key: str) -> tuple[str, str]:
+    """把会话键拆回 (map_key, branch_uid)。兼容旧格式（无 :: 视为 root）。"""
+    if "::" in key:
+        m, b = key.rsplit("::", 1)
+        return m, b
+    return key, ""
 
 
 class ChatSession:
-    """Wraps one pi --mode rpc subprocess for a single mind-map key."""
+    """Wraps one pi --mode rpc subprocess for a single (map, branch) pair."""
 
-    def __init__(self, map_key: str, session_file: str | None = None, lang: str = "zh"):
+    def __init__(self, map_key: str, branch_uid: str = "", session_file: str | None = None, lang: str = "zh",
+                 map_state: dict | None = None):
         self.map_key = map_key
+        self.branch_uid = branch_uid or ""  # "" = root agent (full map)
         self.session_file = session_file
         self.lang = lang
+        # manager._map_state 的引用（只读用，查分支名）；None 时 _branch_label 走磁盘兜底
+        self._map_state = map_state
         self.proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.listeners: list[Queue] = []
@@ -206,11 +263,12 @@ class ChatSession:
         if not self.session_file:
             # Name the session file ourselves so history listing is a simple
             # glob per map key. pi creates the file at the given path.
-            self.session_file = str(SESSION_DIR / _new_session_filename(self.map_key))
+            self.session_file = str(SESSION_DIR / _new_session_filename(self.map_key, self.branch_uid))
         env = dict(os.environ)
         env.update(PROVIDER_KEYS)
         env["SMM_API_BASE"] = os.environ.get("SMM_API_BASE", "http://localhost:8789")
         env["MAP_KEY"] = self.map_key
+        env["BRANCH_UID"] = self.branch_uid
 
         system_prompt = ""
         if PROMPT_PATH.is_file():
@@ -222,6 +280,25 @@ class ChatSession:
                 "下面是你所在脑图的背景信息（自动注入，无需调 get_background）：\n\n"
                 + bg
                 + "\n"
+            )
+        # 分支职责：绑定分支的 agent 只能改自己的分支，root agent 管全图
+        if self.branch_uid:
+            state = (self._map_state or {}).get(self.map_key)
+            branch_label = _branch_label(self.map_key, self.branch_uid, state)
+            system_prompt += (
+                "\n\n## 你负责的分支（重要）\n\n"
+                f"你绑定在脑图的分支「{branch_label}」（根节点 uid={self.branch_uid}）上工作。\n"
+                "- **看**：你可以查看整张脑图（get_mindmap/get_subtree/get_mindmap_diff 返回全图结构），理解上下文。\n"
+                "- **改**：update_mindmap / replace_mindmap **只允许操作你分支内的节点**（分支根节点及其子孙）。\n"
+                "  涉及分支外节点的改动会被后端拒绝——其他分支由其他 agent 负责，请勿越界。\n"
+                "- 如果你认为需要改动分支外的内容，在回复里说明并建议用户找对应的 agent 或 root agent。\n"
+            )
+        else:
+            system_prompt += (
+                "\n\n## 你的职责范围（重要）\n\n"
+                "你是 root agent，负责整张脑图。可以查看和修改任意节点。\n"
+                "用户可能同时让多个分支 agent 在不同分支上并行工作；你负责全局统筹，\n"
+                "改图时注意不要破坏其他分支的结构。\n"
             )
         # 界面语言：跟随前端语言，AI 助理用同一种语言回复
         system_prompt += (
@@ -351,6 +428,8 @@ class ChatSessionManager:
         self._sessions: dict[str, ChatSession] = {}
         self._lock = threading.Lock()
         self._mapping = self._load_mapping()
+        # per-map 写锁：同一脑图的 apply_ops/apply_map 串行化，防多 agent 并发写互相覆盖
+        self._write_locks: dict[str, threading.Lock] = {}
         self._model_pref: dict[str, dict] = self._load_json(MODELS_PATH)
         self._panel_state: dict[str, bool] = self._load_json(UISTATE_PATH)
         self._lang_pref: dict[str, str] = {}  # map_key → 界面语言（zh/en…）
@@ -387,9 +466,10 @@ class ChatSessionManager:
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
         MAPPING_PATH.write_text(json.dumps(self._mapping, indent=2))
 
-    def get_or_spawn(self, map_key: str) -> ChatSession:
+    def get_or_spawn(self, map_key: str, branch_uid: str = "") -> ChatSession:
+        skey = session_key(map_key, branch_uid)
         with self._lock:
-            sess = self._sessions.get(map_key)
+            sess = self._sessions.get(skey)
             if sess and sess.alive:
                 return sess
             # Evict the longest-idle session if at max
@@ -399,11 +479,11 @@ class ChatSessionManager:
                 if evictable:
                     oldest = min(evictable, key=lambda s: s.last_active)
                     oldest.kill()
-                    self._sessions.pop(oldest.map_key, None)
-            session_file = self._mapping.get(map_key)
-            sess = ChatSession(map_key, session_file, self._lang_pref.get(map_key, "zh"))
+                    self._sessions.pop(session_key(oldest.map_key, oldest.branch_uid), None)
+            session_file = self._mapping.get(skey)
+            sess = ChatSession(map_key, branch_uid, session_file, self._lang_pref.get(skey, "zh"), self._map_state)
             sess.spawn()
-            self._sessions[map_key] = sess
+            self._sessions[skey] = sess
             # Re-apply the user's model choice to the fresh pi process
             pref = self._model_pref.get(map_key)
             if pref:
@@ -412,15 +492,17 @@ class ChatSessionManager:
                 ).start()
             # Persist the key → session-file binding eagerly; this is what
             # makes history survive restarts.
-            if sess.session_file and self._mapping.get(map_key) != sess.session_file:
-                self._mapping[map_key] = sess.session_file
+            if sess.session_file and self._mapping.get(skey) != sess.session_file:
+                self._mapping[skey] = sess.session_file
                 self._save_mapping()
             return sess
 
-    def prompt(self, map_key: str, message: str, context: dict | None = None, lang: str | None = None) -> None:
+    def prompt(self, map_key: str, message: str, context: dict | None = None, lang: str | None = None,
+               branch_uid: str = "") -> None:
+        skey = session_key(map_key, branch_uid)
         if lang:
-            self._lang_pref[map_key] = lang
-        sess = self.get_or_spawn(map_key)
+            self._lang_pref[skey] = lang
+        sess = self.get_or_spawn(map_key, branch_uid)
         parts = []
         if context:
             quoted = context.get("quoted_node")
@@ -436,8 +518,8 @@ class ChatSessionManager:
         full_msg = "\n".join(parts)
         sess.send({"type": "prompt", "message": full_msg})
 
-    def abort(self, map_key: str) -> bool:
-        sess = self._sessions.get(map_key)
+    def abort(self, map_key: str, branch_uid: str = "") -> bool:
+        sess = self._sessions.get(session_key(map_key, branch_uid))
         if sess and sess.alive:
             sess.send({"type": "abort"})
             # If pi doesn't end the turn within 5s, force-kill and respawn
@@ -459,18 +541,19 @@ class ChatSessionManager:
             return True
         return False
 
-    def reset(self, map_key: str) -> None:
-        """Start a new conversation. The old session file is KEPT on disk so
-        it stays available in the history list."""
+    def reset(self, map_key: str, branch_uid: str = "") -> None:
+        """Start a new conversation for a (map, branch) pair. The old session
+        file is KEPT on disk so it stays available in the history list."""
+        skey = session_key(map_key, branch_uid)
         with self._lock:
-            sess = self._sessions.pop(map_key, None)
+            sess = self._sessions.pop(skey, None)
             if sess:
                 sess.kill()
-            self._mapping.pop(map_key, None)
+            self._mapping.pop(skey, None)
             self._save_mapping()
 
-    def events(self, map_key: str) -> Iterator[str]:
-        sess = self.get_or_spawn(map_key)
+    def events(self, map_key: str, branch_uid: str = "") -> Iterator[str]:
+        sess = self.get_or_spawn(map_key, branch_uid)
         q = sess.subscribe(replay=True)
         try:
             while True:
@@ -488,30 +571,42 @@ class ChatSessionManager:
                     yield f"event: {ev_type}\ndata: {line}\n\n"
                     # Persist mapping on session file discovery / conversation end
                     if ev_type in ("agent_start", "agent_end") and sess.session_file:
-                        if self._mapping.get(map_key) != sess.session_file:
-                            self._mapping[map_key] = sess.session_file
+                        skey = session_key(map_key, branch_uid)
+                        if self._mapping.get(skey) != sess.session_file:
+                            self._mapping[skey] = sess.session_file
                             self._save_mapping()
                 except json.JSONDecodeError:
                     yield f"event: raw\ndata: {line}\n\n"
         finally:
             sess.unsubscribe(q)
 
-    def get_history(self, map_key: str) -> list[dict]:
-        sf = self._mapping.get(map_key)
+    def get_history(self, map_key: str, branch_uid: str = "") -> list[dict]:
+        sf = self._mapping.get(session_key(map_key, branch_uid))
         if not sf or not Path(sf).is_file():
             return []
         return parse_session(Path(sf))
 
-    def list_sessions(self, map_key: str) -> list[dict]:
-        """List all saved sessions for a map key, newest first.
+    def list_sessions(self, map_key: str, branch_uid: str = "") -> list[dict]:
+        """List all saved sessions for a (map, branch), newest first.
 
-        Session files are named ``<safe_key>__<utc-timestamp>.jsonl`` by us
-        at spawn time, so a glob is authoritative — no orphan files.
+        Session files are named ``<safe_key>__<timestamp>.jsonl`` (root) or
+        ``<safe_key>__<branch_slug>__<timestamp>.jsonl`` (branch) by us
+        at spawn time, so a glob + branch-slug filter is authoritative.
         """
         prefix = safe_key_slug(map_key) + "__"
+        branch_slug = safe_key_slug(branch_uid)[:8] if branch_uid else ""
         sessions = []
         for f in sorted(SESSION_DIR.glob(f"{prefix}*.jsonl"), reverse=True):
             try:
+                # 分支 session 文件名含 __<branch_slug>__，root 不含
+                stem = f.name[len(prefix):]
+                is_branch = "__" in stem and stem.count("__") >= 2
+                if branch_uid:
+                    if not (is_branch and stem.startswith(branch_slug + "__")):
+                        continue
+                else:
+                    if is_branch:
+                        continue
                 stat = f.stat()
                 text = f.read_text()
                 user_count = text.count('"role": "user"') + text.count('"role":"user"')
@@ -521,27 +616,58 @@ class ChatSessionManager:
                     "modified": stat.st_mtime,
                     "size": stat.st_size,
                     "user_messages": user_count,
-                    "active": str(f) == self._mapping.get(map_key, ""),
+                    "active": str(f) == self._mapping.get(session_key(map_key, branch_uid), ""),
                 })
             except Exception:
                 continue
         return sessions
 
-    def switch_session(self, map_key: str, session_file: str) -> bool:
-        """Switch to a different session file for a map key."""
+    def list_agents(self, map_key: str) -> list[dict]:
+        """列出该脑图的所有 agent（root + 各分支），供前端多 agent 列表显示。
+
+        数据来源：_map_state 里的分支节点 + mapping 里已存在的会话键。
+        返回每个 agent 的 branch_uid（"" = root）、分支名、活跃会话文件、
+        是否正在流式输出。
+        """
+        agents: dict[str, dict] = {}
+        # root agent
+        root_sf = self._mapping.get(map_key)
+        agents[""] = {
+            "branch_uid": "",
+            "label": "整张脑图",
+            "session_file": root_sf,
+            "streaming": self._sessions.get(map_key, None) is not None
+            and self._sessions[map_key]._in_turn,
+        }
+        # 各分支 agent（来自 mapping 键 map_key::branch_uid）
+        for skey, sf in self._mapping.items():
+            mkey, b = split_session_key(skey)
+            if mkey != map_key or not b:
+                continue
+            sess = self._sessions.get(skey)
+            agents[b] = {
+                "branch_uid": b,
+                "label": _branch_label(map_key, b, self._map_state.get(map_key)),
+                "session_file": sf,
+                "streaming": sess is not None and sess._in_turn,
+            }
+        return sorted(agents.values(), key=lambda a: (a["branch_uid"] != "", a["label"]))
+
+    def switch_session(self, map_key: str, session_file: str, branch_uid: str = "") -> bool:
+        """Switch to a different session file for a (map, branch)."""
         path = Path(session_file)
         if not path.is_file():
             return False
-        # Only allow switching to files that belong to this map key.
-        if path.parent != SESSION_DIR or not path.name.startswith(
-            safe_key_slug(map_key) + "__"
-        ):
+        # Only allow switching to files that belong to this map key (+branch).
+        prefix = safe_key_slug(map_key) + "__"
+        if path.parent != SESSION_DIR or not path.name.startswith(prefix):
             return False
+        skey = session_key(map_key, branch_uid)
         with self._lock:
-            sess = self._sessions.pop(map_key, None)
+            sess = self._sessions.pop(skey, None)
             if sess:
                 sess.kill()
-            self._mapping[map_key] = session_file
+            self._mapping[skey] = session_file
             self._save_mapping()
         return True
 
@@ -616,9 +742,9 @@ class ChatSessionManager:
 
     # ─── 面板开关状态（服务端持久化，不依赖浏览器缓存）───
 
-    def get_status(self, map_key: str) -> dict:
+    def get_status(self, map_key: str, branch_uid: str = "") -> dict:
         """Return session streaming status for frontend state recovery."""
-        sess = self._sessions.get(map_key)
+        sess = self._sessions.get(session_key(map_key, branch_uid))
         if sess and sess.alive:
             return {"alive": True, "streaming": sess._in_turn}
         return {"alive": False, "streaming": False}
@@ -967,8 +1093,11 @@ def sync_map(manager: ChatSessionManager, key: str, data: dict) -> None:
     manager._map_state[key] = data
 
 
-def diff_map(manager: ChatSessionManager, key: str) -> dict:
+def diff_map(manager: ChatSessionManager, key: str, branch_uid: str = "") -> dict:
     """Diff current map state vs the AI-synced snapshot (by uid).
+
+    快照按 (map, branch) 隔离：每个 agent 的 diff 快照独立前移，
+    避免 A 调过 get_mindmap_diff 后 B 的增量感知被清空（多 agent 并行关键）。
 
     First call (no snapshot): returns the full slim tree and creates the
     snapshot. Subsequent calls return added/removed/changed lists and then
@@ -979,9 +1108,10 @@ def diff_map(manager: ChatSessionManager, key: str) -> dict:
     if current is None:
         return {"error": "no map state synced yet; frontend must POST /api/chat/{key}/sync first"}
     root = _state_root(current)
-    snapshot = manager._map_snapshot.get(key)
+    snap_key = session_key(key, branch_uid)
+    snapshot = manager._map_snapshot.get(snap_key)
     if snapshot is None:
-        manager._map_snapshot[key] = json.loads(json.dumps(current))
+        manager._map_snapshot[snap_key] = json.loads(json.dumps(current))
         return {
             "full": True,
             "tree": slim_tree(root, text_limit=60, note_limit=-1, show_child_count=True),
@@ -1017,8 +1147,8 @@ def diff_map(manager: ChatSessionManager, key: str) -> dict:
     for uid, node in old_idx.items():
         if uid not in cur_idx:
             removed.append(_node_summary(node))
-    # Snapshot moves forward with every diff
-    manager._map_snapshot[key] = json.loads(json.dumps(current))
+    # Snapshot moves forward with every diff — per (map, branch)
+    manager._map_snapshot[snap_key] = json.loads(json.dumps(current))
     return {"full": False, "added": added, "removed": removed, "changed": changed}
 
 
@@ -1074,10 +1204,18 @@ def _load_doc_for_write(manager: ChatSessionManager, key: str):
     return doc, file_md, old_by_uid, fpath
 
 
-def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict) -> None:
-    """提交新 mindMapData：更新内存、备份、落盘、SSE 广播。"""
+def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict, branch_uid: str = "") -> None:
+    """提交新 mindMapData：更新内存、备份、落盘、SSE 广播。
+
+    branch_uid 是写者（哪个 agent 提交的）。写者自己的 diff 快照前移
+    （自己改的不会重复出现在自己的 diff 里）；其他 agent 的快照不动，
+    这样它们下一次 get_mindmap_diff 能看到本次变化（多 agent 协作关键）。
+    """
     manager._map_state[key] = new_data
-    manager._map_snapshot[key] = json.loads(json.dumps(new_data))
+    writer_key = session_key(key, branch_uid)
+    manager._map_snapshot[writer_key] = json.loads(json.dumps(new_data))
+    # 广播 mindmap_update 给同脑图的所有 agent 会话（root + 各分支），
+    # 让并行工作的其他 agent 前端实时看到结构变化。
     fpath = Path(PROJECT_CWD) / key
     if key.endswith(".smm.json"):
         try:
@@ -1088,19 +1226,19 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
             fpath.write_text(json.dumps(doc, ensure_ascii=False, indent=2))
         except Exception as exc:
             logger.warning("persist %s failed: %s", key, exc)
-    sess = manager._sessions.get(key)
-    if sess:
-        event = json.dumps(
-            {"type": "mindmap_update", "tree": new_data.get("root")}, ensure_ascii=False
-        )
-        for q in list(sess.listeners):
-            try:
-                q.put_nowait(event)
-            except Exception:
-                pass
+    event = json.dumps(
+        {"type": "mindmap_update", "tree": new_data.get("root")}, ensure_ascii=False
+    )
+    for skey, sess in list(manager._sessions.items()):
+        if skey == key or skey.startswith(key + "::"):
+            for q in list(sess.listeners):
+                try:
+                    q.put_nowait(event)
+                except Exception:
+                    pass
 
 
-def apply_map(manager: ChatSessionManager, key: str, tree: dict) -> str | None:
+def apply_map(manager: ChatSessionManager, key: str, tree: dict, branch_uid: str = "") -> str | None:
     """AI pushes a full new root tree. Returns validation error or None.
 
     硬约束：
@@ -1108,15 +1246,22 @@ def apply_map(manager: ChatSessionManager, key: str, tree: dict) -> str | None:
     - 已有节点（按 uid）只接受 AI 对 text 的修改，其余字段一律保留原值
     - 新节点（无 uid）自动补 uid/richText/expand/isActive 默认值
     - 写盘前自动备份 .aibak
+    - 多 agent：只有 root agent（branch_uid 空）允许整树替换；分支 agent
+      整树提交会覆盖其他分支的结构，直接拒绝
+    - 同一脑图的写操作串行化（per-map 锁），防并发写互相覆盖
     """
+    if branch_uid:
+        return "分支 agent 不允许 replace_mindmap（整树替换会覆盖其他分支）；请用 update_mindmap 增量修改自己分支内的节点"
     err = _validate_tree(tree)
     if err:
         return err
-    doc, file_md, old_by_uid, _ = _load_doc_for_write(manager, key)
-    merged_root = _merge_ai_tree(tree, old_by_uid)
-    new_data = dict(file_md)
-    new_data["root"] = merged_root
-    _commit_map(manager, key, doc, new_data)
+    lock = manager._write_locks.setdefault(key, threading.Lock())
+    with lock:
+        doc, file_md, old_by_uid, _ = _load_doc_for_write(manager, key)
+        merged_root = _merge_ai_tree(tree, old_by_uid)
+        new_data = dict(file_md)
+        new_data["root"] = merged_root
+        _commit_map(manager, key, doc, new_data)
     return None
 
 
@@ -1189,7 +1334,18 @@ def _unregister_subtree(node: dict, index: dict) -> None:
         _unregister_subtree(c, index)
 
 
-def apply_ops(manager: ChatSessionManager, key: str, ops: list) -> dict:
+def _collect_branch_uids(root: dict, branch_uid: str) -> set[str] | None:
+    """返回分支根节点及其子孙的所有 uid 集合；branch_uid 空（root agent）返回 None（不限制）。"""
+    if not branch_uid:
+        return None
+    idx = _index_by_uid(root)
+    branch_node = idx.get(branch_uid)
+    if branch_node is None:
+        return set()  # 分支根不存在——拒绝一切写
+    return set(_index_by_uid(branch_node).keys())
+
+
+def apply_ops(manager: ChatSessionManager, key: str, ops: list, branch_uid: str = "") -> dict:
     """增量改图：小改动的首选路径，AI 不用生成整棵树。
 
     支持的 op：
@@ -1200,13 +1356,25 @@ def apply_ops(manager: ChatSessionManager, key: str, ops: list) -> dict:
     - {"action":"move","uid","new_parent_uid"|"new_parent_ref","index"?}
         移动节点（保留子树和全部字段；禁止移到自己/自己的子树下）
     返回 {"applied": n, "errors": [...], "created": {ref: uid}}。
+
+    多 agent 约束：
+    - 分支 agent（branch_uid 非空）：所有 op 的目标 uid 必须在分支内，
+      越界 op 报错拒绝；写操作串行化（per-map 锁）防并发覆盖
+    - root agent（branch_uid 空）：不限分支，但仍受写锁保护
     """
     if not isinstance(ops, list) or not ops:
         return {"applied": 0, "errors": ["ops 必须是非空数组"]}
+    lock = manager._write_locks.setdefault(key, threading.Lock())
+    with lock:
+        return _apply_ops_locked(manager, key, ops, branch_uid)
+
+
+def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_uid: str) -> dict:
     doc, file_md, old_by_uid, _ = _load_doc_for_write(manager, key)
     root = file_md.get("root", file_md)
     if not root or not isinstance(root, dict) or "data" not in root:
         return {"applied": 0, "errors": ["脑图为空或不存在"]}
+    allowed = _collect_branch_uids(root, branch_uid)
     applied, errors, created, refs = 0, [], {}, {}
     root_uid = root.get("data", {}).get("uid")
 
@@ -1217,10 +1385,21 @@ def apply_ops(manager: ChatSessionManager, key: str, ops: list) -> dict:
         else:
             children.append(node)
 
+    def check_allowed(uid: str, op_idx: int, what: str) -> bool:
+        """分支越界校验：allowed 为 None（root）不限制。"""
+        if allowed is None:
+            return True
+        if uid in allowed:
+            return True
+        errors.append(f"op[{op_idx}]: {what} uid {uid} 不在你的分支内（分支根 {branch_uid}）；其他分支由其他 agent 负责")
+        return False
+
     for i, op in enumerate(ops):
         action = op.get("action")
         uid = op.get("uid", "")
         if action == "update_text":
+            if not check_allowed(uid, i, "目标节点"):
+                continue
             node = old_by_uid.get(uid)
             if not node:
                 errors.append(f"op[{i}]: uid {uid} 不存在")
@@ -1231,11 +1410,15 @@ def apply_ops(manager: ChatSessionManager, key: str, ops: list) -> dict:
             node["data"]["text"] = t
             applied += 1
         elif action == "add":
-            parent = old_by_uid.get(op.get("parent_uid", ""))
+            parent_uid = op.get("parent_uid", "")
+            parent = old_by_uid.get(parent_uid)
             if parent is None and op.get("parent_ref"):
                 parent = old_by_uid.get(refs.get(op["parent_ref"], ""))
             if not parent:
                 errors.append(f"op[{i}]: 父节点不存在（parent_uid/parent_ref）")
+                continue
+            # add 的父节点必须在分支内；新增子节点天然挂在分支内
+            if not check_allowed(parent.get("data", {}).get("uid", ""), i, "父节点"):
                 continue
             node = _node_from_spec(op)
             insert_child(parent, node, op.get("index"))
@@ -1248,6 +1431,8 @@ def apply_ops(manager: ChatSessionManager, key: str, ops: list) -> dict:
             if uid == root_uid:
                 errors.append(f"op[{i}]: 不允许删除根节点")
                 continue
+            if not check_allowed(uid, i, "目标节点"):
+                continue
             node = old_by_uid.get(uid)
             if not node or not _delete_by_uid(root, uid):
                 errors.append(f"op[{i}]: uid {uid} 不存在")
@@ -1255,6 +1440,8 @@ def apply_ops(manager: ChatSessionManager, key: str, ops: list) -> dict:
             _unregister_subtree(node, old_by_uid)
             applied += 1
         elif action == "move":
+            if not check_allowed(uid, i, "目标节点"):
+                continue
             node = old_by_uid.get(uid)
             if not node:
                 errors.append(f"op[{i}]: uid {uid} 不存在")
@@ -1269,6 +1456,8 @@ def apply_ops(manager: ChatSessionManager, key: str, ops: list) -> dict:
                 errors.append(f"op[{i}]: 目标父节点不存在")
                 continue
             np_uid = new_parent.get("data", {}).get("uid", "")
+            if not check_allowed(np_uid, i, "目标父节点"):
+                continue
             if np_uid == uid or _contains_uid(node, np_uid):
                 errors.append(f"op[{i}]: 不能移动到自己或自己的子树下")
                 continue
@@ -1280,7 +1469,7 @@ def apply_ops(manager: ChatSessionManager, key: str, ops: list) -> dict:
     if applied:
         new_data = dict(file_md)
         new_data["root"] = root
-        _commit_map(manager, key, doc, new_data)
+        _commit_map(manager, key, doc, new_data, branch_uid)
     return {"applied": applied, "errors": errors, "created": created}
 
 

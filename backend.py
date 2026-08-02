@@ -252,6 +252,7 @@ def _check_map_key(map_key: str):
 class ChatPromptBody(BaseModel):
     message: str
     context: dict | None = None
+    branch_uid: str = ""
 
 class SwitchBody(BaseModel):
     session_file: str
@@ -262,6 +263,12 @@ class BackgroundBody(BaseModel):
 class ApplyBody(BaseModel):
     key: str
     tree: dict
+    branch_uid: str = ""
+
+class OpsBody(BaseModel):
+    key: str
+    ops: list
+    branch_uid: str = ""
 
 @app.post("/api/chat/{map_key}/prompt")
 def api_chat_prompt(map_key: str, body: ChatPromptBody, request: Request):
@@ -269,50 +276,55 @@ def api_chat_prompt(map_key: str, body: ChatPromptBody, request: Request):
     if len(body.message) > 8000:
         raise HTTPException(400, "消息过长（限 8000 字符） / Message too long (max 8000 chars)")
     lang = request.headers.get("X-Lang") or None
-    chat_manager.prompt(map_key, body.message, body.context, lang=lang)
+    chat_manager.prompt(map_key, body.message, body.context, lang=lang, branch_uid=body.branch_uid)
     return {"status": "ok"}
 
 @app.get("/api/chat/{map_key}/events")
-def api_chat_events(map_key: str):
+def api_chat_events(map_key: str, branch: str = ""):
     _check_map_key(map_key)
     return StreamingResponse(
-        chat_manager.events(map_key),
+        chat_manager.events(map_key, branch),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 @app.post("/api/chat/{map_key}/abort")
-def api_chat_abort(map_key: str):
+def api_chat_abort(map_key: str, branch: str = ""):
     _check_map_key(map_key)
-    return {"aborted": chat_manager.abort(map_key)}
+    return {"aborted": chat_manager.abort(map_key, branch)}
 
 @app.get("/api/chat/{map_key}/status")
-def api_chat_status(map_key: str):
+def api_chat_status(map_key: str, branch: str = ""):
     _check_map_key(map_key)
-    return chat_manager.get_status(map_key)
+    return chat_manager.get_status(map_key, branch)
 
 @app.post("/api/chat/{map_key}/reset")
-def api_chat_reset(map_key: str):
+def api_chat_reset(map_key: str, branch: str = ""):
     _check_map_key(map_key)
-    chat_manager.reset(map_key)
+    chat_manager.reset(map_key, branch)
     return {"status": "ok"}
 
 @app.post("/api/chat/{map_key}/switch")
-def api_chat_switch(map_key: str, body: SwitchBody):
+def api_chat_switch(map_key: str, body: SwitchBody, branch: str = ""):
     _check_map_key(map_key)
-    if not chat_manager.switch_session(map_key, body.session_file):
+    if not chat_manager.switch_session(map_key, body.session_file, branch):
         raise HTTPException(400, "切换失败：会话文件不存在或不属于该脑图 / Switch failed: session file not found or not owned by this map")
     return {"status": "ok"}
 
 @app.get("/api/chat/{map_key}/history")
-def api_chat_history(map_key: str):
+def api_chat_history(map_key: str, branch: str = ""):
     _check_map_key(map_key)
-    return chat_manager.get_history(map_key)
+    return chat_manager.get_history(map_key, branch)
 
 @app.get("/api/chat/{map_key}/sessions")
-def api_chat_sessions(map_key: str):
+def api_chat_sessions(map_key: str, branch: str = ""):
     _check_map_key(map_key)
-    return chat_manager.list_sessions(map_key)
+    return chat_manager.list_sessions(map_key, branch)
+
+@app.get("/api/chat/{map_key}/agents")
+def api_chat_agents(map_key: str):
+    _check_map_key(map_key)
+    return chat_manager.list_agents(map_key)
 
 class ModelBody(BaseModel):
     provider: str
@@ -425,9 +437,9 @@ def api_mindmap_subtree(key: str = Query(...), uid: str = Query(...)):
     return result
 
 @app.get("/api/mindmap/diff")
-def api_mindmap_diff(key: str = Query(...)):
+def api_mindmap_diff(key: str = Query(...), branch: str = ""):
     _check_map_key(key)
-    result = chat_service.diff_map(chat_manager, key)
+    result = chat_service.diff_map(chat_manager, key, branch)
     if "error" in result:
         raise HTTPException(400, result["error"])
     return result
@@ -435,7 +447,7 @@ def api_mindmap_diff(key: str = Query(...)):
 @app.post("/api/mindmap/apply")
 def api_mindmap_apply(body: ApplyBody):
     _check_map_key(body.key)
-    err = chat_service.apply_map(chat_manager, body.key, body.tree)
+    err = chat_service.apply_map(chat_manager, body.key, body.tree, body.branch_uid)
     if err:
         raise HTTPException(400, err)
     return {"status": "ok"}
@@ -443,11 +455,12 @@ def api_mindmap_apply(body: ApplyBody):
 class OpsBody(BaseModel):
     key: str
     ops: list
+    branch_uid: str = ""
 
 @app.post("/api/mindmap/apply_ops")
 def api_mindmap_apply_ops(body: OpsBody):
     _check_map_key(body.key)
-    result = chat_service.apply_ops(chat_manager, body.key, body.ops)
+    result = chat_service.apply_ops(chat_manager, body.key, body.ops, body.branch_uid)
     if not result["applied"] and result["errors"]:
         raise HTTPException(400, json.dumps(result["errors"], ensure_ascii=False))
     return result

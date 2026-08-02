@@ -3,7 +3,9 @@ import { Type } from "typebox";
 
 const API_BASE = process.env.SMM_API_BASE || "http://localhost:8789";
 const MAP_KEY = process.env.MAP_KEY || "";
+const BRANCH_UID = process.env.BRANCH_UID || "";
 const K = encodeURIComponent(MAP_KEY);
+const B = encodeURIComponent(BRANCH_UID);
 
 async function apiFetch(path: string, init?: RequestInit): Promise<string> {
   const url = `${API_BASE}${path}`;
@@ -70,7 +72,7 @@ export default function (pi: ExtensionAPI) {
       "获取脑图自上次同步以来的增量变化（新增/删除/修改的节点列表）。每次收到用户消息后先调它跟上用户思路；首轮返回骨架（结构完整、文本截断，细节用 get_subtree）。",
     parameters: Type.Object({}),
     async execute() {
-      const raw = await apiFetch(`/api/mindmap/diff?key=${K}`);
+      const raw = await apiFetch(`/api/mindmap/diff?key=${K}&branch=${B}`);
       return { content: [{ type: "text" as const, text: truncate(raw, 16000) }], details: {} };
     },
   });
@@ -116,7 +118,7 @@ export default function (pi: ExtensionAPI) {
       const raw = await apiFetch(`/api/mindmap/apply_ops`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: MAP_KEY, ops: params.ops }),
+        body: JSON.stringify({ key: MAP_KEY, ops: params.ops, branch_uid: BRANCH_UID }),
       });
       const isErr = raw.includes('"error"');
       return { content: [{ type: "text" as const, text: truncate(raw, 2000) }], details: {}, isError: isErr };
@@ -136,7 +138,7 @@ export default function (pi: ExtensionAPI) {
       const raw = await apiFetch(`/api/mindmap/apply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: MAP_KEY, tree: params.root }),
+        body: JSON.stringify({ key: MAP_KEY, tree: params.root, branch_uid: BRANCH_UID }),
       });
       const isErr = raw.includes('"error"');
       return { content: [{ type: "text" as const, text: truncate(raw, 2000) }], details: {}, isError: isErr };

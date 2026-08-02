@@ -183,6 +183,24 @@
 .ai-session-item {
   display: flex; align-items: center; gap: 6px;
 }
+/* 未读红点（有新回复且未查看） */
+.ai-dot {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: #f56c6c; box-shadow: 0 0 0 2px rgba(245,108,108,.22);
+}
+/* 进行中 spinner（该 session 正在流式输出） */
+.ai-spin {
+  flex: none; width: 10px; height: 10px; border-radius: 50%;
+  border: 2px solid #e6a23c; border-top-color: transparent;
+  animation: aiSpin .8s linear infinite;
+}
+@keyframes aiSpin { to { transform: rotate(360deg); } }
+/* header 后台活跃计数 badge */
+.ai-busy {
+  flex: none; font-size: 11px; color: #fff; background: rgba(0,0,0,.28);
+  border-radius: 8px; padding: 1px 6px; cursor: default;
+  white-space: nowrap;
+}
 .ai-session-time { flex: none; }
 .ai-session-branch {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

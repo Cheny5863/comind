@@ -44,6 +44,10 @@
       saveFailed: "保存失败",
       clearedKey: "已清除 {name} key",
       savedKey: "已保存，服务已重启生效",
+      agentStarted: "🔧 分支「{name}」开始工作",
+      agentDone: "✅ 分支「{name}」已完成回复",
+      busyTitle: "后台 agent 正在工作",
+      working: "工作中…",
     },
     en: {
       assistant: "AI Assistant",
@@ -85,6 +89,10 @@
       saveFailed: "Save failed",
       clearedKey: "Cleared {name} key",
       savedKey: "Saved, service restarted",
+      agentStarted: "🔧 Branch \"{name}\" started working",
+      agentDone: "✅ Branch \"{name}\" finished",
+      busyTitle: "Background agents working",
+      working: "Working…",
     },
   };
   let _lang = null;
@@ -131,6 +139,20 @@
   let _agents = [];          // 该脑图的所有 agent 列表（root + 各分支）
   let _pendingBranchLabel = "";  // 新建分支 agent 时的节点文本（agents 刷新前临时显示）
   let _currentSessionFile = "";  // 当前正在查看的 session 文件（前端维护，历史列表高亮用）
+  let _pollTimer = null;         // 后台 agent 状态轮询（面板打开期间每 3s）
+  let _agentsSnapshot = {};      // 上次轮询的 branch_uid → streaming，用于检测开始/完成
+
+  /* ── 已读标记：localStorage 记每个 session 最后查看时间，历史列表据此显示未读红点 ── */
+  function readTs(file) {
+    try {
+      const v = localStorage.getItem("comind_read_ts:" + mapKey() + ":" + file);
+      return v ? parseFloat(v) : 0;
+    } catch (_) { return 0; }
+  }
+  function markRead(file) {
+    if (!file) return;
+    try { localStorage.setItem("comind_read_ts:" + mapKey() + ":" + file, String(Date.now() / 1000)); } catch (_) {}
+  }
 
   function mapKey() { return window.currentFileName || ""; }
   function api(suffix, branch) {
@@ -163,6 +185,7 @@
       <div class="ai-header" id="ai-header">
         <span class="ai-title" id="ai-title">${t("assistant")}</span>
         <span class="ai-agent-label" id="ai-agent-label" title="${t("switchAgent")}"></span>
+        <span class="ai-busy hidden" id="ai-busy" title="${t("busyTitle")}"></span>
         <span class="ai-status" id="ai-status"></span>
         <select class="ai-model-select" id="ai-model" title="${t("modelTitle")}"></select>
         <button class="ai-btn-sm" id="ai-new" title="${t("newChat")}">＋</button>
@@ -255,7 +278,7 @@
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ open: !nowHidden }),
     }).catch(() => {});
-    if (!nowHidden) { loadHistory(); connectSSE(); loadModels(); recoverStreamState(); refreshAgents(); } else { disconnectSSE(); }
+    if (!nowHidden) { loadHistory(); connectSSE(); loadModels(); recoverStreamState(); refreshAgents(); startPolling(); } else { disconnectSSE(); stopPolling(); }
   }
   function openPanelFlash() {
     const panel = document.getElementById("ai-panel");
@@ -430,8 +453,49 @@
       loadAgentLabel();
       // 同步当前查看的 session：当前分支的活跃会话文件
       const cur = _agents.find((a) => (a.branch_uid || "") === _currentBranch);
-      if (cur && cur.session_file) _currentSessionFile = cur.session_file;
+      if (cur && cur.session_file) {
+        _currentSessionFile = cur.session_file;
+        markRead(_currentSessionFile);  // 正在查看 = 已读，历史列表不显示红点
+      }
       if (cb) cb(_agents);
+    }).catch(() => {});
+  }
+  /* ── 后台 agent 状态轮询：检测其他分支开始/完成，header 显示活跃计数 ── */
+  function startPolling() {
+    if (_pollTimer) return;
+    _agentsSnapshot = {};   // 重置快照：首轮只建基线，不误报
+    _pollTimer = setInterval(pollTick, 3000);
+    pollTick();
+  }
+  function stopPolling() { if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; } }
+  function agentLabelOf(branch, list) {
+    const ag = (list || []).find((a) => (a.branch_uid || "") === branch);
+    if (ag && (ag.display_label || ag.label)) return (ag.display_label || ag.label);
+    return branch ? branch.slice(0, 5) : t("rootAgent");
+  }
+  function pollTick() {
+    fetch(api("agents")).then((r) => r.json()).then((list) => {
+      const snap = {};
+      (list || []).forEach((a) => { snap[a.branch_uid || ""] = !!a.streaming; });
+      // 后台 agent 开始/完成 → toast（当前分支的状态由 SSE 管，不重复通知）
+      Object.keys(snap).forEach((b) => {
+        if (b === _currentBranch) return;
+        const cur = !!snap[b];
+        const prev = _agentsSnapshot[b] === undefined ? cur : !!_agentsSnapshot[b];
+        if (cur && !prev) toast(t("agentStarted", { name: agentLabelOf(b, list) }));
+        else if (!cur && prev) toast(t("agentDone", { name: agentLabelOf(b, list) }));
+      });
+      _agentsSnapshot = snap;
+      // header 活跃计数：其他分支正在工作的数量
+      const busy = Object.keys(snap).filter((b) => snap[b] && b !== _currentBranch).length;
+      const el = document.getElementById("ai-busy");
+      if (el) {
+        el.classList.toggle("hidden", busy === 0);
+        el.textContent = busy > 0 ? "🔄 " + busy : "";
+      }
+      // 历史列表打开时自动刷新（未读红点/进行中状态实时更新）
+      const listEl = document.getElementById("ai-session-list");
+      if (listEl && !listEl.classList.contains("hidden")) refreshSessionList();
     }).catch(() => {});
   }
   function switchAgent(branch) {
@@ -488,34 +552,46 @@
   function toggleSessions() {
     const list = document.getElementById("ai-session-list");
     if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
+    list.classList.remove("hidden");
+    refreshSessionList();
+  }
+  function refreshSessionList() {
+    const list = document.getElementById("ai-session-list");
+    if (!list || list.classList.contains("hidden")) return;
     fetch(api("all_sessions"))
       .then((r) => r.json()).then((items) => {
         list.innerHTML = "";
         if (!items.length) {
           list.innerHTML = '<div class="ai-session-item">' + t("noHistory") + '</div>';
+          return;
         }
         items.forEach((it) => {
           const div = document.createElement("div");
           // 高亮判定：纯前端逻辑——当前正在查看的 session 文件才标 active
           const isActive = it.file === _currentSessionFile;
-          div.className = "ai-session-item" + (isActive ? " active" : "");
-          const d = new Date(it.modified * 1000);
+          // 未读：最后消息时间 > 用户上次查看时间（+1s 容差），且不是当前查看的
+          const isUnread = !isActive && (it.modified || 0) > (readTs(it.file) || 0) + 1;
+          div.className = "ai-session-item" + (isActive ? " active" : "") + (isUnread ? " unread" : "");
+          const d = new Date((it.modified || 0) * 1000);
           const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
           const branchTag = it.branch_uid
             ? '<span class="ai-session-branch">' + esc(it.display_label || it.branch_label || it.branch_uid.slice(0, 5)) + "</span>"
             : '<span class="ai-session-branch root">root</span>';
           const msgCount = '<span class="ai-session-count">' + it.user_messages + t("nMessages") + "</span>";
-          div.innerHTML = "<span class='ai-session-time'>" + time + "</span>" + branchTag + msgCount;
-          div.title = it.name + (it.branch_label ? " — " + it.branch_label : "");
+          const dot = isUnread ? '<span class="ai-dot"></span>' : "";
+          const spin = it.streaming ? '<span class="ai-spin" title="' + t("working") + '"></span>' : "";
+          div.innerHTML = dot + spin + "<span class='ai-session-time'>" + time + "</span>" + branchTag + msgCount;
+          div.title = it.name + (it.branch_label ? " — " + it.branch_label : "") + (it.streaming ? " [" + t("working") + "]" : "");
           div.dataset.file = it.file;
           div.dataset.branch = it.branch_uid || "";
           div.addEventListener("click", () => switchSession(it.file, it.branch_uid || ""));
           list.appendChild(div);
         });
-        list.classList.remove("hidden");
       }).catch(() => {});
   }
   function switchSession(file, branch) {
+    // 已在查看目标 session，短路（避免无谓断开重连/重建）
+    if (file === _currentSessionFile && (branch || "") === _currentBranch) return;
     fetch(api("switch", branch), {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_file: file }),

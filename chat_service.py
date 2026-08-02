@@ -678,6 +678,20 @@ class ChatSessionManager:
         except Exception:
             return 0.0
 
+    def _session_streaming(self, map_key: str, session_file: str, branch_uid: str = "") -> bool:
+        """该 session 是否正在流式输出（分支进程存在、进行中、且活跃文件正是它）。
+
+        用于历史列表显示进行中状态：只有\"当前活跃文件 + 进程 _in_turn\"才算，
+        旧历史文件或空闲进程一律 False。活跃文件以 mapping 为准（磁盘权威）——
+        sess.session_file 可能被 pi 返回的 sessionFile 覆盖且无 SSE 连接时未同步回 mapping。
+        """
+        skey = session_key(map_key, branch_uid)
+        sess = self._sessions.get(skey)
+        if sess is None or not sess._in_turn:
+            return False
+        active = self._mapping.get(skey) or str(sess.session_file or "")
+        return str(active) == str(session_file)
+
     def all_sessions(self, map_key: str) -> list[dict]:
         """该脑图全部 session（root + 各分支）按最后对话时间倒序混排，每条带分支标签。
 
@@ -705,6 +719,7 @@ class ChatSessionManager:
                     "modified": self._last_message_ts(str(f)),
                     "size": f.stat().st_size,
                     "user_messages": user_count,
+                    "streaming": self._session_streaming(map_key, str(f), branch_uid),
                     "branch_uid": branch_uid,
                     "branch_label": _branch_label(map_key, branch_uid, self._map_state.get(map_key)) if branch_uid else "",
                     "display_label": _display_label(
@@ -826,6 +841,12 @@ class ChatSessionManager:
             return False
         skey = session_key(map_key, branch_uid)
         with self._lock:
+            # 幂等：目标就是当前活跃会话且进程还活着 → 不 kill（保留进行中回合，
+            # 前端 SSE replay 自然接上进度，避免"只是想查看却中断了 agent 工作"）
+            if str(self._mapping.get(skey, "")) == session_file:
+                sess = self._sessions.get(skey)
+                if sess is not None and sess.alive:
+                    return True
             sess = self._sessions.pop(skey, None)
             if sess:
                 sess.kill()

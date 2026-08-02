@@ -195,8 +195,10 @@
     panel.innerHTML = `
       <div class="ai-header" id="ai-header">
         <span class="ai-title" id="ai-title">🤖 ${t("assistant")}</span>
-        <span class="ai-agent-label" id="ai-agent-label" title="${t("switchAgent")}"></span>
-        <span class="ai-busy hidden" id="ai-busy" title="${t("busyTitle")}"></span>
+        <div class="ai-label-group">
+          <span class="ai-agent-label" id="ai-agent-label" title="${t("switchAgent")}"></span>
+          <span class="ai-busy hidden" id="ai-busy" title="${t("busyTitle")}"></span>
+        </div>
         <span class="ai-status" id="ai-status"></span>
         <span class="ai-flex"></span>
         <button class="ai-btn-sm" id="ai-new" title="${t("newChat")}">＋</button>
@@ -394,6 +396,8 @@
       try {
         const ev = JSON.parse(e.data);
         applyMapUpdate(ev.tree);
+        // 对齐画布写版本：保存时后端据此判断前端是否落后（防旧画布覆盖 AI 改动）
+        if (typeof ev.ver === "number") window.__comindMapVer = ev.ver;
       } catch (_) {}
     });
   }

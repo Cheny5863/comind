@@ -450,6 +450,9 @@ class ChatSessionManager:
         self._model_pref: dict[str, dict] = self._load_json(MODELS_PATH)
         self._panel_state: dict[str, bool] = self._load_json(UISTATE_PATH)
         self._lang_pref: dict[str, str] = {}  # map_key → 界面语言（zh/en…）
+        # per-map 写版本：AI 每次写盘 +1。前端画布版本与此对齐，
+        # 保存时版本一致 = 前端看到全部 → 直接覆盖；版本落后 = 前端未同步 AI 改动 → merge
+        self._map_ver: dict[str, int] = {}
         # Mind-map state: key → current mindMapData / AI-synced snapshot
         self._map_state: dict[str, dict] = {}
         self._map_snapshot: dict[str, dict] = {}
@@ -1388,6 +1391,70 @@ def _load_doc_for_write(manager: ChatSessionManager, key: str):
     return doc, file_md, old_by_uid, fpath
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """原子写盘：先写临时文件再 rename，避免并发写盘时文件被截断损坏。
+
+    所有写盘路径（apply_ops/apply_map 的 _commit_map、前端 /api/save）都必须走这里，
+    配合 per-map 写锁（manager._write_locks）防多 session 并发互相覆盖。
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _collect_uids(root: dict, out: set) -> None:
+    uid = (root.get("data") or {}).get("uid")
+    if uid:
+        out.add(uid)
+    for c in root.get("children", []) or []:
+        _collect_uids(c, out)
+
+
+def _front_covers_disk(front_root: dict, disk_root: dict) -> bool:
+    """前端画布是否包含磁盘所有节点（uid 集合）。是 → 前端是完整视图，
+    用户删除/移动/顺序都是真实意图，保存直接覆盖（零副作用，不 merge）。"""
+    f, d = set(), set()
+    _collect_uids(front_root, f)
+    _collect_uids(disk_root, d)
+    return d <= f
+
+
+def _merge_save_tree(disk_root: dict, front_root: dict) -> dict:
+    """前端保存 merge（仅当前端落后于磁盘、含 AI 未同步改动时调用）。
+
+    背景（2026-08-02 movexbot 多 session 并发）：前端 saveMindMapData 用
+    画布整树覆盖写盘，如果画布没同步 AI 的改动（SSE 未连/未刷新），
+    AI 刚写盘的节点会被覆盖丢失。merge 规则（用户意图优先）：
+    - children 顺序以**前端**为准（用户移动/排序不丢）
+    - 同 uid → 取前端 data，子节点递归 merge
+    - 磁盘独有节点（AI 新增、前端未同步）→ 追加到末尾（保留 AI 改动）
+    代价：用户删除的节点若磁盘仍有会复活（AI 协作场景防丢为主）。
+    """
+    if not isinstance(disk_root, dict) or "data" not in disk_root:
+        return front_root
+    if not isinstance(front_root, dict) or "data" not in front_root:
+        return disk_root
+    front_children = front_root.get("children", []) or []
+    disk_by_uid = {}
+    for c in disk_root.get("children", []) or []:
+        uid = (c.get("data") or {}).get("uid")
+        if uid:
+            disk_by_uid[uid] = c
+    merged_children = []
+    for c in front_children:
+        uid = (c.get("data") or {}).get("uid")
+        if uid and uid in disk_by_uid:
+            merged_children.append(_merge_save_tree(disk_by_uid.pop(uid), c))
+        else:
+            merged_children.append(c)  # 前端独有（用户新增）
+    for c in disk_by_uid.values():
+        merged_children.append(c)  # 磁盘独有（AI 新增）追加
+    return {
+        "data": front_root.get("data", disk_root.get("data", {})),
+        "children": merged_children,
+    }
+
+
 def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict, branch_uid: str = "") -> None:
     """提交新 mindMapData：更新内存、备份、落盘、SSE 广播。
 
@@ -1396,10 +1463,10 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
     这样它们下一次 get_mindmap_diff 能看到本次变化（多 agent 协作关键）。
     """
     manager._map_state[key] = new_data
+    manager._map_ver[key] = manager._map_ver.get(key, 0) + 1
     writer_key = session_key(key, branch_uid)
     manager._map_snapshot[writer_key] = json.loads(json.dumps(new_data))
-    # 广播 mindmap_update 给同脑图的所有 agent 会话（root + 各分支），
-    # 让并行工作的其他 agent 前端实时看到结构变化。
+    # 落盘（原子写）
     fpath = Path(PROJECT_CWD) / key
     if key.endswith(".smm.json"):
         try:
@@ -1407,11 +1474,15 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
                 backup = fpath.with_suffix(fpath.suffix + ".aibak")
                 backup.write_text(fpath.read_text())
             doc["mindMapData"] = new_data
-            fpath.write_text(json.dumps(doc, ensure_ascii=False, indent=2))
+            _atomic_write(fpath, json.dumps(doc, ensure_ascii=False, indent=2))
         except Exception as exc:
-            logger.warning("persist %s failed: %s", key, exc)
+            # 写盘失败绝不能静默：apply_ops 会返回成功而磁盘没写（假成功），
+            # agent 以为更新了实际丢失——用 error 级别留痕
+            logger.error("persist %s failed: %s", key, exc)
+    # 广播 mindmap_update 给同脑图的所有 agent 会话（root + 各分支），
+    # 让并行工作的其他 agent 前端实时看到结构变化；带 ver 供前端对齐画布版本
     event = json.dumps(
-        {"type": "mindmap_update", "tree": new_data.get("root")}, ensure_ascii=False
+        {"type": "mindmap_update", "tree": new_data.get("root"), "ver": manager._map_ver[key]}, ensure_ascii=False
     )
     for skey, sess in list(manager._sessions.items()):
         if skey == key or skey.startswith(key + "::"):

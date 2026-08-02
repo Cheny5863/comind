@@ -80,6 +80,51 @@ def test_branch_agent_move_within_branch_ok(env):
     assert find_by_uid(root, "a-1-1")["data"]["text"] == "<p>A1移动后改名</p>"
 
 
+def test_merge_save_tree_keeps_ai_nodes():
+    """前端保存 merge：磁盘独有节点（AI 新增未同步）必须保留，前端独有节点加入。"""
+    disk_root = {
+        "data": {"uid": "root", "text": "root"},
+        "children": [
+            {"data": {"uid": "ai-1", "text": "AI新增节点"}, "children": []},
+            {"data": {"uid": "same", "text": "AI改过的文本"}, "children": []},
+        ],
+    }
+    front_root = {
+        "data": {"uid": "root", "text": "root"},
+        "children": [
+            {"data": {"uid": "same", "text": "用户看到的旧文本"}, "children": []},
+            {"data": {"uid": "user-1", "text": "用户新加节点"}, "children": []},
+        ],
+    }
+    merged = chat_service._merge_save_tree(disk_root, front_root)
+    merged_by_uid = {c["data"]["uid"]: c for c in merged["children"]}
+    # AI 新增节点保留（不在前端树里）
+    assert "ai-1" in merged_by_uid, "AI 新增节点被前端保存覆盖！"
+    # 用户新加节点加入
+    assert "user-1" in merged_by_uid
+    # 同 uid 取前端（用户保存意图）
+    assert merged_by_uid["same"]["data"]["text"] == "用户看到的旧文本"
+    # 顺序以用户为准：same 在前，AI 新增追加末尾
+    assert [c["data"]["uid"] for c in merged["children"]] == ["same", "user-1", "ai-1"]
+
+
+def test_front_covers_disk():
+    """前端画布包含磁盘全部节点 → 完整视图，直接覆盖（用户删除/移动是真实意图）。"""
+    disk_root = {"data": {"uid": "root"}, "children": [
+        {"data": {"uid": "a"}, "children": []},
+        {"data": {"uid": "b"}, "children": []},
+    ]}
+    # 前端包含全部 + 用户删了 b（disk 有 front 没有 → 不覆盖，走 merge 保留 b）
+    front_missing = {"data": {"uid": "root"}, "children": [{"data": {"uid": "a"}, "children": []}]}
+    assert not chat_service._front_covers_disk(front_missing, disk_root)
+    # 前端包含全部节点（即使顺序不同）→ 覆盖
+    front_all = {"data": {"uid": "root"}, "children": [
+        {"data": {"uid": "b"}, "children": []},
+        {"data": {"uid": "a"}, "children": []},
+    ]}
+    assert chat_service._front_covers_disk(front_all, disk_root)
+
+
 def test_branch_agent_update_outside_branch_rejected(env):
     """分支 agent 改分支外的节点：拒绝。"""
     client = env

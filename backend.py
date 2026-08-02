@@ -2,7 +2,8 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import json, os, sys, zipfile, datetime
+import json, os, sys, zipfile, datetime, threading
+from pathlib import Path
 
 import chat_service
 
@@ -176,14 +177,49 @@ def api_load(name: str = Query(..., description="文件名")):
     return load_from_file(name)
 
 
+@app.get("/api/ver")
+def api_ver(name: str = Query(...)):
+    """返回脑图当前写版本（AI 写盘次数）。前端画布 load 时初始化、收到
+    mindmap_update 时对齐；保存时带版本，后端据此判断前端是否落后。"""
+    _check_map_key(name)
+    return {"version": chat_manager._map_ver.get(name, 0)}
+
+
 @app.post("/api/save")
-def api_save(name: str = Query(...), body: dict = None):
+def api_save(name: str = Query(...), body: dict = None, version: int = 0):
     # 确保文件名是 .smm.json
     if not name.endswith(".smm.json"):
         name = name.rsplit(".", 1)[0] + ".smm.json"
-    fpath = os.path.join(WORKSPACE, name)
-    with open(fpath, "w", encoding="utf-8") as f:
-        json.dump(body, f, ensure_ascii=False, indent=2)
+    fpath = Path(WORKSPACE) / name
+    # 与 apply_ops/apply_map 共用 per-map 写锁（写队列串行化）+ 原子写：
+    # 防多 session 并发（AI 写盘 vs 前端保存）互相覆盖/截断损坏。
+    # 曾因此丢 AI 改动（前端旧画布保存覆盖）并损坏文件（UnicodeDecodeError）
+    lock = chat_manager._write_locks.setdefault(name, threading.Lock())
+    with lock:
+        # 锁内读磁盘 → 判断前端画布版本是否落后 → 原子写。
+        # version 一致（前端看到全部 AI 改动）→ 直接覆盖，用户删除/移动/顺序是真实意图；
+        # version 落后（前端未同步 AI 新增）→ merge 保留磁盘独有节点
+        if isinstance(body, dict) and "mindMapData" in body and fpath.is_file():
+            try:
+                disk_doc = json.loads(fpath.read_text())
+                disk_md = (disk_doc or {}).get("mindMapData") or {}
+                front_md = body["mindMapData"]
+                if isinstance(disk_md, dict) and isinstance(front_md, dict):
+                    disk_root = disk_md.get("root", disk_md) if isinstance(disk_md.get("root"), dict) else disk_md
+                    front_root = front_md.get("root", front_md) if isinstance(front_md.get("root"), dict) else front_md
+                    if isinstance(disk_root, dict) and isinstance(front_root, dict):
+                        cur_ver = chat_manager._map_ver.get(name, 0)
+                        if version < cur_ver and not chat_service._front_covers_disk(front_root, disk_root):
+                            merged_md = dict(disk_md)
+                            merged_md["root"] = chat_service._merge_save_tree(disk_root, front_root)
+                            body = dict(body)
+                            body["mindMapData"] = merged_md
+            except Exception:
+                pass  # 磁盘读失败（损坏）→ 直接用前端树覆盖重建
+        chat_service._atomic_write(fpath, json.dumps(body, ensure_ascii=False, indent=2))
+        # 保持内存态与磁盘一致：后续 AI 的 diff/apply 基于保存后的树
+        if isinstance(body, dict) and "mindMapData" in body:
+            chat_manager._map_state[name] = body["mindMapData"]
     return {"status": "ok", "name": name}
 
 
@@ -618,6 +654,16 @@ const getDataFromBackend = async () => {{
   return data;
 }};
 
+// 画布写版本：AI 写盘时后端版本 +1（SSE mindmap_update 带 ver 更新）；
+// 保存时带版本，后端据此判断画布是否落后（防旧画布覆盖 AI 改动）
+window.__comindMapVer = 0;
+try {{
+  fetch('/api/ver?name=' + encodeURIComponent(window.currentFileName))
+    .then(function(r) {{ return r.json(); }})
+    .then(function(d) {{ window.__comindMapVer = d.version || 0; }})
+    .catch(function() {{}});
+}} catch (e) {{}}
+
 const setTakeOverAppMethods = (data) => {{
   window.takeOverAppMethods = {{}};
   window.takeOverAppMethods.getMindMapData = () => data.mindMapData;
@@ -641,7 +687,7 @@ const setTakeOverAppMethods = (data) => {{
       }}
       const current = await (await fetch('/api/load?name=' + encodeURIComponent(window.currentFileName))).json();
       current.mindMapData = d;
-      await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName), {{
+      await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName) + '&version=' + (window.__comindMapVer || 0), {{
         method: 'POST', headers: {{'Content-Type':'application/json'}},
         body: JSON.stringify(current)
       }});
@@ -651,7 +697,7 @@ const setTakeOverAppMethods = (data) => {{
   window.takeOverAppMethods.saveMindMapConfig = async (c) => {{
     const current = await (await fetch('/api/load?name=' + encodeURIComponent(window.currentFileName))).json();
     current.mindMapConfig = c;
-    await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName), {{
+    await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName) + '&version=' + (window.__comindMapVer || 0), {{
       method: 'POST', headers: {{'Content-Type':'application/json'}},
       body: JSON.stringify(current)
     }});

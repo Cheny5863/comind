@@ -246,6 +246,13 @@
 .ai-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
 /* ── 多 Agent（并行分支工作）── */
+/* 居中组：分支标签 + 后台活跃计数 badge 一起居中，两者永不分离、
+   也不与左侧标题/右侧按钮重叠（窄面板时 group 限宽内部收缩） */
+.ai-label-group {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 4px;
+  max-width: 58%; z-index: 1;
+}
 .ai-agent-label {
   position: absolute; left: 50%; transform: translateX(-50%);
   font-size: 11px; color: #409eff; background: #ecf5ff;

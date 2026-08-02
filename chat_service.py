@@ -270,6 +270,7 @@ class ChatSession:
         self._reader_thread: threading.Thread | None = None
         self._alive = False
         self._in_turn = False  # True between agent_start and agent_end
+        self._abort_requested = False  # True after abort() until agent_end/kill
 
     def spawn(self) -> None:
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -369,26 +370,32 @@ class ChatSession:
                     ev_type = ev.get("type")
                     if ev_type == "agent_start":
                         self._in_turn = True
+                        self._abort_requested = False
                         sf = ev.get("sessionFile") or ev.get("session_file")
                         if sf:
                             self.session_file = sf
+                    # abort 后吞掉内容事件（thinking/text delta 等），
+                    # 只放行 agent_end/agent_settled 让前端知道回合结束
+                    if self._abort_requested and ev_type not in (
+                        "agent_end", "agent_settled", "agent_start",
+                    ):
+                        continue
                     self._buffer.append(line)
                     # Keep session alive while pi is producing output
                     self.last_active = time.time()
                     if ev_type in ("agent_end", "agent_settled"):
                         self._in_turn = False
+                        self._abort_requested = False
                         self._buffer.clear()
                 except json.JSONDecodeError:
                     pass
-                # Broadcast to all listeners
-                dead = []
-                for i, q in enumerate(self.listeners):
+                # Broadcast to all listeners (drop on full, never remove —
+                # real disconnect cleanup is in events() finally → unsubscribe)
+                for q in list(self.listeners):
                     try:
                         q.put_nowait(line)
                     except Exception:
-                        dead.append(i)
-                for i in reversed(dead):
-                    self.listeners.pop(i)
+                        pass
         except Exception as exc:
             logger.warning("reader error for %s: %s", self.map_key, exc)
         finally:
@@ -544,14 +551,18 @@ class ChatSessionManager:
     def abort(self, map_key: str, branch_uid: str = "") -> bool:
         sess = self._sessions.get(session_key(map_key, branch_uid))
         if sess and sess.alive:
+            # 立即标记 abort —— _read_stdout 会吞掉后续内容事件，前端不再收到残留流
+            sess._abort_requested = True
+            sess._buffer.clear()
             sess.send({"type": "abort"})
             # 秒停：pi 正常响应 abort 很快；短窗口（1.5s）后仍未结束则强制
-            # 清 buffer + 广播 agent_end + kill，保证前端不再收到残留流内容
+            # 广播 agent_end + kill，保证前端不再收到残留流内容
             def _force_kill():
                 time.sleep(1.5)
-                if sess._in_turn and sess.alive:
+                if sess.alive and (sess._in_turn or sess._abort_requested):
                     logger.warning("abort timeout for %s, force-killing pi", map_key)
                     sess._in_turn = False
+                    sess._abort_requested = False
                     # Synthesize agent_end so listeners/SSE get notified
                     end_ev = json.dumps({"type": "agent_end", "forced": True})
                     sess._buffer.clear()

@@ -377,6 +377,7 @@
     // On SSE reconnect (browser auto-reconnects), recover state
     _es.addEventListener("open", () => recoverStreamState());
     _es.addEventListener("message_update", (e) => {
+      if (!_streaming) return; // abort 后丢弃残留内容事件
       try {
         const ev = JSON.parse(e.data);
         const d = ev.assistantMessageEvent || {};
@@ -387,6 +388,7 @@
       } catch (_) {}
     });
     _es.addEventListener("tool_execution_start", (e) => {
+      if (!_streaming) return; // abort 后丢弃
       try {
         const ev = JSON.parse(e.data);
         appendToolCall(ev.toolName, ev.args);

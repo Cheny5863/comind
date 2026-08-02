@@ -120,8 +120,16 @@ export default function (pi: ExtensionAPI) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ key: MAP_KEY, ops: params.ops, branch_uid: BRANCH_UID }),
       });
+      // 解析结果，将 skipped_human_editing 转为人类可读的提示
+      let text = truncate(raw, 2000);
+      try {
+        const result = JSON.parse(raw);
+        if (result.skipped_human_editing && result.skipped_human_editing.length) {
+          text += "\n⚠️ 以下节点正在被用户编辑，已跳过：" + result.skipped_human_editing.join(", ") + "。请稍后重试这些节点的修改。";
+        }
+      } catch (_) {}
       const isErr = raw.includes('"error"');
-      return { content: [{ type: "text" as const, text: truncate(raw, 2000) }], details: {}, isError: isErr };
+      return { content: [{ type: "text" as const, text }], details: {}, isError: isErr };
     },
   });
 

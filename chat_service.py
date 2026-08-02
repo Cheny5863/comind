@@ -453,6 +453,9 @@ class ChatSessionManager:
         # per-map 写版本：AI 每次写盘 +1。前端画布版本与此对齐，
         # 保存时版本一致 = 前端看到全部 → 直接覆盖；版本落后 = 前端未同步 AI 改动 → merge
         self._map_ver: dict[str, int] = {}
+        # 人类编辑锁：key → {uid, ts}。前端双击编辑节点时上报，60 秒超时自动释放。
+        # apply_ops 遇到被锁 uid 时跳过该 op（不整批失败），反馈给 AI 稍后重试。
+        self._human_editing: dict[str, dict] = {}
         # Mind-map state: key → current mindMapData / AI-synced snapshot
         self._map_state: dict[str, dict] = {}
         self._map_snapshot: dict[str, dict] = {}
@@ -1662,7 +1665,14 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
     # 不预计算白名单——add/move 后归属自动正确，无需手动维护集合
     parents = _index_with_parent(root)
     applied, errors, created, refs = 0, [], {}, {}
+    skipped_human: list[str] = []     # 被人类编辑锁跳过的 uid
     root_uid = root.get("data", {}).get("uid")
+
+    # 人类编辑锁：检查是否有人正在编辑某节点（60 秒超时自动失效）
+    human_lock = manager._human_editing.get(key)
+    human_locked_uid = ""
+    if human_lock and (time.time() - human_lock.get("ts", 0)) < 60:
+        human_locked_uid = human_lock.get("uid", "")
 
     def insert_child(parent: dict, node: dict, idx) -> None:
         children = parent.setdefault("children", [])
@@ -1683,6 +1693,10 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
     for i, op in enumerate(ops):
         action = op.get("action")
         uid = op.get("uid", "")
+        # P3: 人类编辑锁——目标节点正被人编辑时跳过该 op（不整批失败）
+        if human_locked_uid and uid and uid == human_locked_uid and action in ("update_text", "delete", "move"):
+            skipped_human.append(uid)
+            continue
         if action == "update_text":
             if not check_allowed(uid, i, "目标节点"):
                 continue
@@ -1761,7 +1775,10 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
         new_data = dict(file_md)
         new_data["root"] = root
         _commit_map(manager, key, doc, new_data, branch_uid)
-    return {"applied": applied, "errors": errors, "created": created}
+    result: dict = {"applied": applied, "errors": errors, "created": created}
+    if skipped_human:
+        result["skipped_human_editing"] = skipped_human
+    return result
 
 
 def _delete_by_uid(node: dict, uid: str) -> bool:

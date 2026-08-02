@@ -507,6 +507,27 @@ def api_mindmap_apply_ops(body: OpsBody):
     return result
 
 
+# ─── P2: 人类编辑锁 ───
+# 前端双击编辑节点时 POST lock（上报 uid），编辑完成时 POST unlock。
+# apply_ops 会检查该锁，跳过被人编辑的节点（不整批失败）。60 秒超时自动释放。
+
+import time as _time
+
+@app.post("/api/editing/{map_key}/lock")
+def api_editing_lock(map_key: str, body: dict):
+    uid = body.get("uid", "")
+    if not uid:
+        raise HTTPException(400, "uid required")
+    chat_manager._human_editing[map_key] = {"uid": uid, "ts": _time.time()}
+    return {"status": "locked", "uid": uid}
+
+
+@app.post("/api/editing/{map_key}/unlock")
+def api_editing_unlock(map_key: str):
+    chat_manager._human_editing.pop(map_key, None)
+    return {"status": "unlocked"}
+
+
 # ─── 前端页面 ───
 
 @app.get("/", response_class=HTMLResponse)
@@ -543,6 +564,22 @@ window.initCapture = () => {{
       mindMapInstance = mindMap;
       installClipboardFix(mindMap);
       installExportFix(mindMap);
+      // P2: 人类编辑锁——双击编辑节点时上报后端，AI 的 apply_ops 会跳过被人编辑的节点
+      mindMap.on('before_show_text_edit', () => {{
+        const active = mindMap.renderer.activeNodeList;
+        const node = active && active[0];
+        if (node && node.uid) {{
+          fetch('/api/editing/' + encodeURIComponent(window.currentFileName) + '/lock', {{
+            method: 'POST', headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{uid: node.uid}})
+          }}).catch(() => {{}});
+        }}
+      }});
+      mindMap.on('hide_text_edit', () => {{
+        fetch('/api/editing/' + encodeURIComponent(window.currentFileName) + '/unlock', {{
+          method: 'POST'
+        }}).catch(() => {{}});
+      }});
     }});
   }}
 }};

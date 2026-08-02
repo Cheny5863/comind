@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # CoMind 一键更新脚本（在 ~/.comind/app 或任意目录运行）
 # 流程: 拉 latest.json → 对比版本 → 下载 → 校验 sha256 → 备份旧版(保留1份) → 覆盖 → 重启
+# 用法: bash update.sh [--force]
+#   --force: 强制更新。版本相同（同版本 bugfix 重发）时也执行下载/校验/覆盖安装，
+#            用于修复已部署的同版本包。正常升级无需此参数。
 # 更新源（三选一）:
 #   1. 环境变量 SMM_UPDATE_URL=http://内网IP:8000/smm   （内网文件服务器/HTTP 目录）
 #   2. 包内 latest.json（本地目录分发：把发布包+latest.json 放到 ~/.comind/app 或同目录）
@@ -16,6 +19,15 @@ L() { if [ "${LANG:-zh}" = "zh" ]; then echo "$1"; else echo "$2"; fi; }
 say() { echo -e "\033[1;32m[update]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[update] $(L 警告: Warning:)\033[0m $*"; }
 die() { echo -e "\033[1;31m[update] $(L 错误: Error:)\033[0m $*" >&2; exit 1; }
+
+# 解析参数：--force 强制同版本覆盖更新
+FORCE=0
+for arg in "$@"; do
+    case "$arg" in
+        --force|-f) FORCE=1 ;;
+        *) die "$(L "未知参数: $arg（仅支持 --force）" "Unknown argument: $arg (only --force supported)")" ;;
+    esac
+done
 
 [ -f "$APP_DIR/VERSION" ] || die "$(L "未找到 $APP_DIR/VERSION，请先运行 install.sh" "VERSION not found in $APP_DIR, run install.sh first")"
 CUR="$(cat "$APP_DIR/VERSION" | tr -d ' \n')"
@@ -39,8 +51,12 @@ SHA="$(grep -o '"sha256":"[^"]*"' /tmp/smm-latest.json | head -1 | cut -d'"' -f4
 [ -n "$NEW" ] || die "$(L "latest.json 格式异常（缺 version）" "latest.json malformed (missing version)")"
 
 if [ "$NEW" = "$CUR" ]; then
-    say "$(L "已是最新版本 ($CUR)，无需更新" "Already up to date ($CUR)")"
-    exit 0
+    if [ "$FORCE" = "1" ]; then
+        say "$(L "版本相同 ($CUR)，--force 强制覆盖更新" "Same version ($CUR), --force reinstall")"
+    else
+        say "$(L "已是最新版本 ($CUR)，无需更新（同版本修复重发请用 bash update.sh --force）" "Already up to date ($CUR). For same-version hotfix reinstall: bash update.sh --force")"
+        exit 0
+    fi
 fi
 
 # ── 2. 下载 ──

@@ -177,31 +177,19 @@
   cursor: pointer; flex: none;
 }
 .ai-agent-label.is-branch { color: #e6a23c; background: #fdf6ec; }
-.ai-agent-list {
-  border-bottom: 1px solid #ebeef5; background: #fafafa;
-  max-height: 200px; overflow-y: auto; padding: 6px 8px;
+
+
+/* ── 历史会话：时间混排 + 分支标签 ── */
+.ai-session-item {
+  display: flex; align-items: center; gap: 6px;
 }
-.ai-agent-group {
-  font-size: 11px; color: #909399; padding: 2px 4px 6px; font-weight: 600;
+.ai-session-time { flex: none; }
+.ai-session-branch {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px; color: #e6a23c; background: #fdf6ec;
+  border-radius: 8px; padding: 1px 8px; text-align: center;
 }
-.ai-agent-item {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 7px 10px; border-radius: 6px; font-size: 12px;
-  cursor: pointer; transition: background .15s; margin-bottom: 2px;
-  border: 1px solid transparent;
+.ai-session-count { flex: none; font-size: 11px; color: #909399; }
+.ai-session-branch.root {
+  color: #909399; background: #f4f4f5;
 }
-.ai-agent-item:hover { background: #f0f2f5; }
-.ai-agent-item.active { background: #ecf5ff; border-color: #b3d8ff; }
-.ai-agent-item.streaming { background: #fdf6ec; border-color: #f5dab1; }
-.ai-agent-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ai-agent-badge { font-size: 11px; margin-left: 6px; color: #e6a23c; }
-.ai-agent-hist {
-  flex: none; font-size: 13px; padding: 0 4px; border-radius: 4px;
-  opacity: .7; transition: opacity .15s;
-}
-.ai-agent-hist:hover { opacity: 1; background: #e4e7ed; }
-.ai-agent-new {
-  color: #409eff; border: 1px dashed #c6e2ff; background: #fff;
-  justify-content: center; margin-top: 4px;
-}
-.ai-agent-new:hover { background: #ecf5ff; }

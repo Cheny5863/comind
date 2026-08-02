@@ -560,13 +560,20 @@ class ChatSessionManager:
 
     def reset(self, map_key: str, branch_uid: str = "") -> None:
         """Start a new conversation for a (map, branch) pair. The old session
-        file is KEPT on disk so it stays available in the history list."""
+        file is KEPT on disk so it stays available in the history list.
+
+        新分支（mapping 无条目）：创建空占位条目，让 agents 列表能列出它；
+        已存在分支：杀掉 pi、删条目，下次访问 spawn 新 session 文件。
+        """
         skey = session_key(map_key, branch_uid)
         with self._lock:
             sess = self._sessions.pop(skey, None)
             if sess:
                 sess.kill()
             self._mapping.pop(skey, None)
+            if branch_uid:
+                # 占位：分支 agent 已创建但尚无会话文件（label 从 _map_state 取）
+                self._mapping[skey] = ""
             self._save_mapping()
 
     def events(self, map_key: str, branch_uid: str = "") -> Iterator[str]:
@@ -615,9 +622,9 @@ class ChatSessionManager:
         sessions = []
         for f in sorted(SESSION_DIR.glob(f"{prefix}*.jsonl"), reverse=True):
             try:
-                # 分支 session 文件名含 __<branch_slug>__，root 不含
+                # 分支 session 文件名含 __<branch_slug>__，root 不含（去掉 map 前缀后判断）
                 stem = f.name[len(prefix):]
-                is_branch = "__" in stem and stem.count("__") >= 2
+                is_branch = "__" in stem
                 if branch_uid:
                     if not (is_branch and stem.startswith(branch_slug + "__")):
                         continue
@@ -639,21 +646,155 @@ class ChatSessionManager:
                 continue
         return sessions
 
+    def _last_message_ts(self, session_file: str) -> float:
+        """session 最后一条消息的时间戳（秒）。
+
+        不依赖文件 mtime——选中/读取 session 不会改文件，但 pi 可能
+        在加载时写 session 元数据导致 mtime 变化。真正的"最后对话时间"
+        应来自 jsonl 里最后一条 message 记录的 timestamp。
+        """
+        try:
+            last = 0.0
+            for line in Path(session_file).read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("type") != "message":
+                    continue
+                ts = e.get("timestamp")
+                if isinstance(ts, str):
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        v = dt.timestamp()
+                        if v > last:
+                            last = v
+                    except Exception:
+                        pass
+            return last
+        except Exception:
+            return 0.0
+
+    def all_sessions(self, map_key: str) -> list[dict]:
+        """该脑图全部 session（root + 各分支）按最后对话时间倒序混排，每条带分支标签。
+
+        前端历史记录不再按 agent/分支分组：人的思维链是顺序的，多个分支
+        session 协作解决同一件事，按时间线看最符合直觉。分支降级为每行的
+        标签（branch_uid + display_label），点击即切换（自动带上分支约束）。
+        """
+        prefix = safe_key_slug(map_key) + "__"
+        sessions = []
+        for f in SESSION_DIR.glob(f"{prefix}*.jsonl"):
+            try:
+                stem = f.name[len(prefix):]
+                # 分支 session 文件名 <map>__<branch_slug>__<ts>.jsonl：去掉 map 前缀后
+                # 含 "__"（slug__ts）；root 是 <map>__<ts>.jsonl：不含
+                is_branch = "__" in stem
+                branch_uid = ""
+                if is_branch:
+                    # 文件名里 slug 不是完整 uid，用 mapping 反查该文件属于哪个分支
+                    branch_uid = self._branch_uid_for_file(map_key, str(f))
+                text = f.read_text()
+                user_count = text.count('"role": "user"') + text.count('"role":"user"')
+                sessions.append({
+                    "file": str(f),
+                    "name": f.stem,
+                    "modified": self._last_message_ts(str(f)),
+                    "size": f.stat().st_size,
+                    "user_messages": user_count,
+                    "branch_uid": branch_uid,
+                    "branch_label": _branch_label(map_key, branch_uid, self._map_state.get(map_key)) if branch_uid else "",
+                    "display_label": _display_label(
+                        _branch_label(map_key, branch_uid, self._map_state.get(map_key))
+                    ) if branch_uid else "",
+                })
+            except Exception:
+                continue
+        # 按最后对话时间倒序（不是文件 mtime / 创建时间）
+        sessions.sort(key=lambda s: s["modified"], reverse=True)
+        return sessions
+
+    def _branch_uid_for_file(self, map_key: str, session_file: str) -> str:
+        """从 session 文件反查它属于哪个分支（找不到返回空 = root）。
+
+        两条路径：
+        1. mapping 反查：当前活跃的 session 文件能直接命中
+           （map_key::branch_uid → session_file）。
+        2. 文件名 slug 匹配：旧 session（已被 reset 替换、不在 mapping 中）
+           从文件名提取分支 slug（branch_uid 前 8 位），在脑图节点 uid 里
+           前缀匹配——保证同一分支的历史 session 仍显示正确的分支标签。
+        """
+        for skey, sf in self._mapping.items():
+            mkey, b = split_session_key(skey)
+            if mkey == map_key and b and sf == session_file:
+                return b
+        # mapping 反查不到（旧 session）：文件名 <map>__<branch_slug8>__<ts>.jsonl
+        fname = Path(session_file).name
+        prefix = safe_key_slug(map_key) + "__"
+        if fname.startswith(prefix):
+            stem = fname[len(prefix):]
+            if "__" in stem:
+                slug = stem.split("__", 1)[0]
+                if len(slug) >= 4:  # 真实 uid slug 8 位；测试用短 uid 也支持
+                    return self._uid_by_slug_prefix(map_key, slug)
+        return ""
+
+    def _uid_by_slug_prefix(self, map_key: str, slug: str) -> str:
+        """在脑图节点中找 uid 前几位匹配 slug 的节点（取第一个）。
+
+        _map_state 为空（服务重启未 sync）时从磁盘脑图文件兜底。
+        """
+        state = self._map_state.get(map_key)
+        if not state:
+            fpath = Path(PROJECT_CWD) / map_key
+            if map_key.endswith(".smm.json") and fpath.is_file():
+                try:
+                    doc = json.loads(fpath.read_text())
+                    state = doc.get("mindMapData") or {}
+                except Exception:
+                    state = None
+        if not state:
+            return ""
+        root = _state_root(state)
+        if not isinstance(root, dict):
+            return ""
+        for uid in _index_by_uid(root):
+            if uid.startswith(slug):
+                return uid
+        return ""
+
+    def _session_has_history(self, session_file: str | None) -> bool:
+        """该 agent 是否实际交流过：活跃 session 文件存在且含用户消息。
+
+        「+」语义决策依据：有历史 = 新开一轮（reset）；无历史 = 幂等切换。
+        """
+        if not session_file or not Path(session_file).is_file():
+            return False
+        try:
+            text = Path(session_file).read_text()
+            return '"role": "user"' in text or '"role":"user"' in text
+        except Exception:
+            return False
+
     def list_agents(self, map_key: str) -> list[dict]:
         """列出该脑图的所有 agent（root + 各分支），供前端多 agent 列表显示。
 
         数据来源：_map_state 里的分支节点 + mapping 里已存在的会话键。
         返回每个 agent 的 branch_uid（"" = root）、分支名、活跃会话文件、
-        是否正在流式输出。
+        是否正在流式输出、是否实际交流过（has_history）。
         """
         agents: dict[str, dict] = {}
         # root agent
         root_sf = self._mapping.get(map_key)
         agents[""] = {
             "branch_uid": "",
-            "label": "整张脑图",
-            "display_label": "整张脑图",
+            "label": "",
+            "display_label": "",
             "session_file": root_sf,
+            "has_history": self._session_has_history(root_sf),
             "streaming": self._sessions.get(map_key, None) is not None
             and self._sessions[map_key]._in_turn,
         }
@@ -669,6 +810,7 @@ class ChatSessionManager:
                 "label": full,
                 "display_label": _display_label(full),
                 "session_file": sf,
+                "has_history": self._session_has_history(sf),
                 "streaming": sess is not None and sess._in_turn,
             }
         return sorted(agents.values(), key=lambda a: (a["branch_uid"] != "", a["label"]))

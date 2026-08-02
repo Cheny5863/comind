@@ -129,6 +129,8 @@
   let _mindMap = null;
   let _currentBranch = "";   // "" = root agent（整张脑图）；非空 = 绑定分支 uid
   let _agents = [];          // 该脑图的所有 agent 列表（root + 各分支）
+  let _pendingBranchLabel = "";  // 新建分支 agent 时的节点文本（agents 刷新前临时显示）
+  let _currentSessionFile = "";  // 当前正在查看的 session 文件（前端维护，历史列表高亮用）
 
   function mapKey() { return window.currentFileName || ""; }
   function api(suffix, branch) {
@@ -170,7 +172,6 @@
         <button class="ai-btn-sm" id="ai-close" title="${t("close")}">✕</button>
       </div>
       <div class="ai-session-list hidden" id="ai-session-list"></div>
-      <div class="ai-agent-list hidden" id="ai-agent-list"></div>
       <div class="ai-messages" id="ai-messages"></div>
       <div class="ai-input-area">
         <div class="ai-input-wrap">
@@ -204,7 +205,7 @@
     document.getElementById("ai-send").addEventListener("click", sendMessage);
     document.getElementById("ai-abort").addEventListener("click", abortChat);
     document.getElementById("ai-new").addEventListener("click", newAgent);
-    document.getElementById("ai-hist").addEventListener("click", toggleAgents);
+    document.getElementById("ai-hist").addEventListener("click", toggleSessions);
     document.getElementById("ai-bg").addEventListener("click", openBg);
     document.getElementById("ai-bg-close").addEventListener("click", closeBg);
     document.getElementById("ai-bg-save").addEventListener("click", saveBg);
@@ -212,8 +213,8 @@
     document.getElementById("ai-keys-close").addEventListener("click", closeKeys);
     document.getElementById("ai-keys-list").addEventListener("click", onKeysListClick);
     document.getElementById("ai-model").addEventListener("change", onModelChange);
-    // agent 列表事件委托：切换 agent / 展开该 agent 的历史会话
-    document.getElementById("ai-agent-list").addEventListener("click", onAgentListClick);
+    // 点击左上角分支标签 → 脑图聚焦到该分支根节点
+    document.getElementById("ai-agent-label").addEventListener("click", focusBranchNode);
 
     const input = document.getElementById("ai-input");
     input.addEventListener("keydown", onInputKeydown);
@@ -229,7 +230,7 @@
     let dragging = false, sx, sy, sl, st;
     handle.style.cursor = "grab";
     handle.addEventListener("mousedown", (e) => {
-      if (e.target.closest("button,select")) return; // 不在按钮/下拉上拖拽
+      if (e.target.closest("button,select") || e.target.closest("#ai-agent-label")) return; // 不在按钮/下拉/分支标签上拖拽
       dragging = true;
       const r = panel.getBoundingClientRect();
       sx = e.clientX; sy = e.clientY; sl = r.left; st = r.top;
@@ -297,10 +298,12 @@
   }
   function disconnectSSE() { if (_es) { _es.close(); _es = null; } }
 
-  /* ── 状态恢复：页面刷新/SSE 重连后，向后端查询是否正在流式输出 ── */
+  /* ── 状态恢复：页面刷新/SSE 重连/切换 session 后，与后端 streaming 状态双向对齐 ── */
   function recoverStreamState() {
     fetch(api("status")).then(function(r) { return r.json(); }).then(function(d) {
-      if (d.streaming && !_streaming) setStreaming(true);
+      // 双向同步：后端 streaming=false 时也要清掉残留的"思考中/中止"UI
+      // （例如旧 session 在思考、切到空闲的新 session——不主动清就会残留）
+      setStreaming(!!d.streaming);
     }).catch(function() {});
   }
 
@@ -417,7 +420,7 @@
     if (!el) return;
     const ag = _agents.find((a) => (a.branch_uid || "") === _currentBranch);
     const display = (ag && (ag.display_label || ag.label)) ? (ag.display_label || ag.label)
-      : (_currentBranch ? _currentBranch.slice(0, 5) : t("rootAgent"));
+      : (_pendingBranchLabel ? _pendingBranchLabel.slice(0, 5) : t("rootAgent"));
     el.textContent = display;
     el.classList.toggle("is-branch", !!_currentBranch);
   }
@@ -425,71 +428,23 @@
     fetch(api("agents")).then((r) => r.json()).then((list) => {
       _agents = list || [];
       loadAgentLabel();
+      // 同步当前查看的 session：当前分支的活跃会话文件
+      const cur = _agents.find((a) => (a.branch_uid || "") === _currentBranch);
+      if (cur && cur.session_file) _currentSessionFile = cur.session_file;
       if (cb) cb(_agents);
     }).catch(() => {});
   }
-  function toggleAgents() {
-    const list = document.getElementById("ai-agent-list");
-    const sl = document.getElementById("ai-session-list");
-    if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
-    sl.classList.add("hidden");
-    refreshAgents((agents) => {
-      list.innerHTML = "";
-      const title = document.createElement("div");
-      title.className = "ai-agent-group";
-      title.textContent = t("agents");
-      list.appendChild(title);
-      agents.forEach((ag) => {
-        const div = document.createElement("div");
-        const isActive = (ag.branch_uid || "") === _currentBranch;
-        div.className = "ai-agent-item" + (isActive ? " active" : "") +
-          (ag.streaming ? " streaming" : "");
-        div.dataset.branch = ag.branch_uid || "";
-        const label = (ag.display_label || ag.label) || (ag.branch_uid ? ag.branch_uid.slice(0, 5) : t("rootAgent"));
-        const fullTitle = ag.label || label;
-        const badge = ag.streaming ? ' <span class="ai-agent-badge">💭</span>' : "";
-        const act = isActive ? ' <span class="ai-agent-badge">' + t("activeAgent") + "</span>" : "";
-        div.innerHTML = "<span class='ai-agent-name' title='" + esc(fullTitle) + "'>" + esc(label) + badge + act + "</span>" +
-          (ag.branch_uid ? "<span class='ai-agent-hist' data-role='hist'>📂</span>" : "");
-        list.appendChild(div);
-      });
-      const newRow = document.createElement("div");
-      newRow.className = "ai-agent-item ai-agent-new";
-      newRow.textContent = "＋ " + t("newAgentBranch");
-      newRow.addEventListener("click", () => {
-        const node = activeNode();
-        if (node) {
-          newAgentFor(node.nodeData.data.uid || "");
-        } else {
-          toast(t("noNodeSelected"));
-        }
-      });
-      list.appendChild(newRow);
-      list.classList.remove("hidden");
-    });
-  }
-  function onAgentListClick(e) {
-    const item = e.target.closest(".ai-agent-item");
-    if (!item || item.classList.contains("ai-agent-new")) return;
-    const histBtn = e.target.closest("[data-role='hist']");
-    if (histBtn) {
-      // 展开该 agent 的历史会话（分支 agent 专用）
-      const branch = item.dataset.branch || "";
-      toggleSessions(branch);
-      return;
-    }
-    switchAgent(item.dataset.branch || "");
-  }
   function switchAgent(branch) {
     if ((branch || "") === _currentBranch) {
-      document.getElementById("ai-agent-list").classList.add("hidden");
       return;
     }
     _currentBranch = branch || "";
+    _currentSessionFile = "";  // 等待 refreshAgents 同步新分支活跃会话
+    _pendingBranchLabel = "";  // 已存在的 agent 从后端拿 label
+    setStreaming(false);  // 清掉旧 session 的"思考中/中止"UI 残留
     disconnectSSE();
     document.getElementById("ai-messages").innerHTML = "";
     document.getElementById("ai-session-list").classList.add("hidden");
-    document.getElementById("ai-agent-list").classList.add("hidden");
     loadAgentLabel();
     loadHistory();
     connectSSE();
@@ -498,30 +453,42 @@
   function newAgent() {
     // 新建 agent：绑定当前选中节点所在分支；未选中 = 整张脑图（root）
     const node = activeNode();
+    _pendingBranchLabel = node ? stripHtml(node.nodeData.data.text || "") : "";
     newAgentFor(node ? (node.nodeData.data.uid || "") : "");
   }
   function newAgentFor(branch) {
-    // reset 该 (map, branch) 的会话 = 新开一个空会话；旧会话文件保留在历史里
-    fetch(api("reset", branch), { method: "POST" }).then(() => {
+    // 「+」语义（上下文敏感）：
+    // - 该分支已交流过（has_history）→ 新开一轮（reset 清会话，旧文件保留在历史）
+    // - 该分支未交流/无 session（幂等）→ 只切换，不重复创建/reset
+    const ag = _agents.find((a) => (a.branch_uid || "") === (branch || ""));
+    const hasHistory = ag && ag.has_history;
+    const doSwitch = () => {
       _currentBranch = branch || "";
+      _currentSessionFile = "";  // 新建/切换后等待 agents 刷新同步活跃会话
+      if (!branch) _pendingBranchLabel = "";  // root 用固定文案
+      setStreaming(false);  // 清掉旧 session 的"思考中/中止"UI 残留
       disconnectSSE();
       document.getElementById("ai-messages").innerHTML = "";
       document.getElementById("ai-session-list").classList.add("hidden");
-      document.getElementById("ai-agent-list").classList.add("hidden");
       loadAgentLabel();
       refreshAgents();
       connectSSE();
       recoverStreamState();
-    }).catch(() => {});
+    };
+    if (hasHistory) {
+      // 已交流过：reset 新开一轮（旧会话文件保留在历史列表）
+      fetch(api("reset", branch), { method: "POST" }).then(doSwitch).catch(() => {});
+    } else {
+      // 未交流/新分支：幂等切换，不产生新会话
+      doSwitch();
+    }
   }
 
-  /* ── 历史会话（当前 agent 的）── */
-  function toggleSessions(branch) {
+  /* ── 历史会话（全部 session 按时间混排，分支降级为行内标签）── */
+  function toggleSessions() {
     const list = document.getElementById("ai-session-list");
-    if (!list.classList.contains("hidden") && (branch || "") === _currentBranch) {
-      list.classList.add("hidden"); return;
-    }
-    fetch(api("sessions", branch !== undefined ? branch : _currentBranch))
+    if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
+    fetch(api("all_sessions"))
       .then((r) => r.json()).then((items) => {
         list.innerHTML = "";
         if (!items.length) {
@@ -529,14 +496,20 @@
         }
         items.forEach((it) => {
           const div = document.createElement("div");
-          div.className = "ai-session-item" + (it.active ? " active" : "");
+          // 高亮判定：纯前端逻辑——当前正在查看的 session 文件才标 active
+          const isActive = it.file === _currentSessionFile;
+          div.className = "ai-session-item" + (isActive ? " active" : "");
           const d = new Date(it.modified * 1000);
-          div.innerHTML = "<span>" + d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" }) +
-            "</span><span>" + it.user_messages + t("nMessages") + "</span>";
-          div.title = it.name;
+          const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
+          const branchTag = it.branch_uid
+            ? '<span class="ai-session-branch">' + esc(it.display_label || it.branch_label || it.branch_uid.slice(0, 5)) + "</span>"
+            : '<span class="ai-session-branch root">root</span>';
+          const msgCount = '<span class="ai-session-count">' + it.user_messages + t("nMessages") + "</span>";
+          div.innerHTML = "<span class='ai-session-time'>" + time + "</span>" + branchTag + msgCount;
+          div.title = it.name + (it.branch_label ? " — " + it.branch_label : "");
           div.dataset.file = it.file;
-          div.dataset.branch = branch !== undefined ? branch : _currentBranch;
-          div.addEventListener("click", () => switchSession(it.file, branch !== undefined ? branch : _currentBranch));
+          div.dataset.branch = it.branch_uid || "";
+          div.addEventListener("click", () => switchSession(it.file, it.branch_uid || ""));
           list.appendChild(div);
         });
         list.classList.remove("hidden");
@@ -547,9 +520,17 @@
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_file: file }),
     }).then(() => {
+      _currentBranch = branch || "";  // 切 session 时同步分支上下文
+      _currentSessionFile = file;     // 前端维护当前查看的 session
+      setStreaming(false);  // 清掉旧 session 的"思考中/中止"UI 残留
+      disconnectSSE();
       document.getElementById("ai-messages").innerHTML = "";
       document.getElementById("ai-session-list").classList.add("hidden");
+      loadAgentLabel();
+      refreshAgents();
       loadHistory();
+      connectSSE();
+      recoverStreamState();  // 与目标 session 的实际 streaming 状态对齐
     }).catch(() => {});
   }
   /* ── 发送 / 中止 / 新建 ── */
@@ -633,7 +614,14 @@
     if (target) {
       _mindMap.renderer.clearActiveNode();
       _mindMap.renderer.addNodeToActiveList(target, true);
+      // 选中后把节点居中到画布中心（保持当前缩放级别）
+      try { _mindMap.renderer.moveNodeToCenter(target); } catch (_) {}
     }
+  }
+  function focusBranchNode() {
+    // 点击 header 左上角分支标签：聚焦到当前分支根节点（root agent 无分支，忽略）
+    if (!_currentBranch || !_mindMap) return;
+    focusNode(_currentBranch);
   }
   function findNodeByUid(node, uid) {
     if (!node) return null;

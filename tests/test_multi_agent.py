@@ -1,8 +1,11 @@
 """多 agent 分支隔离测试：写路径分支校验、整树替换限制、diff 快照隔离。"""
 import json
+import os
+from pathlib import Path
 
 import chat_service
 from conftest import MAP_KEY, all_uids, disk_doc, find_by_uid, sample_doc
+from chat_service import safe_key_slug
 
 
 def test_branch_agent_update_within_branch_ok(env):
@@ -163,3 +166,135 @@ def test_display_label_truncate(env):
     assert cs._display_label("恰好五个字") == "恰好五个字"
     assert cs._display_label("超过五个字的完整分支名") == "超过五个字…"
     assert cs._display_label("") == ""
+
+
+def test_reset_new_branch_appears_in_agents(env):
+    """bug 回归：reset 新分支（mapping 无条目）后，agents 列表能列出它，
+    且 label 是节点可读文本（前5字），不是 uid。"""
+    import backend as be
+    # 新分支：Charles 抓包（a-1-1 的完整 uid 对应 sample_doc 里的节点）
+    # sample_doc: root-1 → [a-1 节点A → [a-1-1 节点A1, a-1-2 节点A2], b-1 节点B]
+    client = env
+    # 先 reset 一个 mapping 里没有的新分支（a-1-1 节点 A1）
+    r = client.post(f"/api/chat/{MAP_KEY}/reset", params={"branch": "a-1-1"})
+    assert r.status_code == 200
+    agents = client.get(f"/api/chat/{MAP_KEY}/agents").json()
+    branch_agent = [a for a in agents if a["branch_uid"] == "a-1-1"]
+    assert len(branch_agent) == 1, f"新分支未出现在 agents 列表: {agents}"
+    # label 应为节点可读文本（节点A1），display_label 前 5 字；绝不能是 uid
+    assert branch_agent[0]["label"] == "节点A1", f"label 错误: {branch_agent[0]['label']!r}"
+    assert branch_agent[0]["display_label"] == "节点A1"
+    assert not branch_agent[0]["label"].startswith("a-1-1"), "label 是 uid，bug 未修复"
+
+
+def test_has_history_semantics(env):
+    """has_history：「+」语义决策依据。占位/空 session = False（幂等切换），
+    有实际用户消息 = True（新开一轮）。"""
+    client = env
+    # 1) 新分支占位条目（reset 后无会话文件）→ has_history=False
+    r = client.post(f"/api/chat/{MAP_KEY}/reset", params={"branch": "a-1-1"})
+    assert r.status_code == 200
+    ag = [a for a in client.get(f"/api/chat/{MAP_KEY}/agents").json() if a["branch_uid"] == "a-1-1"]
+    assert ag and ag[0]["has_history"] is False
+    # 2) 往该分支写入实际对话（模拟用户交流：session 文件含 user 消息）
+    import backend as be
+    # 用 mapping 指向一个真实带 user 消息的 session 文件
+    fake_sf = str(Path(be.chat_service.SESSION_DIR) / "fake_hist.smm.jsonl")
+    Path(fake_sf).write_text('{"type":"message","message":{"role":"user","content":"hi"}}\n')
+    be.chat_manager._mapping[MAP_KEY + "::a-1-1"] = fake_sf
+    ag = [a for a in client.get(f"/api/chat/{MAP_KEY}/agents").json() if a["branch_uid"] == "a-1-1"]
+    assert ag and ag[0]["has_history"] is True
+    # 3) 无 mapping 条目的分支（从未创建）→ has_history=False
+    ag = [a for a in client.get(f"/api/chat/{MAP_KEY}/agents").json() if a["branch_uid"] == "b-1"]
+    assert not ag  # 从未创建的 branch 不在列表里
+
+
+def test_all_sessions_flat_sorted_with_branch_tags(env):
+    """all_sessions：root + 分支混排、按最后对话时间倒序、分支带标签。"""
+    import backend as be
+    client = env
+    # 造两个 session 文件：一个 root、一个分支，消息 timestamp 不同
+    sd = be.chat_service.SESSION_DIR
+    root_sf = str(sd / (safe_key_slug(MAP_KEY) + "__old.jsonl"))
+    branch_sf = str(sd / (safe_key_slug(MAP_KEY) + "__a-1-1__new.jsonl"))
+    # 消息时间：root 旧（2026-07-01），分支新（2026-07-02）
+    Path(root_sf).write_text(
+        '{"type":"message","message":{"role":"user","content":"r"},"timestamp":"2026-07-01T00:00:00.000Z"}\n'
+    )
+    Path(branch_sf).write_text(
+        '{"type":"message","message":{"role":"user","content":"b"},"timestamp":"2026-07-02T00:00:00.000Z"}\n'
+    )
+    # 文件 mtime 故意设成相反（root 新、分支旧）——验证排序用的是消息时间而非 mtime
+    old_t = 2000.0
+    new_t = 1000.0
+    os.utime(root_sf, (old_t, old_t))
+    os.utime(branch_sf, (new_t, new_t))
+    # 模拟分支 mapping：branch_sf 属于 a-1-1 分支
+    be.chat_manager._mapping[MAP_KEY + "::a-1-1"] = branch_sf
+    items = client.get(f"/api/chat/{MAP_KEY}/all_sessions").json()
+    assert len(items) >= 2
+    # 按消息时间倒序：分支（07-02）应排在 root（07-01）前，即使 root mtime 更新
+    idx_root = next(i for i, it in enumerate(items) if it["file"] == root_sf)
+    idx_branch = next(i for i, it in enumerate(items) if it["file"] == branch_sf)
+    assert idx_branch < idx_root, f"排序错误: branch@{idx_branch} root@{idx_root}"
+    # 分支带标签，root 无 branch_uid
+    branch_item = next(i for i in items if i["branch_uid"] == "a-1-1")
+    assert branch_item["display_label"] == "节点A1"
+    root_item = next(i for i in items if i["branch_uid"] == "")
+    # root 不返回硬编码中文 label（前端用 i18n t("rootAgent") 显示）
+    assert root_item["display_label"] == ""
+    # modified 是消息时间戳（不是文件 mtime）
+    assert abs(branch_item["modified"] - 1782950400.0) < 2  # 2026-07-02 UTC
+
+
+def test_session_modified_is_last_message_ts(env):
+    """bug 回归：历史 session 的 modified 来自最后一条消息时间戳，
+    不依赖文件 mtime——选中/读取 session 不应改变排序时间。"""
+    import backend as be
+    client = env
+    sd = be.chat_service.SESSION_DIR
+    prefix = safe_key_slug(MAP_KEY) + "__"
+    sf = str(sd / (prefix + "ts.jsonl"))
+    Path(sf).write_text(
+        '{"type":"session","timestamp":"2026-07-01T00:00:00.000Z"}\n'
+        '{"type":"message","message":{"role":"user","content":"a"},"timestamp":"2026-07-03T12:00:00.000Z"}\n'
+        '{"type":"model_change","timestamp":"2026-07-04T00:00:00.000Z"}\n'
+    )
+    # 文件 mtime 设为 2026-07-05（比最后消息晚）——验证不采用 mtime
+    later = 1783209600.0  # 2026-07-05
+    os.utime(sf, (later, later))
+    items = client.get(f"/api/chat/{MAP_KEY}/all_sessions").json()
+    it = next(i for i in items if i["file"] == sf)
+    # 应为最后一条 message 的时间（07-03T12:00 = 1783080000），
+    # 不是 model_change（07-04）也不是 mtime（07-05）
+    assert abs(it["modified"] - 1783080000.0) < 2, f"modified={it['modified']}"
+
+
+def test_active_removed_from_all_sessions(env):
+    """bug 回归：all_sessions 不再返回 active 字段（高亮纯前端逻辑）。"""
+    client = env
+    items = client.get(f"/api/chat/{MAP_KEY}/all_sessions").json()
+    assert all("active" not in i for i in items)
+
+
+def test_old_session_branch_slug_fallback(env):
+    """bug 回归：同一分支的旧 session（不在 mapping 中）仍应显示正确分支标签。
+
+    mapping 只记录当前活跃会话；旧 session 文件只能靠文件名 slug 反查分支。
+    """
+    import backend as be
+    client = env
+    sd = be.chat_service.SESSION_DIR
+    prefix = safe_key_slug(MAP_KEY) + "__"
+    # 旧分支 session：文件名 slug 来自 safe_key_slug(uid)[:8]，a-1-1 保留 - 仍是 "a-1-1"
+    slug = "a-1-1"
+    old_sf = str(sd / (prefix + slug + "__old.jsonl"))
+    Path(old_sf).write_text('{"type":"message","message":{"role":"user","content":"old"}}\n')
+    # mapping 里只有 root 和另一个活跃分支
+    be.chat_manager._mapping[MAP_KEY] = str(sd / (prefix + "root.jsonl"))
+    Path(be.chat_manager._mapping[MAP_KEY]).write_text('{"type":"message","message":{"role":"user","content":"r"}}\n')
+    items = client.get(f"/api/chat/{MAP_KEY}/all_sessions").json()
+    old_it = next(i for i in items if i["file"] == old_sf)
+    # slug 前缀匹配 a-1-1 节点 → 应标为分支 a-1-1，不是 root
+    assert old_it["branch_uid"] == "a-1-1", f"旧 session 分支归属错误: {old_it['branch_uid']!r}"
+    assert old_it["display_label"] == "节点A1"

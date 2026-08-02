@@ -321,6 +321,11 @@ def api_chat_sessions(map_key: str, branch: str = ""):
     _check_map_key(map_key)
     return chat_manager.list_sessions(map_key, branch)
 
+@app.get("/api/chat/{map_key}/all_sessions")
+def api_chat_all_sessions(map_key: str):
+    _check_map_key(map_key)
+    return chat_manager.all_sessions(map_key)
+
 @app.get("/api/chat/{map_key}/agents")
 def api_chat_agents(map_key: str):
     _check_map_key(map_key)

@@ -1022,7 +1022,10 @@ function onContextMenu(e, wrapper) {
     if (!action) return;
     if (action === 'rename') showRenameModal(name);
     else if (action === 'copy') copyFilePath(name);
-    else if (action === 'delete') { if (confirm(_L('确定删除 ', 'Delete ') + name + '?')) deleteFile(ctxTarget); }
+    // 用闭包捕获的 wrapper/name，不用 ctxTarget——document 捕获阶段的
+    // closeContextMenu 会在点击菜单项时先把 ctxTarget 清成 null，
+    // 之前 deleteFile(ctxTarget) 因此抛 TypeError，删除静默失效
+    else if (action === 'delete') { if (confirm(_L('确定删除 ', 'Delete ') + name + '?')) deleteFile(wrapper); }
     closeContextMenu();
   });
   document.body.appendChild(ctxMenu);

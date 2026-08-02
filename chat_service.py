@@ -75,6 +75,19 @@ def _background_text(map_key: str) -> str:
     return ""
 
 
+def _display_label(label: str, max_len: int = 5) -> str:
+    """给用户 UI 看的分支名：前 max_len 个字符，超出加省略号。
+
+    与 _branch_label（给 AI system prompt 的完整名）分开：AI 需要全名
+    理解上下文，用户界面只显示短标签避免撑爆面板。
+    """
+    if not label:
+        return label
+    if len(label) <= max_len:
+        return label
+    return label[:max_len] + "…"
+
+
 def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> str:
     """取分支根节点的文本标签，用于注入 system prompt 分支职责说明。
 
@@ -639,6 +652,7 @@ class ChatSessionManager:
         agents[""] = {
             "branch_uid": "",
             "label": "整张脑图",
+            "display_label": "整张脑图",
             "session_file": root_sf,
             "streaming": self._sessions.get(map_key, None) is not None
             and self._sessions[map_key]._in_turn,
@@ -649,9 +663,11 @@ class ChatSessionManager:
             if mkey != map_key or not b:
                 continue
             sess = self._sessions.get(skey)
+            full = _branch_label(map_key, b, self._map_state.get(map_key))
             agents[b] = {
                 "branch_uid": b,
-                "label": _branch_label(map_key, b, self._map_state.get(map_key)),
+                "label": full,
+                "display_label": _display_label(full),
                 "session_file": sf,
                 "streaming": sess is not None and sess._in_turn,
             }

@@ -153,3 +153,13 @@ def test_agents_list(env):
     assert any(a["branch_uid"] == "" for a in agents)      # root
     assert any(a["branch_uid"] == "a-1" for a in agents)   # 分支 A
     assert any(a["label"] == "节点A" for a in agents)      # 分支标签从脑图取
+    assert any(a["display_label"] == "节点A" for a in agents)  # 5 字内不截断
+
+
+def test_display_label_truncate(env):
+    """display_label：超过 5 字截断加省略号，label 保留完整。"""
+    import chat_service as cs
+    assert cs._display_label("短") == "短"
+    assert cs._display_label("恰好五个字") == "恰好五个字"
+    assert cs._display_label("超过五个字的完整分支名") == "超过五个字…"
+    assert cs._display_label("") == ""

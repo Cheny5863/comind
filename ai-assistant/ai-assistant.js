@@ -416,7 +416,9 @@
     const el = document.getElementById("ai-agent-label");
     if (!el) return;
     const ag = _agents.find((a) => (a.branch_uid || "") === _currentBranch);
-    el.textContent = (ag && ag.label) ? ag.label : (_currentBranch ? _currentBranch.slice(0, 8) : t("rootAgent"));
+    const display = (ag && (ag.display_label || ag.label)) ? (ag.display_label || ag.label)
+      : (_currentBranch ? _currentBranch.slice(0, 5) : t("rootAgent"));
+    el.textContent = display;
     el.classList.toggle("is-branch", !!_currentBranch);
   }
   function refreshAgents(cb) {
@@ -443,10 +445,11 @@
         div.className = "ai-agent-item" + (isActive ? " active" : "") +
           (ag.streaming ? " streaming" : "");
         div.dataset.branch = ag.branch_uid || "";
-        const label = ag.label || (ag.branch_uid ? ag.branch_uid.slice(0, 8) : t("rootAgent"));
+        const label = (ag.display_label || ag.label) || (ag.branch_uid ? ag.branch_uid.slice(0, 5) : t("rootAgent"));
+        const fullTitle = ag.label || label;
         const badge = ag.streaming ? ' <span class="ai-agent-badge">💭</span>' : "";
         const act = isActive ? ' <span class="ai-agent-badge">' + t("activeAgent") + "</span>" : "";
-        div.innerHTML = "<span class='ai-agent-name'>" + esc(label) + badge + act + "</span>" +
+        div.innerHTML = "<span class='ai-agent-name' title='" + esc(fullTitle) + "'>" + esc(label) + badge + act + "</span>" +
           (ag.branch_uid ? "<span class='ai-agent-hist' data-role='hist'>📂</span>" : "");
         list.appendChild(div);
       });

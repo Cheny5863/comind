@@ -31,7 +31,6 @@
       noHistory: "暂无历史会话",
       noNodeSelected: "请先选中一个节点，再新建分支 Agent",
       nMessages: " 条",
-      aborting: "正在终止…",
       switchingModel: "切换模型…",
       switchFailed: "切换失败",
       loading: "加载中…",
@@ -76,7 +75,6 @@
       noHistory: "No sessions yet",
       noNodeSelected: "Select a node first to create a branch agent",
       nMessages: " msgs",
-      aborting: "Stopping…",
       switchingModel: "Switching model…",
       switchFailed: "Switch failed",
       loading: "Loading…",
@@ -153,6 +151,19 @@
     if (!file) return;
     try { localStorage.setItem("comind_read_ts:" + mapKey() + ":" + file, String(Date.now() / 1000)); } catch (_) {}
   }
+  /* ── 上次查看的 session：进入页面打开面板时恢复，而不是固定回 root ── */
+  function lastViewKey() { return "comind_last_view:" + mapKey(); }
+  function readLastView() {
+    try { return JSON.parse(localStorage.getItem(lastViewKey()) || "null"); } catch (_) { return null; }
+  }
+  function recordLastView(file, branch) {
+    if (!file) return;
+    try {
+      const cur = readLastView();
+      if (cur && cur.file === file && (cur.branch || "") === (branch || "")) return;
+      localStorage.setItem(lastViewKey(), JSON.stringify({ file, branch: branch || "", ts: Date.now() }));
+    } catch (_) {}
+  }
 
   function mapKey() { return window.currentFileName || ""; }
   function api(suffix, branch) {
@@ -183,19 +194,39 @@
     panel.id = "ai-panel"; panel.className = "ai-panel hidden";
     panel.innerHTML = `
       <div class="ai-header" id="ai-header">
-        <span class="ai-title" id="ai-title">${t("assistant")}</span>
+        <span class="ai-title" id="ai-title">🤖 ${t("assistant")}</span>
         <span class="ai-agent-label" id="ai-agent-label" title="${t("switchAgent")}"></span>
         <span class="ai-busy hidden" id="ai-busy" title="${t("busyTitle")}"></span>
         <span class="ai-status" id="ai-status"></span>
-        <select class="ai-model-select" id="ai-model" title="${t("modelTitle")}"></select>
+        <span class="ai-flex"></span>
         <button class="ai-btn-sm" id="ai-new" title="${t("newChat")}">＋</button>
         <button class="ai-btn-sm" id="ai-hist" title="${t("history")}">📂</button>
-        <button class="ai-btn-sm" id="ai-keys" title="${t("modelSettings")}">⚙️</button>
-        <button class="ai-btn-sm" id="ai-bg" title="${t("background")}">📝</button>
         <button class="ai-btn-sm" id="ai-close" title="${t("close")}">✕</button>
       </div>
-      <div class="ai-session-list hidden" id="ai-session-list"></div>
-      <div class="ai-messages" id="ai-messages"></div>
+      <div class="ai-body">
+        <div class="ai-session-list hidden" id="ai-session-list"></div>
+        <div class="ai-messages" id="ai-messages" data-empty="${t("noHistory")}"></div>
+        <div class="ai-bg-drawer hidden" id="ai-bg-drawer">
+          <textarea id="ai-bg-text" placeholder="${t("bgPlaceholder")}"></textarea>
+          <div class="bar">
+            <button class="ai-bg-close" id="ai-bg-close">${t("close")}</button>
+            <button class="ai-bg-save" id="ai-bg-save">${t("save")}</button>
+          </div>
+        </div>
+        <div class="ai-bg-drawer hidden" id="ai-keys-drawer">
+          <div class="ai-keys-title">${t("modelSettings")}</div>
+          <div class="ai-keys-hint">${t("keysHint")}</div>
+          <div class="ai-keys-list" id="ai-keys-list"></div>
+          <div class="bar">
+            <button class="ai-bg-close" id="ai-keys-close">${t("close")}</button>
+          </div>
+        </div>
+      </div>
+      <div class="ai-toolbar">
+        <select class="ai-model-select" id="ai-model" title="${t("modelTitle")}"></select>
+        <button class="ai-tool-btn" id="ai-bg" title="${t("background")}">📝 <span>${t("background")}</span></button>
+        <button class="ai-tool-btn" id="ai-keys" title="${t("modelSettings")}">⚙️ <span>${t("modelSettings")}</span></button>
+      </div>
       <div class="ai-input-area">
         <div class="ai-input-wrap">
           <div class="ai-input" id="ai-input" contenteditable="true"
@@ -206,21 +237,7 @@
           <button class="ai-abort hidden" id="ai-abort">${t("abort")}</button>
         </div>
       </div>
-      <div class="ai-bg-drawer hidden" id="ai-bg-drawer">
-        <textarea id="ai-bg-text" placeholder="${t("bgPlaceholder")}"></textarea>
-        <div class="bar">
-          <button class="ai-bg-close" id="ai-bg-close">${t("close")}</button>
-          <button class="ai-bg-save" id="ai-bg-save">${t("save")}</button>
-        </div>
-      </div>
-      <div class="ai-bg-drawer hidden" id="ai-keys-drawer">
-        <div class="ai-keys-title">${t("modelSettings")}</div>
-        <div class="ai-keys-hint">${t("keysHint")}</div>
-        <div class="ai-keys-list" id="ai-keys-list"></div>
-        <div class="bar">
-          <button class="ai-bg-close" id="ai-keys-close">${t("close")}</button>
-        </div>
-      </div>`;
+      <div class="ai-resize" id="ai-resize" title="拖拽调整大小"></div>`;
     document.body.appendChild(panel);
 
     fab.addEventListener("click", togglePanel);
@@ -247,9 +264,16 @@
       if (chip && chip.dataset.uid) focusNode(chip.dataset.uid);
     });
     initDrag(panel, document.getElementById("ai-header"));
+    initResize(panel);
+  }
+
+  /* ── 移动端检测：≤640px 视为触屏设备，走全屏沉浸式布局（无拖拽/无 resize）── */
+  function isMobile() {
+    return window.matchMedia("(max-width: 640px)").matches;
   }
 
   function initDrag(panel, handle) {
+    if (isMobile()) return; // 移动端全屏，无需拖动
     let dragging = false, sx, sy, sl, st;
     handle.style.cursor = "grab";
     handle.addEventListener("mousedown", (e) => {
@@ -261,11 +285,51 @@
     });
     document.addEventListener("mousemove", (e) => {
       if (!dragging) return;
-      panel.style.left = (sl + e.clientX - sx) + "px";
-      panel.style.top = (st + e.clientY - sy) + "px";
+      // 边界限制：面板至少留 80px 在视口内，防止拖出屏幕找不回来
+      const maxLeft = window.innerWidth - 80;
+      const maxTop = window.innerHeight - 80;
+      panel.style.left = Math.min(Math.max(0, sl + e.clientX - sx), maxLeft) + "px";
+      panel.style.top = Math.min(Math.max(0, st + e.clientY - sy), maxTop) + "px";
       panel.style.right = "auto"; panel.style.bottom = "auto";
     });
     document.addEventListener("mouseup", () => { dragging = false; });
+  }
+
+  /* ── 拖拽调整大小：右下角 handle，尺寸记忆 localStorage ── */
+  function initResize(panel) {
+    if (isMobile()) return; // 移动端全屏，无需调整
+    // 恢复上次调整的尺寸
+    try {
+      const s = JSON.parse(localStorage.getItem("comind_panel_size") || "null");
+      if (s && s.w >= 340 && s.h >= 380) {
+        panel.style.width = s.w + "px";
+        panel.style.height = s.h + "px";
+      }
+    } catch (_) {}
+    const handle = document.getElementById("ai-resize");
+    if (!handle) return;
+    let resizing = false, sx, sy, sw, sh;
+    handle.addEventListener("mousedown", (e) => {
+      resizing = true;
+      const r = panel.getBoundingClientRect();
+      sx = e.clientX; sy = e.clientY; sw = r.width; sh = r.height;
+      e.preventDefault(); e.stopPropagation();
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!resizing) return;
+      const w = Math.min(Math.max(sw + e.clientX - sx, 340), window.innerWidth - 16);
+      const h = Math.min(Math.max(sh + e.clientY - sy, 380), window.innerHeight - 100);
+      panel.style.width = w + "px";
+      panel.style.height = h + "px";
+    });
+    document.addEventListener("mouseup", () => {
+      if (!resizing) return;
+      resizing = false;
+      try {
+        localStorage.setItem("comind_panel_size",
+          JSON.stringify({ w: panel.offsetWidth, h: panel.offsetHeight }));
+      } catch (_) {}
+    });
   }
 
   function togglePanel() {
@@ -278,7 +342,21 @@
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ open: !nowHidden }),
     }).catch(() => {});
-    if (!nowHidden) { loadHistory(); connectSSE(); loadModels(); recoverStreamState(); refreshAgents(); startPolling(); } else { disconnectSSE(); stopPolling(); }
+    if (!nowHidden) {
+      // 恢复上次查看的 session（刷新后不固定回 root）；无记录/记录失效则默认流程
+      const rec = readLastView();
+      if (rec && rec.file) {
+        fetch(api("all_sessions")).then((r) => r.json()).then((items) => {
+          if (items.some((it) => it.file === rec.file)) {
+            switchSession(rec.file, rec.branch || "");
+            loadModels(); startPolling();
+          } else { openPanelRoutine(); }
+        }).catch(() => openPanelRoutine());
+      } else { openPanelRoutine(); }
+    } else { disconnectSSE(); stopPolling(); }
+  }
+  function openPanelRoutine() {
+    loadHistory(); connectSSE(); loadModels(); recoverStreamState(); refreshAgents(); startPolling();
   }
   function openPanelFlash() {
     const panel = document.getElementById("ai-panel");
@@ -334,7 +412,8 @@
     _streaming = on;
     document.getElementById("ai-send").classList.toggle("hidden", on);
     document.getElementById("ai-abort").classList.toggle("hidden", !on);
-    document.getElementById("ai-status").textContent = on ? t("thinking") : "";
+    // header 不显示「思考中」——聊天框内已有思考小窗实时展示
+    // （aborting/switchingModel 等瞬时状态由各自的流程直接赋值 status）
     if (!on) { _currentBubble = null; hideThinking(); }
   }
 
@@ -354,7 +433,10 @@
   function appendThinking(delta) {
     if (!_thinkEl) showThinking();
     _thinkText += delta || "";
-    _thinkEl.querySelector(".ai-thinking-body").textContent = _thinkText;
+    const body = _thinkEl.querySelector(".ai-thinking-body");
+    body.textContent = _thinkText;
+    // 固定小窗内自动滚到底部，始终显示最新思考内容（overflow hidden 无滚动条）
+    body.scrollTop = body.scrollHeight;
     const box = document.getElementById("ai-messages");
     box.scrollTop = box.scrollHeight;
   }
@@ -374,14 +456,61 @@
     addBubble("assistant", t("mapUpdated"));
   }
 
-  /* ── 消息渲染 ── */
+  /* ── 消息渲染（流式安全）──
+   * 支持：```代码块（未闭合时按纯文本，避免流式中途闪烁）、###~###### 标题、
+   *      引用、无序/有序列表、行内 code / **加粗** / *斜体* / [链接](http)
+   * 注意：行级块渲染，空行留白；所有内容先 esc 再加工，XSS 安全 */
+  function renderInline(s) {
+    s = esc(s);
+    s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return s;
+  }
   function renderMd(text) {
-    let h = esc(text);
-    h = h.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-    h = h.replace(/`([^`]+)`/g, "<code>$1</code>");
-    h = h.replace(/^### (.*)$/gm, "<strong>$1</strong>");
-    h = h.replace(/\n/g, "<br>");
-    return h;
+    const lines = String(text || "").split("\n");
+    const out = [];
+    let inCode = false, codeBuf = [];
+    const flushCode = () => {
+      if (codeBuf.length) {
+        out.push('<div class="ai-code">' + esc(codeBuf.join("\n")) + "</div>");
+        codeBuf = [];
+      }
+      inCode = false;
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const fence = line.match(/^```\w*\s*$/);
+      if (fence) {
+        if (inCode) flushCode(); else inCode = true;
+        continue;
+      }
+      if (inCode) { codeBuf.push(line); continue; }
+      const trimmed = line.trim();
+      if (!trimmed) { out.push('<div class="ai-gap"></div>'); continue; }
+      let block = "";
+      if (/^#{1,4}\s/.test(trimmed)) {
+        const level = trimmed.match(/^#{1,4}/)[0].length;
+        block = '<div class="ai-h' + level + '">' + renderInline(trimmed.replace(/^#{1,4}\s*/, "")) + "</div>";
+      } else if (/^&gt;\s?/.test(trimmed) || /^>\s?/.test(trimmed)) {
+        block = '<div class="ai-quote">' + renderInline(trimmed.replace(/^&gt;\s?/, "").replace(/^>\s?/, "")) + "</div>";
+      } else if (/^[-*+]\s+/.test(trimmed)) {
+        block = '<div class="ai-li">• ' + renderInline(trimmed.replace(/^[-*+]\s+/, "")) + "</div>";
+      } else if (/^\d+[.、]\s+/.test(trimmed)) {
+        const m = trimmed.match(/^(\d+)[.、]\s+(.*)$/);
+        block = '<div class="ai-li"><span class="ai-li-num">' + m[1] + ".</span> " + renderInline(m[2]) + "</div>";
+      } else {
+        block = '<div class="ai-line">' + renderInline(trimmed) + "</div>";
+      }
+      out.push(block);
+    }
+    if (inCode) {
+      // 代码块未闭合（流式中间态）：剩余行按纯文本渲染，避免整个块消失闪烁
+      codeBuf.forEach((l) => { if (l.trim()) out.push('<div class="ai-line">' + renderInline(l) + "</div>"); });
+    }
+    return out.join("");
   }
   function addBubble(role, html) {
     const box = document.getElementById("ai-messages");
@@ -456,6 +585,7 @@
       if (cur && cur.session_file) {
         _currentSessionFile = cur.session_file;
         markRead(_currentSessionFile);  // 正在查看 = 已读，历史列表不显示红点
+        recordLastView(_currentSessionFile, _currentBranch);  // 记住"上次查看"，刷新后恢复
       }
       if (cb) cb(_agents);
     }).catch(() => {});
@@ -646,19 +776,10 @@
     });
   }
   function abortChat() {
+    // 秒停：立即恢复 UI（清思考小窗、恢复发送按钮），不显示「停止中」
+    // 后端 abort 在后台处理（pi 快速停止，超时强制 kill）
+    setStreaming(false);
     fetch(api("abort"), { method: "POST" }).catch(() => {});
-    // Optimistic: show "正在终止…" and poll status
-    document.getElementById("ai-status").textContent = t("aborting");
-    var _abortPoll = setInterval(function() {
-      fetch(api("status")).then(function(r) { return r.json(); }).then(function(d) {
-        if (!d.streaming) {
-          clearInterval(_abortPoll);
-          setStreaming(false);
-        }
-      }).catch(function() {});
-    }, 1000);
-    // Safety: stop polling after 10s regardless
-    setTimeout(function() { clearInterval(_abortPoll); }, 10000);
   }
 
   function onInputKeydown(e) {

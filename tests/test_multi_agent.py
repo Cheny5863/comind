@@ -33,6 +33,53 @@ def test_branch_agent_add_under_own_branch_ok(env):
     assert r.json()["applied"] == 1
 
 
+def test_branch_agent_add_parent_ref_chain_ok(env):
+    """分支 agent 链式 add + ref：往同批次新建节点下加子节点，必须成功。
+
+    回归 2026-08-02 movexbot 发现的 bug：白名单集合是操作开始时从磁盘
+    构建的，不含本批次新建的 uid，导致通过 ref 引用新节点时被误判
+    「不在你的分支内」拒绝（applied=1, errors=[...]）。
+    修复方案（Ian）：改用 parent 链祖先判断，新节点挂分支内父节点下天然满足。
+    """
+    client = env
+    r = client.post("/api/mindmap/apply_ops", json={
+        "key": MAP_KEY, "branch_uid": "a-1",
+        "ops": [
+            {"action": "add", "parent_uid": "a-1-1", "text": "链式父", "ref": "chain_a"},
+            {"action": "add", "parent_ref": "chain_a", "text": "链式子", "ref": "chain_b"},
+        ],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["applied"] == 2, body
+    assert not body["errors"], body
+    uid_a = body["created"]["chain_a"]
+    root = disk_doc()["mindMapData"]["root"]
+    node_a = find_by_uid(root, uid_a)
+    assert node_a is not None
+    assert node_a["children"][0]["data"]["text"] == "<p>链式子</p>"
+
+
+def test_branch_agent_move_within_branch_ok(env):
+    """分支 agent 在自己分支内移动节点：成功，move 后同批次仍能继续操作该节点（parent 链同步）。"""
+    client = env
+    r = client.post("/api/mindmap/apply_ops", json={
+        "key": MAP_KEY, "branch_uid": "a-1",
+        "ops": [
+            {"action": "move", "uid": "a-1-1", "new_parent_uid": "a-1-2"},
+            {"action": "update_text", "uid": "a-1-1", "text": "A1移动后改名"},
+        ],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["applied"] == 2, body
+    assert not body["errors"], body
+    root = disk_doc()["mindMapData"]["root"]
+    a2 = find_by_uid(root, "a-1-2")
+    assert a2["children"][0]["data"]["uid"] == "a-1-1"
+    assert find_by_uid(root, "a-1-1")["data"]["text"] == "<p>A1移动后改名</p>"
+
+
 def test_branch_agent_update_outside_branch_rejected(env):
     """分支 agent 改分支外的节点：拒绝。"""
     client = env

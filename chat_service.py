@@ -539,9 +539,10 @@ class ChatSessionManager:
         sess = self._sessions.get(session_key(map_key, branch_uid))
         if sess and sess.alive:
             sess.send({"type": "abort"})
-            # If pi doesn't end the turn within 5s, force-kill and respawn
+            # 秒停：pi 正常响应 abort 很快；短窗口（1.5s）后仍未结束则强制
+            # 清 buffer + 广播 agent_end + kill，保证前端不再收到残留流内容
             def _force_kill():
-                time.sleep(5)
+                time.sleep(1.5)
                 if sess._in_turn and sess.alive:
                     logger.warning("abort timeout for %s, force-killing pi", map_key)
                     sess._in_turn = False
@@ -1517,15 +1518,44 @@ def _unregister_subtree(node: dict, index: dict) -> None:
         _unregister_subtree(c, index)
 
 
-def _collect_branch_uids(root: dict, branch_uid: str) -> set[str] | None:
-    """返回分支根节点及其子孙的所有 uid 集合；branch_uid 空（root agent）返回 None（不限制）。"""
+def _belongs_to_branch(uid: str, branch_uid: str, parents: dict) -> bool:
+    """节点是否在以 branch_uid 为根的子树内（含分支根自身）。
+
+    Ian 方案（2026-08-02）：不预计算白名单集合，而是沿 parent 链向上爬，
+    祖先链中存在 branch_uid 即属于该分支。实时位置即真相：
+    - 同批次新建节点天然满足（挂在分支内父节点下）
+    - move 移入/移出分支后归属实时变化，无需维护过期集合
+    """
     if not branch_uid:
-        return None
-    idx = _index_by_uid(root)
-    branch_node = idx.get(branch_uid)
-    if branch_node is None:
-        return set()  # 分支根不存在——拒绝一切写
-    return set(_index_by_uid(branch_node).keys())
+        return True
+    cur = uid or ""
+    guard = 0
+    while cur:
+        if cur == branch_uid:
+            return True
+        cur = parents.get(cur) or ""  # 根节点的 parent 是 ""，爬到头自然终止
+        guard += 1
+        if guard > 100000:  # 防环保险
+            return False
+    return False
+
+
+def _register_parents(node: dict, parent_uid: str, parents: dict) -> None:
+    """把新节点子树注册进 parent 索引（add 后调用）。"""
+    uid = node.get("data", {}).get("uid")
+    if uid:
+        parents[uid] = parent_uid
+    for c in node.get("children", []) or []:
+        _register_parents(c, uid, parents)
+
+
+def _unregister_parents(node: dict, parents: dict) -> None:
+    """把删除节点的子树从 parent 索引移除（delete 后调用）。"""
+    uid = node.get("data", {}).get("uid")
+    if uid:
+        parents.pop(uid, None)
+    for c in node.get("children", []) or []:
+        _unregister_parents(c, parents)
 
 
 def apply_ops(manager: ChatSessionManager, key: str, ops: list, branch_uid: str = "") -> dict:
@@ -1557,7 +1587,9 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
     root = file_md.get("root", file_md)
     if not root or not isinstance(root, dict) or "data" not in root:
         return {"applied": 0, "errors": ["脑图为空或不存在"]}
-    allowed = _collect_branch_uids(root, branch_uid)
+    # parent 链索引：uid → parent_uid。分支归属用祖先链判断（见 _belongs_to_branch），
+    # 不预计算白名单——add/move 后归属自动正确，无需手动维护集合
+    parents = _index_with_parent(root)
     applied, errors, created, refs = 0, [], {}, {}
     root_uid = root.get("data", {}).get("uid")
 
@@ -1569,10 +1601,10 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
             children.append(node)
 
     def check_allowed(uid: str, op_idx: int, what: str) -> bool:
-        """分支越界校验：allowed 为 None（root）不限制。"""
-        if allowed is None:
+        """分支越界校验：branch_uid 空（root agent）不限制。"""
+        if not branch_uid:
             return True
-        if uid in allowed:
+        if _belongs_to_branch(uid, branch_uid, parents):
             return True
         errors.append(f"op[{op_idx}]: {what} uid {uid} 不在你的分支内（分支根 {branch_uid}）；其他分支由其他 agent 负责")
         return False
@@ -1606,6 +1638,9 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
             node = _node_from_spec(op)
             insert_child(parent, node, op.get("index"))
             _register_subtree(node, old_by_uid)
+            # 新节点挂在分支内父节点下，天然属于本分支；注册进 parent 链，
+            # 同批次后续 op 用 ref 引用它（往新节点下加子节点等）时归属判断自动通过
+            _register_parents(node, parent.get("data", {}).get("uid", ""), parents)
             if op.get("ref"):
                 refs[op["ref"]] = node["data"]["uid"]
                 created[op["ref"]] = node["data"]["uid"]
@@ -1621,6 +1656,7 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
                 errors.append(f"op[{i}]: uid {uid} 不存在")
                 continue
             _unregister_subtree(node, old_by_uid)
+            _unregister_parents(node, parents)
             applied += 1
         elif action == "move":
             if not check_allowed(uid, i, "目标节点"):
@@ -1646,6 +1682,7 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
                 continue
             _delete_by_uid(root, uid)
             insert_child(new_parent, node, op.get("index"))
+            parents[uid] = np_uid  # move 后 parent 链更新（子树内部关系不变）
             applied += 1
         else:
             errors.append(f"op[{i}]: 未知 action {action!r}")

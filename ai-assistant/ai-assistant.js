@@ -33,6 +33,8 @@
       nMessages: " 条",
       switchingModel: "切换模型…",
       switchFailed: "切换失败",
+      thinkingLevel: "思考等级",
+      thinkingMax: "最大",
       loading: "加载中…",
       loadFailed: "加载失败",
       configured: "已配置 ✓",
@@ -77,6 +79,8 @@
       nMessages: " msgs",
       switchingModel: "Switching model…",
       switchFailed: "Switch failed",
+      thinkingLevel: "Thinking",
+      thinkingMax: "Max",
       loading: "Loading…",
       loadFailed: "Load failed",
       configured: "Configured ✓",
@@ -226,6 +230,7 @@
       </div>
       <div class="ai-toolbar">
         <select class="ai-model-select" id="ai-model" title="${t("modelTitle")}"></select>
+        <select class="ai-thinking-select" id="ai-thinking" title="${t("thinkingLevel")}"></select>
         <button class="ai-tool-btn" id="ai-bg" title="${t("background")}">📝 <span>${t("background")}</span></button>
         <button class="ai-tool-btn" id="ai-keys" title="${t("modelSettings")}">⚙️ <span>${t("modelSettings")}</span></button>
       </div>
@@ -255,6 +260,7 @@
     document.getElementById("ai-keys-close").addEventListener("click", closeKeys);
     document.getElementById("ai-keys-list").addEventListener("click", onKeysListClick);
     document.getElementById("ai-model").addEventListener("change", onModelChange);
+    document.getElementById("ai-thinking").addEventListener("change", onThinkingChange);
     // 点击左上角分支标签 → 脑图聚焦到该分支根节点
     document.getElementById("ai-agent-label").addEventListener("click", focusBranchNode);
 
@@ -883,6 +889,16 @@
   const KEY_PROVIDERS = [
     { id: "deepseek", name: "🔵 DeepSeek", placeholder: t("pasteKey") },
     { id: "moonshotai-cn", name: "🟣 Moonshot (Kimi)", placeholder: t("pasteKey") },
+    { id: "anthropic", name: "🟠 Anthropic (Claude)", placeholder: "sk-ant-…" },
+    { id: "openai", name: "🟢 OpenAI", placeholder: "sk-…" },
+    { id: "google", name: "🔴 Google (Gemini)", placeholder: "AI…" },
+    { id: "xai", name: "⚡ xAI (Grok)", placeholder: "xai-…" },
+    { id: "openrouter", name: "🌐 OpenRouter", placeholder: "sk-or-…" },
+    { id: "mistral", name: "🔷 Mistral", placeholder: t("pasteKey") },
+    { id: "groq", name: "🟡 Groq", placeholder: "gsk_…" },
+    { id: "fireworks", name: "🔥 Fireworks", placeholder: t("pasteKey") },
+    { id: "together", name: "🤝 Together AI", placeholder: t("pasteKey") },
+    { id: "kimi-coding", name: "🌙 Kimi for Coding", placeholder: t("pasteKey") },
   ];
   function openKeys() {
     const drawer = document.getElementById("ai-keys-drawer");
@@ -982,7 +998,29 @@
       if (d.current) {
         sel.value = d.current.provider + "|" + d.current.id;
       }
+      // 加载思考等级
+      loadThinkingLevels(d.thinkingLevel || "max");
     }).catch(() => {});
+  }
+  function loadThinkingLevels(currentLevel) {
+    const sel = document.getElementById("ai-thinking");
+    fetch(api("thinking_levels")).then((r) => r.json()).then((d) => {
+      const levels = d.levels || [];
+      sel.innerHTML = "";
+      if (!levels.length) {
+        // 模型不支持 thinking，隐藏下拉框
+        sel.style.display = "none";
+        return;
+      }
+      sel.style.display = "";
+      levels.forEach((lv) => {
+        const opt = document.createElement("option");
+        opt.value = lv;
+        opt.textContent = lv;
+        sel.appendChild(opt);
+      });
+      sel.value = currentLevel || levels[levels.length - 1] || "max";
+    }).catch(() => { sel.style.display = "none"; });
   }
   function onModelChange() {
     const sel = document.getElementById("ai-model");
@@ -996,7 +1034,17 @@
     }).then((r) => {
       status.textContent = r.ok ? "" : t("switchFailed");
       if (!r.ok) loadModels(); // 还原显示
+      else loadThinkingLevels("max"); // 换模型后刷新 thinking levels
     }).catch(() => { status.textContent = t("switchFailed"); });
+  }
+  function onThinkingChange() {
+    const sel = document.getElementById("ai-thinking");
+    const level = sel.value;
+    if (!level) return;
+    fetch(api("thinking_level"), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ level: level }),
+    }).catch(() => {});
   }
 
   /* ── 初始化 ── */

@@ -124,9 +124,20 @@ def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> s
 
 
 # provider id → 环境变量名（也用作 private/keys.json 的键名）
+# 包含 pi agent 支持的所有 API key 类型的 provider
 PROVIDER_ENV = {
     "deepseek": "DEEPSEEK_API_KEY",
     "moonshotai-cn": "MOONSHOT_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "xai": "XAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "kimi-coding": "KIMI_API_KEY",
 }
 
 
@@ -136,9 +147,8 @@ def _load_provider_keys() -> dict:
     读取优先级（从高到低）——本地私人工具，前端明确设置的 key 最优先：
     1. private/keys.json（前端「模型设置」写入，本机私有、git ignore）
     2. 环境变量（部署/进程级配置）
-    3. ~/.hermes（pi 的旧配置，兼容兜底）
     """
-    keys = {"DEEPSEEK_API_KEY": "", "MOONSHOT_API_KEY": ""}
+    keys = {env_var: "" for env_var in PROVIDER_ENV.values()}
     # ① private/keys.json（前端可改，最优先）
     try:
         if KEYS_PATH.is_file():
@@ -153,29 +163,6 @@ def _load_provider_keys() -> dict:
     for k in keys:
         if not keys[k]:
             keys[k] = os.environ.get(k, "")
-    # ③ ~/.hermes 兼容（旧配置兜底）
-    if not keys["DEEPSEEK_API_KEY"]:
-        env_file = Path(os.path.expanduser("~/.hermes/.env"))
-        if env_file.is_file():
-            try:
-                for line in env_file.read_text().splitlines():
-                    line = line.strip()
-                    if line.startswith("DEEPSEEK_API_KEY="):
-                        keys["DEEPSEEK_API_KEY"] = line.split("=", 1)[1].strip()
-                        break
-            except Exception:
-                pass
-    if not keys["MOONSHOT_API_KEY"]:
-        cfg_file = Path(os.path.expanduser("~/.hermes/config.yaml"))
-        if cfg_file.is_file():
-            try:
-                import yaml
-                cfg = yaml.safe_load(cfg_file.read_text()) or {}
-                keys["MOONSHOT_API_KEY"] = (
-                    (cfg.get("providers") or {}).get("kimi") or {}
-                ).get("api_key", "")
-            except Exception:
-                pass
     return {k: v for k, v in keys.items() if v}
 
 
@@ -271,6 +258,7 @@ class ChatSession:
         self._alive = False
         self._in_turn = False  # True between agent_start and agent_end
         self._abort_requested = False  # True after abort() until agent_end/kill
+        self._abort_gen = 0  # incremented on each abort; _force_kill only acts if unchanged
 
     def spawn(self) -> None:
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -329,6 +317,7 @@ class ChatSession:
             PI_BIN, "--mode", "rpc",
             "--provider", "deepseek",
             "--model", "deepseek-v4-flash",
+            "--thinking", "max",
             "-e", str(EXT_PATH),
             "--session-dir", str(SESSION_DIR),
             "--session", self.session_file,
@@ -371,6 +360,7 @@ class ChatSession:
                     if ev_type == "agent_start":
                         self._in_turn = True
                         self._abort_requested = False
+                        self._abort_gen += 1  # invalidate any pending _force_kill timer
                         sf = ev.get("sessionFile") or ev.get("session_file")
                         if sf:
                             self.session_file = sf
@@ -553,12 +543,19 @@ class ChatSessionManager:
         if sess and sess.alive:
             # 立即标记 abort —— _read_stdout 会吞掉后续内容事件，前端不再收到残留流
             sess._abort_requested = True
+            sess._abort_gen += 1
+            gen = sess._abort_gen  # capture for closure
             sess._buffer.clear()
             sess.send({"type": "abort"})
             # 秒停：pi 正常响应 abort 很快；短窗口（1.5s）后仍未结束则强制
             # 广播 agent_end + kill，保证前端不再收到残留流内容
             def _force_kill():
                 time.sleep(1.5)
+                # Only act if THIS abort is still the active one.
+                # If a new prompt arrived (agent_start resets _abort_requested)
+                # or another abort was issued, gen will have changed — bail out.
+                if sess._abort_gen != gen:
+                    return
                 if sess.alive and (sess._in_turn or sess._abort_requested):
                     logger.warning("abort timeout for %s, force-killing pi", map_key)
                     sess._in_turn = False
@@ -900,27 +897,21 @@ class ChatSessionManager:
             sess.unsubscribe(q)
 
     def get_models(self, map_key: str) -> dict:
-        """Available models + current model for this map's session.
-
-        Only the two enabled providers are exposed: deepseek + moonshotai-cn.
-        """
+        """Available models + current model + thinking level for this map's session."""
         sess = self.get_or_spawn(map_key)
         ev = self._rpc_request(sess, {"type": "get_available_models"})
         models = []
         if ev and ev.get("success"):
-            models = [
-                m for m in (ev.get("data") or {}).get("models", [])
-                if m.get("provider") in ("deepseek", "moonshotai-cn")
-            ]
+            models = (ev.get("data") or {}).get("models", [])
         st = self._rpc_request(sess, {"type": "get_state"})
         current = None
+        thinking_level = "max"
         if st and st.get("success"):
             current = (st.get("data") or {}).get("model")
-        return {"models": models, "current": current}
+            thinking_level = (st.get("data") or {}).get("thinkingLevel", "max")
+        return {"models": models, "current": current, "thinkingLevel": thinking_level}
 
     def set_model(self, map_key: str, provider: str, model_id: str) -> bool:
-        if provider not in ("deepseek", "moonshotai-cn"):
-            return False
         sess = self.get_or_spawn(map_key)
         ev = self._rpc_request(sess, {
             "type": "set_model", "provider": provider, "modelId": model_id,
@@ -930,6 +921,20 @@ class ChatSessionManager:
             self._model_pref[map_key] = {"provider": provider, "modelId": model_id}
             self._save_json(MODELS_PATH, self._model_pref)
         return ok
+
+    def get_thinking_levels(self, map_key: str) -> dict:
+        """Get available thinking levels for the current model."""
+        sess = self.get_or_spawn(map_key)
+        ev = self._rpc_request(sess, {"type": "get_available_thinking_levels"})
+        levels = []
+        if ev and ev.get("success"):
+            levels = (ev.get("data") or {}).get("levels", [])
+        return {"levels": levels}
+
+    def set_thinking_level(self, map_key: str, level: str) -> bool:
+        sess = self.get_or_spawn(map_key)
+        ev = self._rpc_request(sess, {"type": "set_thinking_level", "level": level})
+        return bool(ev and ev.get("success"))
 
     def _apply_model_pref(self, sess: ChatSession, pref: dict) -> None:
         try:

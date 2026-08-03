@@ -57,6 +57,10 @@
   background: #fff; color: #333; padding: 5px 6px; cursor: pointer; outline: none;
 }
 .ai-model-select option, .ai-model-select optgroup { color: #333; }
+.ai-thinking-select {
+  flex: none; width: 70px; font-size: 12px; border: 1px solid #dcdfe6; border-radius: 5px;
+  background: #fff; color: #333; padding: 5px 6px; cursor: pointer; outline: none;
+}
 .ai-tool-btn {
   flex: none; border: 1px solid #dcdfe6; background: #fff; color: #606266;
   border-radius: 5px; padding: 5px 9px; font-size: 12px; cursor: pointer;
@@ -167,6 +171,15 @@
 }
 .ai-session-item:hover { background: #f5f7fa; }
 .ai-session-item.active { color: #409eff; font-weight: 600; }
+/* 轮次回滚列表 */
+.ai-rollback-head {
+  padding: 8px 12px 4px; font-size: 12px; font-weight: 600; color: #606266;
+}
+.ai-rollback-badge {
+  margin-left: auto; flex: none; font-size: 11px; color: #e6a23c;
+  background: #fdf6ec; border-radius: 4px; padding: 1px 6px; white-space: nowrap;
+}
+.ai-session-item.rollback-item { color: #303133; }
 /* 背景信息编辑 / 设置抽屉：覆盖 ai-body 区域（跟随 header/toolbar 高度，无硬编码） */
 .ai-bg-drawer {
   position: absolute; inset: 0; background: #fff; z-index: 2;
@@ -324,6 +337,7 @@
   /* 工具条：按钮只留图标，模型选择撑满 */
   .ai-toolbar { padding: 8px 12px; gap: 8px; }
   .ai-model-select { padding: 8px 8px; font-size: 14px; }
+  .ai-thinking-select { width: 80px; padding: 8px 8px; font-size: 14px; }
   .ai-tool-btn { padding: 9px 11px; font-size: 15px; }
   .ai-tool-btn span { display: none; }
   /* 消息区 */

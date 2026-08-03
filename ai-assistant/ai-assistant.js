@@ -18,7 +18,7 @@
       noAgents: "暂无其他 Agent",
       switchAgent: "切换 Agent",
       activeAgent: "当前",
-      inputPlaceholder: "输入问题…（Ctrl+J 求助当前节点）",
+      inputPlaceholder: "输入问题…（Ctrl+J 求助当前节点 / Ctrl+Alt+N 新建会话）",
       send: "发送 ➤",
       abort: "中止 ■",
       bgPlaceholder: "给 AI 的背景信息：这张脑图的主题、项目上下文、你的目标…",
@@ -33,6 +33,8 @@
       nMessages: " 条",
       switchingModel: "切换模型…",
       switchFailed: "切换失败",
+      thinkingLevel: "思考等级",
+      thinkingMax: "最大",
       loading: "加载中…",
       loadFailed: "加载失败",
       configured: "已配置 ✓",
@@ -47,6 +49,15 @@
       agentDone: "✅ 分支「{name}」已完成回复",
       busyTitle: "后台 agent 正在工作",
       working: "工作中…",
+      rollback: "回滚",
+      rollbackHint: "回滚到某一轮对话（撤销该轮之后的对话与脑图改动）",
+      rollbackTitle: "回滚到指定轮次",
+      rollbackEmpty: "暂无历史轮次",
+      rollbackConfirm: "确定回滚到「{msg}」之前？\n将撤销该轮之后的所有对话和脑图改动，那句话会放回输入框。",
+      rollbackDone: "撤销成功",
+      rollbackSkipped: "{n} 个节点未回滚",
+      rollbackFail: "回滚失败：{err}",
+      rollbackNoMap: "对话已回滚，脑图未自动恢复",
     },
     en: {
       assistant: "AI Assistant",
@@ -62,7 +73,7 @@
       noAgents: "No other agents",
       switchAgent: "Switch agent",
       activeAgent: "Active",
-      inputPlaceholder: "Ask a question… (Ctrl+J to assist the current node)",
+      inputPlaceholder: "Ask a question… (Ctrl+J assist current node / Ctrl+Alt+N new session)",
       send: "Send ➤",
       abort: "Stop ■",
       bgPlaceholder: "Background info for AI: this map's topic, project context, your goals…",
@@ -77,6 +88,8 @@
       nMessages: " msgs",
       switchingModel: "Switching model…",
       switchFailed: "Switch failed",
+      thinkingLevel: "Thinking",
+      thinkingMax: "Max",
       loading: "Loading…",
       loadFailed: "Load failed",
       configured: "Configured ✓",
@@ -91,6 +104,15 @@
       agentDone: "✅ Branch \"{name}\" finished",
       busyTitle: "Background agents working",
       working: "Working…",
+      rollback: "Rollback",
+      rollbackHint: "Roll back to a previous turn (undo conversation & map changes after it)",
+      rollbackTitle: "Roll back to a turn",
+      rollbackEmpty: "No turns yet",
+      rollbackConfirm: "Roll back to before \"{msg}\"?\nAll conversation and map changes after this turn will be undone, and the message goes back to the input box.",
+      rollbackDone: "Rolled back",
+      rollbackSkipped: "{n} node(s) not rolled back",
+      rollbackFail: "Rollback failed: {err}",
+      rollbackNoMap: "Conversation rolled back, map not restored",
     },
   };
   let _lang = null;
@@ -202,11 +224,13 @@
         <span class="ai-status" id="ai-status"></span>
         <span class="ai-flex"></span>
         <button class="ai-btn-sm" id="ai-new" title="${t("newChat")}">＋</button>
+        <button class="ai-btn-sm" id="ai-rollback" title="${t("rollbackHint")}">↩</button>
         <button class="ai-btn-sm" id="ai-hist" title="${t("history")}">📂</button>
         <button class="ai-btn-sm" id="ai-close" title="${t("close")}">✕</button>
       </div>
       <div class="ai-body">
         <div class="ai-session-list hidden" id="ai-session-list"></div>
+        <div class="ai-session-list hidden" id="ai-rollback-list"></div>
         <div class="ai-messages" id="ai-messages" data-empty="${t("noHistory")}"></div>
         <div class="ai-bg-drawer hidden" id="ai-bg-drawer">
           <textarea id="ai-bg-text" placeholder="${t("bgPlaceholder")}"></textarea>
@@ -226,6 +250,7 @@
       </div>
       <div class="ai-toolbar">
         <select class="ai-model-select" id="ai-model" title="${t("modelTitle")}"></select>
+        <select class="ai-thinking-select" id="ai-thinking" title="${t("thinkingLevel")}"></select>
         <button class="ai-tool-btn" id="ai-bg" title="${t("background")}">📝 <span>${t("background")}</span></button>
         <button class="ai-tool-btn" id="ai-keys" title="${t("modelSettings")}">⚙️ <span>${t("modelSettings")}</span></button>
       </div>
@@ -247,6 +272,7 @@
     document.getElementById("ai-send").addEventListener("click", sendMessage);
     document.getElementById("ai-abort").addEventListener("click", abortChat);
     document.getElementById("ai-new").addEventListener("click", newAgent);
+    document.getElementById("ai-rollback").addEventListener("click", toggleRollbackList);
     document.getElementById("ai-hist").addEventListener("click", toggleSessions);
     document.getElementById("ai-bg").addEventListener("click", openBg);
     document.getElementById("ai-bg-close").addEventListener("click", closeBg);
@@ -255,6 +281,7 @@
     document.getElementById("ai-keys-close").addEventListener("click", closeKeys);
     document.getElementById("ai-keys-list").addEventListener("click", onKeysListClick);
     document.getElementById("ai-model").addEventListener("change", onModelChange);
+    document.getElementById("ai-thinking").addEventListener("change", onThinkingChange);
     // 点击左上角分支标签 → 脑图聚焦到该分支根节点
     document.getElementById("ai-agent-label").addEventListener("click", focusBranchNode);
 
@@ -745,6 +772,77 @@
       recoverStreamState();  // 与目标 session 的实际 streaming 状态对齐
     }).catch(() => {});
   }
+
+  /* ── 轮次回滚（按对话轮次线性回滚）── */
+  function toggleRollbackList() {
+    const list = document.getElementById("ai-rollback-list");
+    if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
+    document.getElementById("ai-session-list").classList.add("hidden");
+    list.classList.remove("hidden");
+    refreshRollbackList();
+  }
+  function refreshRollbackList() {
+    const list = document.getElementById("ai-rollback-list");
+    if (!list || list.classList.contains("hidden")) return;
+    fetch(api("turns"))
+      .then((r) => r.json()).then((turns) => {
+        list.innerHTML = '<div class="ai-rollback-head">' + t("rollbackTitle") + "</div>";
+        if (!turns || !turns.length) {
+          list.innerHTML += '<div class="ai-session-item">' + t("rollbackEmpty") + "</div>";
+          return;
+        }
+        turns.forEach((tn) => {
+          const div = document.createElement("div");
+          div.className = "ai-session-item rollback-item";
+          const d = new Date((tn.ts || 0) * 1000);
+          const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
+          const rawMsg = tn.user_msg || "";
+          const msg = esc((rawMsg || t("nodeAssistFallback")).slice(0, 24));
+          const s = tn.diff_summary || {};
+          const parts = [];
+          if (s.add) parts.push("+" + s.add);
+          if (s.update_text) parts.push("~" + s.update_text);
+          if (s.delete) parts.push("-" + s.delete);
+          if (s.move) parts.push("↔" + s.move);
+          const badge = parts.length ? '<span class="ai-rollback-badge">' + parts.join(" ") + "</span>" : "";
+          div.innerHTML = "<span class='ai-session-time'>" + time + "</span>" + msg + badge;
+          div.title = tn.user_msg || "";
+          div.addEventListener("click", () => handleRollback(tn));
+          list.appendChild(div);
+        });
+      }).catch(() => {});
+  }
+  function handleRollback(turn) {
+    const msg = ((turn.user_msg || "").slice(0, 30)) || t("nodeAssistFallback");
+    if (!window.confirm(t("rollbackConfirm", { msg }))) return;
+    fetch(api("rollback"), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_msg_idx: turn.user_msg_idx, branch_uid: _currentBranch }),
+    }).then((r) => r.json()).then((res) => {
+      if (!res.ok) { toast(t("rollbackFail", { err: res.error || "?" })); return; }
+      // 回滚成功：后端 session 已截断 + 脑图已恢复（SSE mindmap_update 已广播）
+      disconnectSSE();
+      const box = document.getElementById("ai-messages");
+      box.innerHTML = "";
+      document.getElementById("ai-rollback-list").classList.add("hidden");
+      // 把目标轮那句话放回输入框（可直接编辑重发）
+      const input = document.getElementById("ai-input");
+      input.innerHTML = "";
+      if (res.user_msg) {
+        input.appendChild(document.createTextNode(res.user_msg));
+        input.focus();
+      }
+      loadHistory();      // 截断后的历史
+      refreshAgents();    // 更新 label / 活跃 session
+      connectSSE();
+      recoverStreamState();
+      // 成功提示极简：正常只弹「撤销成功」；异常情况最多追加一条关键信息
+      toast(t("rollbackDone"));
+      const skipped = res.skipped || [];
+      if (skipped.length) toast(t("rollbackSkipped", { n: skipped.length }));
+      else if (res.map_restored === false) toast(t("rollbackNoMap"));
+    }).catch(() => toast(t("rollbackFail", { err: "network" })));
+  }
   /* ── 发送 / 中止 / 新建 ── */
   function syncMap() {
     if (!_mindMap) return Promise.resolve();
@@ -883,6 +981,16 @@
   const KEY_PROVIDERS = [
     { id: "deepseek", name: "🔵 DeepSeek", placeholder: t("pasteKey") },
     { id: "moonshotai-cn", name: "🟣 Moonshot (Kimi)", placeholder: t("pasteKey") },
+    { id: "anthropic", name: "🟠 Anthropic (Claude)", placeholder: "sk-ant-…" },
+    { id: "openai", name: "🟢 OpenAI", placeholder: "sk-…" },
+    { id: "google", name: "🔴 Google (Gemini)", placeholder: "AI…" },
+    { id: "xai", name: "⚡ xAI (Grok)", placeholder: "xai-…" },
+    { id: "openrouter", name: "🌐 OpenRouter", placeholder: "sk-or-…" },
+    { id: "mistral", name: "🔷 Mistral", placeholder: t("pasteKey") },
+    { id: "groq", name: "🟡 Groq", placeholder: "gsk_…" },
+    { id: "fireworks", name: "🔥 Fireworks", placeholder: t("pasteKey") },
+    { id: "together", name: "🤝 Together AI", placeholder: t("pasteKey") },
+    { id: "kimi-coding", name: "🌙 Kimi for Coding", placeholder: t("pasteKey") },
   ];
   function openKeys() {
     const drawer = document.getElementById("ai-keys-drawer");
@@ -982,7 +1090,29 @@
       if (d.current) {
         sel.value = d.current.provider + "|" + d.current.id;
       }
+      // 加载思考等级
+      loadThinkingLevels(d.thinkingLevel || "max");
     }).catch(() => {});
+  }
+  function loadThinkingLevels(currentLevel) {
+    const sel = document.getElementById("ai-thinking");
+    fetch(api("thinking_levels")).then((r) => r.json()).then((d) => {
+      const levels = d.levels || [];
+      sel.innerHTML = "";
+      if (!levels.length) {
+        // 模型不支持 thinking，隐藏下拉框
+        sel.style.display = "none";
+        return;
+      }
+      sel.style.display = "";
+      levels.forEach((lv) => {
+        const opt = document.createElement("option");
+        opt.value = lv;
+        opt.textContent = lv;
+        sel.appendChild(opt);
+      });
+      sel.value = currentLevel || levels[levels.length - 1] || "max";
+    }).catch(() => { sel.style.display = "none"; });
   }
   function onModelChange() {
     const sel = document.getElementById("ai-model");
@@ -996,7 +1126,17 @@
     }).then((r) => {
       status.textContent = r.ok ? "" : t("switchFailed");
       if (!r.ok) loadModels(); // 还原显示
+      else loadThinkingLevels("max"); // 换模型后刷新 thinking levels
     }).catch(() => { status.textContent = t("switchFailed"); });
+  }
+  function onThinkingChange() {
+    const sel = document.getElementById("ai-thinking");
+    const level = sel.value;
+    if (!level) return;
+    fetch(api("thinking_level"), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ level: level }),
+    }).catch(() => {});
   }
 
   /* ── 初始化 ── */
@@ -1051,8 +1191,26 @@
     fetch(api("panel")).then((r) => r.json()).then((d) => {
       if (d.open) togglePanel();
     }).catch(() => {});
-    // Ctrl+J：当前节点求助
+    // Ctrl+Alt+N：新建会话（选中节点 → 该节点分支；未选中 → root）
+    // 不用 Ctrl+N：Chrome 保留快捷键（新建窗口）页面 JS 无法拦截，必须用非保留组合
+    // 不走 togglePanel（其"恢复上次 session"逻辑会异步覆盖新建意图），直接打开面板 + newAgent
     document.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.altKey && (e.key === "n" || e.key === "N")) {
+        e.preventDefault();
+        const panel = document.getElementById("ai-panel");
+        if (panel.classList.contains("hidden")) {
+          panel.classList.remove("hidden");
+          document.getElementById("ai-fab").classList.add("active");
+          fetch(api("panel"), {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ open: true }),
+          }).catch(() => {});
+          loadModels();
+          startPolling();
+        }
+        newAgent();
+      }
+      // Ctrl+J：当前节点求助
       if ((e.ctrlKey || e.metaKey) && (e.key === "j" || e.key === "J")) {
         const tag = (e.target.tagName || "").toLowerCase();
         if (tag === "input" || tag === "textarea") return;

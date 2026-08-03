@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
@@ -124,9 +125,20 @@ def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> s
 
 
 # provider id → 环境变量名（也用作 private/keys.json 的键名）
+# 包含 pi agent 支持的所有 API key 类型的 provider
 PROVIDER_ENV = {
     "deepseek": "DEEPSEEK_API_KEY",
     "moonshotai-cn": "MOONSHOT_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "google": "GEMINI_API_KEY",
+    "xai": "XAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "fireworks": "FIREWORKS_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "kimi-coding": "KIMI_API_KEY",
 }
 
 
@@ -136,9 +148,8 @@ def _load_provider_keys() -> dict:
     读取优先级（从高到低）——本地私人工具，前端明确设置的 key 最优先：
     1. private/keys.json（前端「模型设置」写入，本机私有、git ignore）
     2. 环境变量（部署/进程级配置）
-    3. ~/.hermes（pi 的旧配置，兼容兜底）
     """
-    keys = {"DEEPSEEK_API_KEY": "", "MOONSHOT_API_KEY": ""}
+    keys = {env_var: "" for env_var in PROVIDER_ENV.values()}
     # ① private/keys.json（前端可改，最优先）
     try:
         if KEYS_PATH.is_file():
@@ -153,29 +164,6 @@ def _load_provider_keys() -> dict:
     for k in keys:
         if not keys[k]:
             keys[k] = os.environ.get(k, "")
-    # ③ ~/.hermes 兼容（旧配置兜底）
-    if not keys["DEEPSEEK_API_KEY"]:
-        env_file = Path(os.path.expanduser("~/.hermes/.env"))
-        if env_file.is_file():
-            try:
-                for line in env_file.read_text().splitlines():
-                    line = line.strip()
-                    if line.startswith("DEEPSEEK_API_KEY="):
-                        keys["DEEPSEEK_API_KEY"] = line.split("=", 1)[1].strip()
-                        break
-            except Exception:
-                pass
-    if not keys["MOONSHOT_API_KEY"]:
-        cfg_file = Path(os.path.expanduser("~/.hermes/config.yaml"))
-        if cfg_file.is_file():
-            try:
-                import yaml
-                cfg = yaml.safe_load(cfg_file.read_text()) or {}
-                keys["MOONSHOT_API_KEY"] = (
-                    (cfg.get("providers") or {}).get("kimi") or {}
-                ).get("api_key", "")
-            except Exception:
-                pass
     return {k: v for k, v in keys.items() if v}
 
 
@@ -271,6 +259,7 @@ class ChatSession:
         self._alive = False
         self._in_turn = False  # True between agent_start and agent_end
         self._abort_requested = False  # True after abort() until agent_end/kill
+        self._abort_gen = 0  # incremented on each abort; _force_kill only acts if unchanged
 
     def spawn(self) -> None:
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -329,6 +318,7 @@ class ChatSession:
             PI_BIN, "--mode", "rpc",
             "--provider", "deepseek",
             "--model", "deepseek-v4-flash",
+            "--thinking", "max",
             "-e", str(EXT_PATH),
             "--session-dir", str(SESSION_DIR),
             "--session", self.session_file,
@@ -371,6 +361,7 @@ class ChatSession:
                     if ev_type == "agent_start":
                         self._in_turn = True
                         self._abort_requested = False
+                        self._abort_gen += 1  # invalidate any pending _force_kill timer
                         sf = ev.get("sessionFile") or ev.get("session_file")
                         if sf:
                             self.session_file = sf
@@ -466,6 +457,8 @@ class ChatSessionManager:
         # Mind-map state: key → current mindMapData / AI-synced snapshot
         self._map_state: dict[str, dict] = {}
         self._map_snapshot: dict[str, dict] = {}
+        # 轮次回滚：skey → {before, user_msg, user_msg_idx, ts}（该轮开始时的脑图快照）
+        self._turn_before: dict[str, dict] = {}
         # Start reaper
         t = threading.Thread(target=self._reap_loop, daemon=True, name="pi-reaper")
         t.start()
@@ -546,6 +539,7 @@ class ChatSessionManager:
                     parts.append(f"[该节点的备注内容：{note}]")
         parts.append(message)
         full_msg = "\n".join(parts)
+        self.record_turn_start(map_key, branch_uid, message)
         sess.send({"type": "prompt", "message": full_msg})
 
     def abort(self, map_key: str, branch_uid: str = "") -> bool:
@@ -553,12 +547,19 @@ class ChatSessionManager:
         if sess and sess.alive:
             # 立即标记 abort —— _read_stdout 会吞掉后续内容事件，前端不再收到残留流
             sess._abort_requested = True
+            sess._abort_gen += 1
+            gen = sess._abort_gen  # capture for closure
             sess._buffer.clear()
             sess.send({"type": "abort"})
             # 秒停：pi 正常响应 abort 很快；短窗口（1.5s）后仍未结束则强制
             # 广播 agent_end + kill，保证前端不再收到残留流内容
             def _force_kill():
                 time.sleep(1.5)
+                # Only act if THIS abort is still the active one.
+                # If a new prompt arrived (agent_start resets _abort_requested)
+                # or another abort was issued, gen will have changed — bail out.
+                if sess._abort_gen != gen:
+                    return
                 if sess.alive and (sess._in_turn or sess._abort_requested):
                     logger.warning("abort timeout for %s, force-killing pi", map_key)
                     sess._in_turn = False
@@ -610,6 +611,9 @@ class ChatSessionManager:
                 try:
                     ev = json.loads(line)
                     ev_type = ev.get("type", "unknown")
+                    # agent_end 先落盘轮次记录再广播：前端收到事件立即查 turns 时数据已就绪
+                    if ev_type == "agent_end":
+                        self.finalize_turn(map_key, branch_uid)
                     yield f"event: {ev_type}\ndata: {line}\n\n"
                     # Persist mapping on session file discovery / conversation end
                     if ev_type in ("agent_start", "agent_end") and sess.session_file:
@@ -900,27 +904,21 @@ class ChatSessionManager:
             sess.unsubscribe(q)
 
     def get_models(self, map_key: str) -> dict:
-        """Available models + current model for this map's session.
-
-        Only the two enabled providers are exposed: deepseek + moonshotai-cn.
-        """
+        """Available models + current model + thinking level for this map's session."""
         sess = self.get_or_spawn(map_key)
         ev = self._rpc_request(sess, {"type": "get_available_models"})
         models = []
         if ev and ev.get("success"):
-            models = [
-                m for m in (ev.get("data") or {}).get("models", [])
-                if m.get("provider") in ("deepseek", "moonshotai-cn")
-            ]
+            models = (ev.get("data") or {}).get("models", [])
         st = self._rpc_request(sess, {"type": "get_state"})
         current = None
+        thinking_level = "max"
         if st and st.get("success"):
             current = (st.get("data") or {}).get("model")
-        return {"models": models, "current": current}
+            thinking_level = (st.get("data") or {}).get("thinkingLevel", "max")
+        return {"models": models, "current": current, "thinkingLevel": thinking_level}
 
     def set_model(self, map_key: str, provider: str, model_id: str) -> bool:
-        if provider not in ("deepseek", "moonshotai-cn"):
-            return False
         sess = self.get_or_spawn(map_key)
         ev = self._rpc_request(sess, {
             "type": "set_model", "provider": provider, "modelId": model_id,
@@ -930,6 +928,20 @@ class ChatSessionManager:
             self._model_pref[map_key] = {"provider": provider, "modelId": model_id}
             self._save_json(MODELS_PATH, self._model_pref)
         return ok
+
+    def get_thinking_levels(self, map_key: str) -> dict:
+        """Get available thinking levels for the current model."""
+        sess = self.get_or_spawn(map_key)
+        ev = self._rpc_request(sess, {"type": "get_available_thinking_levels"})
+        levels = []
+        if ev and ev.get("success"):
+            levels = (ev.get("data") or {}).get("levels", [])
+        return {"levels": levels}
+
+    def set_thinking_level(self, map_key: str, level: str) -> bool:
+        sess = self.get_or_spawn(map_key)
+        ev = self._rpc_request(sess, {"type": "set_thinking_level", "level": level})
+        return bool(ev and ev.get("success"))
 
     def _apply_model_pref(self, sess: ChatSession, pref: dict) -> None:
         try:
@@ -983,6 +995,161 @@ class ChatSessionManager:
                     sess = self._sessions.pop(k)
                     sess.kill()
                     logger.info("reaped idle session %s", k)
+
+    # ─── 轮次回滚（按对话轮次线性回滚：脑图 + pi session 一起回到那一刻）───
+
+    def record_turn_start(self, map_key: str, branch_uid: str, message: str) -> None:
+        """prompt 时记录轮次起点：用户消息 + jsonl 中 user 消息序号 + 脑图轮前快照。"""
+        skey = session_key(map_key, branch_uid)
+        sess = self._sessions.get(skey)
+        if not sess or not sess.session_file:
+            return
+        before = None
+        state = self._map_state.get(map_key)
+        if not isinstance(state, dict):
+            # 内存无状态（首轮 prompt 前端未 sync）→ 磁盘兜底
+            fpath = Path(PROJECT_CWD) / map_key
+            if fpath.is_file():
+                try:
+                    doc = json.loads(fpath.read_text(encoding="utf-8"))
+                    state = doc.get("mindMapData") or {}
+                except Exception:
+                    state = None
+        if isinstance(state, dict):
+            root = state.get("root", state)
+            if isinstance(root, dict):
+                try:
+                    before = deepcopy(root)
+                except Exception:
+                    before = None
+        self._turn_before[skey] = {
+            "before": before,
+            "user_msg": message or "",
+            "ts": time.time(),
+            "user_msg_idx": _user_message_count(Path(sess.session_file)) + 1,
+        }
+
+    def finalize_turn(self, map_key: str, branch_uid: str) -> None:
+        """agent_end 时把本轮净 diff 追加进轮次记录（脑图回滚的数据源）。"""
+        skey = session_key(map_key, branch_uid)
+        rec = self._turn_before.pop(skey, None)
+        sess = self._sessions.get(skey)
+        if not rec or not sess or not sess.session_file:
+            return
+        sf = Path(sess.session_file)
+        if not sf.is_file():
+            return
+        after_root = None
+        state = self._map_state.get(map_key)
+        if isinstance(state, dict):
+            r = state.get("root", state)
+            if isinstance(r, dict):
+                after_root = r
+        diff = _compute_net_diff(rec.get("before"), after_root) if after_root else []
+        turns = _load_turns(sess.session_file)
+        turns.append({
+            "turn_id": uuid.uuid4().hex,
+            "user_msg": rec.get("user_msg", ""),
+            "ts": rec.get("ts", time.time()),
+            "user_msg_idx": rec.get("user_msg_idx", 0),
+            "diff": diff,
+        })
+        _save_turns(sess.session_file, turns)
+
+    def list_turns(self, map_key: str, branch_uid: str = "") -> list[dict]:
+        """当前 session 的轮次列表（前端回滚列表用）。
+
+        轮次清单权威来源 = jsonl 的 user 消息（所有 session 天然有，含旧会话）；
+        turns.json 的 diff 按 user_msg_idx 附加（有 diff 的轮次脑图可精确回滚）。
+        """
+        skey = session_key(map_key, branch_uid)
+        sess = self._sessions.get(skey)
+        session_file = sess.session_file if sess and sess.session_file else self._mapping.get(skey)
+        if not session_file or not Path(session_file).is_file():
+            return []
+        turns = _load_turns(session_file)
+        diff_by_idx = {t.get("user_msg_idx"): (t.get("diff") or []) for t in turns}
+        msg_by_idx = {t.get("user_msg_idx"): t.get("user_msg", "") for t in turns}
+        out = []
+        for um in _user_messages_from_jsonl(Path(session_file)):
+            diff = diff_by_idx.get(um["user_msg_idx"], [])
+            summary = {"add": 0, "delete": 0, "update_text": 0, "move": 0}
+            for x in diff:
+                a = x.get("action", "")
+                summary[a] = summary.get(a, 0) + 1
+            out.append({
+                "user_msg_idx": um["user_msg_idx"],
+                "user_msg": msg_by_idx.get(um["user_msg_idx"], um["user_msg"]),
+                "ts": um["ts"],
+                "diff_summary": summary,
+                "has_diff": bool(diff),
+            })
+        return out
+
+    def rollback(self, map_key: str, branch_uid: str, user_msg_idx: int) -> dict:
+        """回滚到指定轮次（用户发那句话之前）：
+        kill pi → 截断 session jsonl → 清轮次记录 → 脑图反向 diff → 保持 mapping。
+
+        轮次 = jsonl 里的 user 消息序号（权威）；diff 可选——有 diff 的轮次
+        脑图精确回滚，无 diff（旧会话/未记录）只回滚对话并提示。
+
+        返回 {"ok", "skipped", "user_msg", "map_restored"}。
+        """
+        skey = session_key(map_key, branch_uid)
+        sess = self._sessions.get(skey)
+        session_file = sess.session_file if sess and sess.session_file else self._mapping.get(skey)
+        if not session_file or not Path(session_file).is_file():
+            return {"ok": False, "error": "session 不存在"}
+        turns = _load_turns(session_file)
+        # 1. 直接 kill pi（回滚语义 = 回到那轮之前，正在进行的回复本就该丢弃）
+        if sess and sess.alive:
+            sess.kill()
+        self._sessions.pop(skey, None)
+        # 2. 截断 jsonl 到目标轮 user 消息之前（保留 header + 之前所有行）
+        lines = Path(session_file).read_text().splitlines()
+        cut = None
+        user_count = 0
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("type") == "message" and (e.get("message") or {}).get("role") == "user":
+                user_count += 1
+                if user_count == user_msg_idx:
+                    cut = i
+                    break
+        if cut is None:
+            return {"ok": False, "error": "找不到目标轮次消息（session 文件已变化）"}
+        target_msg = ""
+        ums = _user_messages_from_jsonl(Path(session_file))
+        for um in ums:
+            if um["user_msg_idx"] == user_msg_idx:
+                target_msg = um["user_msg"]
+                break
+        keep = lines[:cut]
+        _atomic_write(Path(session_file), "\n".join(keep) + ("\n" if keep else ""))
+        # 3. 收集目标轮及之后的脑图 diff（该轮用户消息之后的 AI 改动都要撤销），
+        #    清掉这些轮次记录（目标轮消息已被截断回输入框，不再存在）
+        later_diffs = [d for t in turns if (t.get("user_msg_idx") or 0) >= user_msg_idx
+                       for d in (t.get("diff") or [])]
+        turns = [t for t in turns if (t.get("user_msg_idx") or 0) < user_msg_idx]
+        _save_turns(session_file, turns)
+        # 4. 脑图反向应用（只撤销该 session 的 AI 改动，冲突节点跳过）
+        map_restored = bool(later_diffs)
+        skipped = _apply_reverse(self, map_key, later_diffs, branch_uid) if later_diffs else []
+        # 5. mapping 指向同一 session 文件——前端 SSE 重连时 get_or_spawn 加载截断文件
+        self._mapping[skey] = session_file
+        self._save_mapping()
+        return {
+            "ok": True,
+            "skipped": skipped,
+            "user_msg": target_msg,
+            "map_restored": map_restored,
+        }
 
 
 def parse_session(path: Path) -> list[dict]:
@@ -1801,3 +1968,278 @@ def _delete_by_uid(node: dict, uid: str) -> bool:
         if _delete_by_uid(c, uid):
             return True
     return False
+
+
+# ─── 轮次回滚：turns 存储 / 净 diff / 反向应用 ───
+
+def _turns_path(session_file: str) -> Path:
+    return Path(session_file).with_suffix(".turns.json")
+
+
+def _load_turns(session_file: str) -> list[dict]:
+    p = _turns_path(session_file)
+    if p.is_file():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def _save_turns(session_file: str, turns: list[dict]) -> None:
+    _atomic_write(_turns_path(session_file), json.dumps(turns, ensure_ascii=False, indent=1))
+
+
+def _user_message_count(path: Path) -> int:
+    """session jsonl 里 user 消息条数（轮次记录的 user_msg_idx 依据）。"""
+    return len(_user_messages_from_jsonl(path))
+
+
+def _user_messages_from_jsonl(path: Path) -> list[dict]:
+    """从 session jsonl 提取全部轮次（user 消息）——轮次清单的权威来源。
+
+    所有 session 天然有轮次（对话历史），不依赖 turns.json 的 diff 记录。
+    返回 [{user_msg_idx, user_msg, ts}]；user_msg 剥离 NODE_ASSIST 前缀。
+    """
+    out = []
+    try:
+        lines = path.read_text().splitlines()
+    except Exception:
+        return out
+    idx = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("type") != "message":
+            continue
+        msg = e.get("message") or {}
+        if msg.get("role") != "user":
+            continue
+        idx += 1
+        text = ""
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(
+                c.get("text", "") for c in content
+                if isinstance(c, dict) and c.get("type") == "text"
+            )
+        # 剥离 NODE_ASSIST 前缀（引用求助时 prompt 注入的说明行）
+        if text.startswith("[NODE_ASSIST"):
+            parts = text.split("\n", 1)
+            text = parts[1].strip() if len(parts) > 1 else ""
+        ts = msg.get("timestamp") or e.get("timestamp") or 0
+        if ts and ts > 1e12:
+            ts = ts / 1000.0
+        out.append({"user_msg_idx": idx, "user_msg": text, "ts": ts})
+    return out
+
+
+def _compute_net_diff(before_root: dict, after_root: dict) -> list[dict]:
+    """轮前 vs 轮后 → 节点级净 diff（回滚的数据源）。
+
+    同一节点多 op 合并：add/delete 只记顶层变化（父也变的由父带出整子树）；
+    update_text 记录前后文本；move 记录前后父节点。
+    """
+    if not isinstance(before_root, dict) or not isinstance(after_root, dict):
+        return []
+    before_idx = _index_by_uid(before_root)
+    after_idx = _index_by_uid(after_root)
+    before_parents = _index_with_parent(before_root)
+    after_parents = _index_with_parent(after_root)
+    deleted = {u for u in before_idx if u not in after_idx}
+    added = {u for u in after_idx if u not in before_idx}
+    diffs = []
+    for uid in deleted:
+        if before_parents.get(uid) in deleted:  # 父也被删 → 由父的恢复带出
+            continue
+        node = before_idx[uid]
+        diffs.append({
+            "uid": uid, "action": "delete",
+            "before": {"node": node, "parent_uid": before_parents.get(uid) or ""},
+            "after": None,
+        })
+    for uid in added:
+        if after_parents.get(uid) in added:  # 父也新增 → 由父的 add 带出
+            continue
+        diffs.append({
+            "uid": uid, "action": "add",
+            "before": None,
+            "after": {"node": after_idx[uid], "parent_uid": after_parents.get(uid) or ""},
+        })
+    for uid in after_idx:
+        if uid not in before_idx:
+            continue
+        old_d = before_idx[uid].get("data") or {}
+        new_d = after_idx[uid].get("data") or {}
+        if old_d.get("text") != new_d.get("text") or old_d.get("note") != new_d.get("note"):
+            diffs.append({
+                "uid": uid, "action": "update_text",
+                "before": {"text": old_d.get("text", ""), "note": old_d.get("note", "")},
+                "after": {"text": new_d.get("text", ""), "note": new_d.get("note", "")},
+            })
+        elif before_parents.get(uid) != after_parents.get(uid):
+            diffs.append({
+                "uid": uid, "action": "move",
+                "before": {"parent_uid": before_parents.get(uid) or ""},
+                "after": {"parent_uid": after_parents.get(uid) or ""},
+            })
+    return diffs
+
+
+def _build_reverse_ops(later_diffs: list[dict], current_idx: dict, current_parents: dict):
+    """把目标轮之后的 AI 改动转成反向 ops（含冲突预校验）。
+
+    返回 (ops, skipped)；skipped 是用户已手动改过/删除，无法安全反向的节点。
+    """
+    ops, skipped = [], []
+    for d in later_diffs:
+        uid = d.get("uid", "")
+        action = d.get("action")
+        if action == "add":
+            # 反向 = 删除 AI 新增节点；校验 uid 当前存在（用户可能删了）
+            if uid in current_idx:
+                # 预存祖先链（原始状态，删除后索引会清，祖先覆盖检查依赖它）
+                anc = []
+                cur = current_parents.get(uid)
+                guard = 0
+                while cur:
+                    anc.append(cur)
+                    cur = current_parents.get(cur) or ""
+                    guard += 1
+                    if guard > 100000:
+                        break
+                ops.append({"action": "delete", "uid": uid, "ancestors": anc})
+            else:
+                skipped.append({"uid": uid, "why": "节点已不存在"})
+        elif action == "delete":
+            # 反向 = 恢复被删节点（原 uid 整子树）；校验 uid 不存在 + 父存在
+            parent_uid = (d.get("before") or {}).get("parent_uid", "")
+            if uid in current_idx:
+                skipped.append({"uid": uid, "why": "节点已存在（可能是你重建的）"})
+            elif parent_uid and parent_uid not in current_idx:
+                skipped.append({"uid": uid, "why": "父节点已不存在"})
+            else:
+                ops.append({
+                    "action": "restore", "uid": uid,
+                    "node": d["before"]["node"], "parent_uid": parent_uid,
+                })
+        elif action == "update_text":
+            node = current_idx.get(uid)
+            after_text = (d.get("after") or {}).get("text", "")
+            if not node:
+                skipped.append({"uid": uid, "why": "节点已不存在"})
+            elif (node.get("data") or {}).get("text", "") != after_text:
+                skipped.append({"uid": uid, "why": "你已手动修改过该节点"})
+            else:
+                ops.append({
+                    "action": "update_text", "uid": uid,
+                    "text": d["before"].get("text", ""),
+                    "note": d["before"].get("note", ""),
+                })
+        elif action == "move":
+            node = current_idx.get(uid)
+            after_parent = (d.get("after") or {}).get("parent_uid", "")
+            if not node:
+                skipped.append({"uid": uid, "why": "节点已不存在"})
+            elif current_parents.get(uid) != after_parent:
+                skipped.append({"uid": uid, "why": "你已手动移动过该节点"})
+            else:
+                ops.append({
+                    "action": "move", "uid": uid,
+                    "parent_uid": d["before"].get("parent_uid", ""),
+                })
+    # 顺序：先恢复被删（父先于子），再删 AI 新增，再文本/移动
+    order = {"restore": 0, "delete": 1, "update_text": 2, "move": 3}
+    ops.sort(key=lambda o: order.get(o.get("action"), 9))
+    return ops, skipped
+
+
+def _apply_reverse(manager: ChatSessionManager, key: str, later_diffs: list[dict], branch_uid: str) -> list[dict]:
+    """脑图回滚：把目标轮之后的 AI 改动反向应用（只撤销该 session 的改动）。
+
+    复用写锁/原子写/版本号/人类编辑锁；冲突节点跳过并返回 skipped。
+    """
+    if not later_diffs:
+        return []
+    lock = manager._write_locks.setdefault(key, threading.Lock())
+    with lock:
+        doc, file_md, old_by_uid, _ = _load_doc_for_write(manager, key)
+        root = file_md.get("root", file_md)
+        if not root or not isinstance(root, dict) or "data" not in root:
+            return [{"uid": "?", "why": "脑图为空"}]
+        parents = _index_with_parent(root)
+        ops, skipped = _build_reverse_ops(later_diffs, old_by_uid, parents)
+        # 本批要删除的 uid 集合（用于识别"被祖先删除带走"的非冲突场景）
+        delete_targets = {op.get("uid") for op in ops if op.get("action") == "delete"}
+        human_lock = manager._human_editing.get(key)
+        human_locked_uid = ""
+        if human_lock and (time.time() - human_lock.get("ts", 0)) < 60:
+            human_locked_uid = human_lock.get("uid", "")
+        for op in ops:
+            uid = op.get("uid", "")
+            if human_locked_uid and uid and uid == human_locked_uid:
+                skipped.append({"uid": uid, "why": "节点正在被编辑"})
+                continue
+            if op["action"] == "restore":
+                if uid in old_by_uid:
+                    skipped.append({"uid": uid, "why": "节点已存在"})
+                    continue
+                parent = old_by_uid.get(op.get("parent_uid", ""))
+                if not parent:
+                    skipped.append({"uid": uid, "why": "父节点不存在"})
+                    continue
+                node = op["node"]
+                parent.setdefault("children", []).append(node)
+                _register_subtree(node, old_by_uid)
+                _register_parents(node, op.get("parent_uid", ""), parents)
+            elif op["action"] == "delete":
+                node = old_by_uid.get(uid)
+                if not node:
+                    # 祖先也在本批删除中？被父节点删除连带带走，属正常回滚非冲突
+                    if any(a in delete_targets for a in op.get("ancestors", [])):
+                        continue
+                    skipped.append({"uid": uid, "why": "节点已不存在"})
+                    continue
+                parent_uid = parents.get(uid) or ""
+                parent = old_by_uid.get(parent_uid) if parent_uid else None
+                if parent:
+                    parent["children"] = [c for c in parent.get("children", []) or []
+                                          if (c.get("data") or {}).get("uid") != uid]
+                _unregister_subtree(node, old_by_uid)
+                _unregister_parents(node, parents)
+            elif op["action"] == "update_text":
+                node = old_by_uid.get(uid)
+                if not node:
+                    skipped.append({"uid": uid, "why": "节点已不存在"})
+                    continue
+                t = op.get("text", "")
+                if t and "<" not in t and node["data"].get("richText"):
+                    t = f"<p>{t}</p>"
+                node["data"]["text"] = t
+                if "note" in op:
+                    node["data"]["note"] = op.get("note") or ""
+            elif op["action"] == "move":
+                node = old_by_uid.get(uid)
+                new_parent = old_by_uid.get(op.get("parent_uid", ""))
+                if not node or not new_parent:
+                    skipped.append({"uid": uid, "why": "节点或父节点不存在"})
+                    continue
+                cur_parent_uid = parents.get(uid) or ""
+                cur_parent = old_by_uid.get(cur_parent_uid) if cur_parent_uid else None
+                if cur_parent:
+                    cur_parent["children"] = [c for c in cur_parent.get("children", []) or []
+                                              if (c.get("data") or {}).get("uid") != uid]
+                new_parent.setdefault("children", []).append(node)
+                parents[uid] = op.get("parent_uid", "")
+        if ops:
+            new_data = dict(file_md)
+            new_data["root"] = root
+            _commit_map(manager, key, doc, new_data, branch_uid)
+        return skipped

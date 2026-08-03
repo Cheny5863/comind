@@ -127,7 +127,7 @@ def list_workspace_files():
     files = []
     if not os.path.isdir(WORKSPACE):
         return files
-    for fname in sorted(os.listdir(WORKSPACE)):
+    for fname in os.listdir(WORKSPACE):
         fpath = os.path.join(WORKSPACE, fname)
         if os.path.islink(fpath) and not os.path.exists(os.readlink(fpath)):
             continue  # 断链
@@ -138,7 +138,12 @@ def list_workspace_files():
                 "ext": fname.rsplit(".", 1)[-1],
                 "size": stat.st_size,
                 "mtime": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "_mtime": stat.st_mtime,
             })
+    # 按修改时间倒序，越新越靠前
+    files.sort(key=lambda f: f["_mtime"], reverse=True)
+    for f in files:
+        f.pop("_mtime", None)
     return files
 
 
@@ -293,6 +298,10 @@ class ChatPromptBody(BaseModel):
 class SwitchBody(BaseModel):
     session_file: str
 
+class RollbackBody(BaseModel):
+    user_msg_idx: int
+    branch_uid: str = ""
+
 class BackgroundBody(BaseModel):
     content: str
 
@@ -352,6 +361,21 @@ def api_chat_history(map_key: str, branch: str = ""):
     _check_map_key(map_key)
     return chat_manager.get_history(map_key, branch)
 
+@app.get("/api/chat/{map_key}/turns")
+def api_chat_turns(map_key: str, branch: str = ""):
+    """轮次列表（回滚弹层数据源）：时间 + 用户消息 + 该轮 AI 改动统计。"""
+    _check_map_key(map_key)
+    return chat_manager.list_turns(map_key, branch)
+
+@app.post("/api/chat/{map_key}/rollback")
+def api_chat_rollback(map_key: str, body: RollbackBody):
+    """回滚到指定轮次（用户发那句话之前）：session 截断 + 脑图反向 diff。"""
+    _check_map_key(map_key)
+    result = chat_manager.rollback(map_key, body.branch_uid, body.user_msg_idx)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "回滚失败 / Rollback failed"))
+    return result
+
 @app.get("/api/chat/{map_key}/sessions")
 def api_chat_sessions(map_key: str, branch: str = ""):
     _check_map_key(map_key)
@@ -383,6 +407,21 @@ def api_chat_model(map_key: str, body: ModelBody):
         raise HTTPException(400, "切换模型失败 / Model switch failed")
     return {"status": "ok"}
 
+class ThinkingBody(BaseModel):
+    level: str
+
+@app.get("/api/chat/{map_key}/thinking_levels")
+def api_chat_thinking_levels(map_key: str):
+    _check_map_key(map_key)
+    return chat_manager.get_thinking_levels(map_key)
+
+@app.post("/api/chat/{map_key}/thinking_level")
+def api_chat_thinking_level(map_key: str, body: ThinkingBody):
+    _check_map_key(map_key)
+    if not chat_manager.set_thinking_level(map_key, body.level):
+        raise HTTPException(400, "切换思考等级失败 / Thinking level switch failed")
+    return {"status": "ok"}
+
 class PanelBody(BaseModel):
     open: bool
 
@@ -405,12 +444,10 @@ class KeysBody(BaseModel):
 def api_keys_get():
     """返回各 provider 是否已配置 key（绝不回传明文）。"""
     keys = chat_service.PROVIDER_KEYS
-    return {
-        "configured": {
-            "deepseek": bool(keys.get("DEEPSEEK_API_KEY")),
-            "moonshotai-cn": bool(keys.get("MOONSHOT_API_KEY")),
-        }
-    }
+    configured = {}
+    for prov_id, env_var in chat_service.PROVIDER_ENV.items():
+        configured[prov_id] = bool(keys.get(env_var))
+    return {"configured": configured}
 
 @app.post("/api/keys")
 def api_keys_post(body: KeysBody):

@@ -447,7 +447,7 @@
     _es.addEventListener("mindmap_update", (e) => {
       try {
         const ev = JSON.parse(e.data);
-        applyMapUpdate(ev.tree);
+        applyMapUpdate(ev.tree, ev.stats);
         // 对齐画布写版本：保存时后端据此判断前端是否落后（防旧画布覆盖 AI 改动）
         if (typeof ev.ver === "number") window.__comindMapVer = ev.ver;
       } catch (_) {}
@@ -502,14 +502,31 @@
   }
 
   /* ── AI 改图：mindmap_update ── */
-  function applyMapUpdate(tree) {
+  function applyMapUpdate(tree, stats) {
     if (!_mindMap || !tree) return;
-    // 后端 SSE 推来的 tree 就是纯节点树根 {data, children}，直接 setData。
-    // 不要包成 getData()+root 的形式——setData 期望纯树，包 root 会导致
-    // 界面渲染旧树（AI 改图不生效），且垃圾 root 属性污染后续 sync。
-    _mindMap.setData(tree);
-    _mindMap.render();
+    // 用 updateData 而不是 setData：setData 会 CLEAR_ACTIVE_NODE + clearHistory +
+    // reRender（强制全量重建节点实例、重算布局）→ 整图闪一下、用户正在编辑的
+    // 节点被销毁（编辑内容丢失）。updateData 不设 reRender，节点实例按 uid 从
+    // 缓存复用，只有数据变化的节点重算 → 默默增量修改，不闪不移动不丢编辑。
+    // 后端 SSE 推来的 tree 就是纯节点树根 {data, children}，直接 updateData。
+    _mindMap.updateData(tree);
     addBubble("assistant", t("mapUpdated"));
+    if (stats && (stats.added || stats.removed)) showMapDiffToast(stats);
+  }
+
+  /* ── 修改动画：页面底部按重力抛起 "+N -M" 符号（上抛 3s 到 60vh + 自由落体 3s）── */
+  function showMapDiffToast(stats) {
+    // 新 toast 前清掉旧的（避免动画叠加混乱）；旧 el 若残留则由其自身 timer 移除
+    document.querySelectorAll(".ai-map-diff").forEach(function(o){ if (o.parentNode) o.parentNode.removeChild(o); });
+    const el = document.createElement("div");
+    el.className = "ai-map-diff";
+    const parts = [];
+    if (stats.added) parts.push('<span class="ai-diff-add">+' + stats.added + "</span>");
+    if (stats.removed) parts.push('<span class="ai-diff-remove">-' + stats.removed + "</span>");
+    el.innerHTML = '<span class="ai-diff-flag">✨</span>' + parts.join(" ");
+    document.body.appendChild(el);
+    // 动画 6s（上抛 3s + 下落 3s），结束后移除元素
+    setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 6300);
   }
 
   /* ── 消息渲染（流式安全）──
@@ -941,9 +958,9 @@
         placed = true;
       }
       if (placed) input.focus();
-      // 画布刷新：后端响应带回滚后完整树（kill 后 SSE 广播靠 EventSource 自动
-      // 重连不可靠——重连晚于广播、旧 queue 已 unsub），直接 setData 最稳
-      if (res.tree) applyMapUpdate(res.tree);
+      // 画布刷新：后端响应带回滚后完整树（kill 后 SSE 广播靠 EventSource
+      // 自动重连不可靠——重连晚于广播、旧 queue 已 unsub），直接应用最稳
+      if (res.tree) applyMapUpdate(res.tree, res.stats);
       loadHistory();      // 截断后的历史
       refreshAgents();    // 更新 label / 活跃 session
       connectSSE();

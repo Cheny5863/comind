@@ -261,6 +261,32 @@
 }
 .ai-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
+/* AI 改图成功提示：页面底部按重力抛起 "+N -M" 符号（不打扰画布操作）
+   物理模型：上抛到顶 3s（v₀=29.4m/s, h=44.1m）→ 自由落体 3s（√(2h/g)=3s），总 6s。
+   上抛段 ease-out（匀减速）、下落段 ease-in（匀加速），最高点 60vh（过半屏）。 */
+.ai-map-diff {
+  position: fixed; left: 50%; bottom: 24px;
+  transform: translateX(-50%);
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(0,0,0,.78); color: #fff;
+  font-size: 17px; font-weight: 700; line-height: 1;
+  padding: 12px 22px; border-radius: 24px;
+  z-index: 10001; pointer-events: none;
+  white-space: nowrap;
+  box-shadow: 0 4px 20px rgba(0,0,0,.25);
+  animation: aiMapDiffThrow 6s linear forwards;
+}
+.ai-map-diff .ai-diff-flag { font-size: 16px; }
+.ai-map-diff .ai-diff-add { color: #67c23a; }
+.ai-map-diff .ai-diff-remove { color: #f56c6c; }
+@keyframes aiMapDiffThrow {
+  0%   { opacity: 0; transform: translateX(-50%) translateY(40px) scale(.85);
+         animation-timing-function: cubic-bezier(.2,0,.55,1); }  /* 上抛：匀减速 */
+  50%  { opacity: 1; transform: translateX(-50%) translateY(-60vh) scale(1.02);
+         animation-timing-function: cubic-bezier(.42,0,1,1); }    /* 下落：匀加速 */
+  100% { opacity: 0; transform: translateX(-50%) translateY(60px) scale(.85); }
+}
+
 /* ── 多 Agent（并行分支工作）── */
 /* 居中组：分支标签 + 后台活跃计数 badge 一起居中，两者永不分离、
    也不与左侧标题/右侧按钮重叠（窄面板时 group 限宽内部收缩） */

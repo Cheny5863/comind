@@ -1119,6 +1119,7 @@ class ChatSessionManager:
         session_file = sess.session_file if sess and sess.session_file else self._mapping.get(skey)
         if not session_file or not Path(session_file).is_file():
             return {"ok": False, "error": "session 不存在"}
+        before_state = self._map_state.get(map_key)
         turns = _load_turns(session_file)
         # 1. 直接 kill pi（回滚语义 = 回到那轮之前，正在进行的回复本就该丢弃）
         if sess and sess.alive:
@@ -1198,6 +1199,8 @@ class ChatSessionManager:
             # 前端用它直接 setData 刷新画布——SSE 广播在 kill 后靠 EventSource
             # 自动重连不可靠（重连晚于广播，旧 queue 已 unsub），响应带树最稳。
             "tree": new_root if map_restored else None,
+            # 回滚净变化（相对回滚前），前端用来展示 "+N -M" 动画
+            "stats": _map_uid_stats(before_state, self._map_state.get(map_key)),
         }
 
 
@@ -1685,6 +1688,28 @@ def _merge_save_tree(disk_root: dict, front_root: dict) -> dict:
     }
 
 
+def _map_uid_stats(old_state, new_state) -> dict:
+    """对比两次 mindMapData 状态的 uid 集合，统计 added/removed/updated 数量。
+
+    前端 mindmap_update 用它显示 "+N -M" 动画提示；updated 按 data.text 变化粗算。
+    """
+    old_root = _state_root(old_state) if old_state else None
+    new_root = _state_root(new_state)
+    old_idx = _index_by_uid(old_root) if old_root else {}
+    new_idx = _index_by_uid(new_root)
+    old_uids = set(old_idx)
+    new_uids = set(new_idx)
+    added = len(new_uids - old_uids)
+    removed = len(old_uids - new_uids)
+    updated = 0
+    for uid in old_uids & new_uids:
+        ot = (old_idx.get(uid) or {}).get("data", {}).get("text")
+        nt = (new_idx.get(uid) or {}).get("data", {}).get("text")
+        if ot != nt:
+            updated += 1
+    return {"added": added, "removed": removed, "updated": updated}
+
+
 def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict, branch_uid: str = "") -> None:
     """提交新 mindMapData：更新内存、备份、落盘、SSE 广播。
 
@@ -1692,6 +1717,7 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
     （自己改的不会重复出现在自己的 diff 里）；其他 agent 的快照不动，
     这样它们下一次 get_mindmap_diff 能看到本次变化（多 agent 协作关键）。
     """
+    old_state = manager._map_state.get(key)
     manager._map_state[key] = new_data
     manager._map_ver[key] = manager._map_ver.get(key, 0) + 1
     writer_key = session_key(key, branch_uid)
@@ -1710,9 +1736,12 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
             # agent 以为更新了实际丢失——用 error 级别留痕
             logger.error("persist %s failed: %s", key, exc)
     # 广播 mindmap_update 给同脑图的所有 agent 会话（root + 各分支），
-    # 让并行工作的其他 agent 前端实时看到结构变化；带 ver 供前端对齐画布版本
+    # 让并行工作的其他 agent 前端实时看到结构变化；带 ver 供前端对齐画布版本，
+    # 带 stats 供前端播放 "+N -M" 修改动画（不闪的增量更新提示）
+    stats = _map_uid_stats(old_state, new_data)
     event = json.dumps(
-        {"type": "mindmap_update", "tree": new_data.get("root"), "ver": manager._map_ver[key]}, ensure_ascii=False
+        {"type": "mindmap_update", "tree": new_data.get("root"), "ver": manager._map_ver[key], "stats": stats},
+        ensure_ascii=False,
     )
     for skey, sess in list(manager._sessions.items()):
         if skey == key or skey.startswith(key + "::"):

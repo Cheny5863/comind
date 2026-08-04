@@ -674,9 +674,15 @@ function installClipboardFix(mindMap) {{
   if (!mindMap || !mindMap.renderer) return;
   var renderer = mindMap.renderer;
   var origPaste = renderer.paste.bind(renderer);
+  // 跨脑图剪贴板通道：http 内网下 navigator.clipboard 不可用，
+  // 用同源 localStorage 传递 smm 节点数据（剪贴板语义：不清空，直到下次 copy 覆盖）
+  var CLIP_KEY = 'comind_clipboard';
   renderer.copy = function() {{
     this.beingCopyData = this.copyNode();
     if (!this.beingCopyData) return;
+    try {{
+      localStorage.setItem(CLIP_KEY, JSON.stringify(this.beingCopyData));
+    }} catch (e) {{}}
     var treeText = getNodeTreeText(this.beingCopyData);
     writeClipboard(treeText);
   }};
@@ -686,6 +692,17 @@ function installClipboardFix(mindMap) {{
       this.beingCopyData = null;
       return;
     }}
+    // 跨脑图：读上次复制的节点数据（同页内存丢了也能粘）
+    try {{
+      var saved = localStorage.getItem(CLIP_KEY);
+      if (saved) {{
+        var data = JSON.parse(saved);
+        if (data && data.length > 0) {{
+          this.mindMap.execCommand('PASTE_NODE', data);
+          return;
+        }}
+      }}
+    }} catch (e) {{}}
     await origPaste();
   }};
 }}

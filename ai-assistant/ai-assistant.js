@@ -575,18 +575,47 @@
   }
 
   /* ── 历史 ── */
-  // 把历史用户消息里的 [NODE_ASSIST uid=xxx] 前缀还原成引用 chip，
-  // 而不是把协议原文裸显示出来
+  // 把历史用户消息里的 [NODE_ASSIST...] 协议原文还原成引用 chip（含多引用），
+  // 而不是把协议原文裸显示出来。用户怎么写的就怎么显示。
   function renderUserMsg(text) {
-    const m = text.match(/^\[NODE_ASSIST uid=([^\]]*)\] 用户在节点「([\s\S]*?)」上求助\s*\n?/);
+    if (!text || !text.startsWith("[NODE_ASSIST")) return esc(text);
+    const lines = text.split("\n");
+    const m = lines[0].match(/^\[NODE_ASSIST(?: uid=([^\]]*))?\]\s*用户在节点「([\s\S]*?)」上求助\s*$/);
     if (!m) return esc(text);
-    const uid = m[1], nodeText = m[2];
-    let rest = text.slice(m[0].length).trim();
-    if (rest === "（引用节点求助）" || rest === "(Assist with node)") rest = "";
-    const label = nodeText.length > 20 ? nodeText.slice(0, 20) + "…" : nodeText;
-    const chip = '<span class="ai-quote-chip" data-uid="' + esc(uid) + '" data-full-text="' +
-      esc(nodeText) + '"><span>📎 ' + esc(label) + "</span></span>";
-    return chip + (rest ? " " + esc(rest) : "");
+    // 收集引用列表（含首行第一个引用）
+    const ql = [{ uid: m[1] || "", text: m[2] }];
+    const bodyLines = [];
+    for (let i = 1; i < lines.length; i++) {
+      const ln = lines[i].trim();
+      if (!ln) continue;
+      if (ln.startsWith("[该节点的备注内容：")) continue;
+      const rm = ln.match(/^\[引用(\d+)\] uid=([^\s「」]*) 「([\s\S]*?)」(?:（备注：.*）)?$/);
+      if (rm) {
+        const idx = parseInt(rm[1], 10);
+        ql[idx - 1] = { uid: rm[2], text: rm[3] };
+        continue;
+      }
+      if (ln.startsWith("引用节点")) continue;
+      bodyLines.push(ln);
+    }
+    const body = bodyLines.join("\n").trim();
+    // [引用N] 占位符还原成 chip（历史消息保留 chip 样式，节点可点击定位）
+    const chipHtml = (q) => {
+      const label = (q.text || "").length > 20 ? q.text.slice(0, 20) + "…" : (q.text || "");
+      return '<span class="ai-quote-chip" data-uid="' + esc(q.uid || "") + '" data-full-text="' +
+        esc(q.text || "") + '"><span>📎 ' + esc(label) + "</span></span>";
+    };
+    let out = "";
+    const refRe = /\[引用(\d+)\]/g;
+    let last = 0, rm2;
+    while ((rm2 = refRe.exec(body)) !== null) {
+      out += esc(body.slice(last, rm2.index));
+      const q = ql[parseInt(rm2[1], 10) - 1];
+      out += q ? chipHtml(q) : rm2[0];
+      last = rm2.index + rm2[0].length;
+    }
+    out += esc(body.slice(last));
+    return out || (ql.length ? ql.map(chipHtml).join(" ") : "");
   }
   function loadHistory() {
     fetch(api("history")).then((r) => r.json()).then((msgs) => {
@@ -778,12 +807,27 @@
   function isPlaceholderMsg(s) {
     return !s || s === "（引用节点求助）" || s === "(Assist with node)";
   }
-  // 轮次显示文本：纯引用 → 📎 节点文本（有区分度）；混合 → 📎 节点文本：用户文本；普通 → 原文
-  function rollbackDisplay(quoted, userMsg) {
-    if (quoted && quoted.text) {
-      return "📎 " + quoted.text + (isPlaceholderMsg(userMsg) ? "" : "：" + userMsg);
+  // 把消息文本里的 [引用N] 占位符还原成可读的 📎 节点文本（quoted_list 提供对应节点）
+  function replaceRefPlaceholders(text, quotedList) {
+    if (!quotedList || !quotedList.length) return text;
+    return (text || "").replace(/\[引用(\d+)\]/g, (m, n) => {
+      const q = quotedList[parseInt(n, 10) - 1];
+      return q && q.text ? "📎" + q.text : m;
+    });
+  }
+  // 轮次显示文本：纯引用 → 📎 节点文本列表（有区分度）；混合 → 原文（[引用N] 还原成 📎）；普通 → 原文
+  function rollbackDisplay(quotedList, userMsg) {
+    const ql = quotedList || [];
+    const rest = isPlaceholderMsg(userMsg) ? "" : (userMsg || "");
+    if (rest) {
+      // 混合轮次：显示用户原文（占位符还原成 📎 节点文本），保留编排顺序
+      return replaceRefPlaceholders(rest, ql).trim() || (ql.length ? ql.map((q) => "📎" + (q.text || "")).join(" ") : "");
     }
-    return isPlaceholderMsg(userMsg) ? t("nodeAssistFallback") : userMsg;
+    if (ql.length) {
+      // 纯引用轮次：显示引用节点列表
+      return ql.map((q) => "📎" + (q.text || "")).join(" ");
+    }
+    return t("nodeAssistFallback");
   }
   function toggleRollbackList() {
     const list = document.getElementById("ai-rollback-list");
@@ -808,7 +852,7 @@
           const d = new Date((tn.ts || 0) * 1000);
           const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
           // 纯引用轮次显示引用节点文本（有区分度），否则显示用户消息
-          const display = rollbackDisplay(tn.quoted, tn.user_msg || "");
+          const display = rollbackDisplay(tn.quoted_list, tn.user_msg || "");
           const s = tn.diff_summary || {};
           const parts = [];
           if (s.add) parts.push("+" + s.add);
@@ -824,7 +868,7 @@
       }).catch(() => {});
   }
   function handleRollback(turn) {
-    const preview = rollbackDisplay(turn.quoted, turn.user_msg || "");
+    const preview = rollbackDisplay(turn.quoted_list, turn.user_msg || "");
     if (!window.confirm(t("rollbackConfirm", { msg: preview.slice(0, 30) }))) return;
     fetch(api("rollback"), {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -837,18 +881,32 @@
       box.innerHTML = "";
       document.getElementById("ai-rollback-list").classList.add("hidden");
       // 把目标轮那句话放回输入框（可直接编辑重发）：
-      // 用户发了什么就放回什么——引用轮次放回 chip（引用节点已不存在则不放），文本按原文放回
+      // 用户发了什么就放回什么——引用轮次放回 chip（引用节点已不存在则不放），
+      // 文本按原文放回，引用位置用 chip 还原（保留用户编排顺序）
       const input = document.getElementById("ai-input");
       input.innerHTML = "";
       let placed = false;
-      const rq = res.quoted;
-      if (rq && rq.uid && res.quoted_exists) {
-        insertQuoteChip(rq.uid, rq.text || "", rq.note || "");
-        placed = true;
+      const rqList = res.quoted_list || [];
+      const rqExists = res.quoted_list_exists || [];
+      // 旧格式纯引用轮次的占位符不是用户输入，不参与回填
+      let rqMsg = isPlaceholderMsg(res.user_msg) ? "" : (res.user_msg || "");
+      // 按 [引用N] 占位符顺序重建输入框：chip 存在则放 chip，否则丢弃占位符
+      const refRe = /\[引用(\d+)\]/g;
+      let last = 0, m;
+      while ((m = refRe.exec(rqMsg)) !== null) {
+        if (m.index > last) {
+          input.appendChild(document.createTextNode(rqMsg.slice(last, m.index)));
+        }
+        const qi = parseInt(m[1], 10) - 1;
+        const q = rqList[qi];
+        if (q && q.uid && rqExists[qi]) {
+          insertQuoteChip(q.uid, q.text || "", q.note || "");
+          placed = true;
+        }
+        last = m.index + m[0].length;
       }
-      // 用户实际文本才放回（纯引用轮次的占位符不放，双语都判断）
-      if (res.user_msg && !isPlaceholderMsg(res.user_msg)) {
-        input.appendChild(document.createTextNode(res.user_msg));
+      if (last < rqMsg.length) {
+        input.appendChild(document.createTextNode(rqMsg.slice(last)));
         placed = true;
       }
       if (placed) input.focus();
@@ -871,27 +929,56 @@
       body: JSON.stringify(_mindMap.getData()),
     }).catch(() => {});
   }
-  function getInputText() {
+  // 提取输入框内容：chip 原位替换成 [引用N] 占位符（保留用户编排顺序），
+  // 同时返回按出现顺序的 quotes 数组。用户怎么写的就怎么发。
+  function collectInputMessage() {
     const input = document.getElementById("ai-input");
-    const clone = input.cloneNode(true);
-    clone.querySelectorAll(".ai-quote-chip").forEach((c) => c.remove());
-    return clone.textContent || "";
+    const quotes = [];
+    let text = "";
+    let refIdx = 0;
+    input.childNodes.forEach((node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        text += node.textContent;
+      } else if (node.classList && node.classList.contains("ai-quote-chip")) {
+        refIdx++;
+        quotes.push({
+          uid: node.dataset.uid || "",
+          text: node.dataset.fullText || "",
+          note: node.dataset.note || "",
+        });
+        text += "[引用" + refIdx + "]";
+      } else {
+        text += node.textContent || "";
+      }
+    });
+    return { text: text.trim(), quotes };
+  }
+  function getInputText() {
+    return collectInputMessage().text;
   }
   function collectQuotes() {
-    return Array.from(document.querySelectorAll("#ai-input .ai-quote-chip"))
-      .map((c) => ({ uid: c.dataset.uid || "", text: c.dataset.fullText || "", note: c.dataset.note || "" }));
+    return collectInputMessage().quotes;
   }
   function sendMessage() {
     if (_streaming) return;
-    const msg = getInputText().trim();
-    const quotes = collectQuotes();
+    const { text: msg, quotes } = collectInputMessage();
     if (!msg && !quotes.length) return;
     const input = document.getElementById("ai-input");
     input.innerHTML = "";
-    let shown = esc(msg);
-    quotes.forEach((q) => { shown = '<span style="opacity:.75">📎' + esc(q.text.slice(0, 15)) + "…</span> " + shown; });
-    addBubble("user", shown);
-    const context = quotes.length ? { quoted_node: quotes[0] } : null;
+    // 气泡显示也按用户原顺序：把 [引用N] 占位符还原成 chip 样式
+    let shown = "";
+    let refIdx = 0;
+    const parts = msg.split(/\[引用(\d+)\]/g);
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        shown += esc(parts[i]);
+      } else {
+        const q = quotes[parseInt(parts[i], 10) - 1];
+        if (q) shown += '<span style="opacity:.75">📎' + esc(q.text.slice(0, 15)) + "…</span>";
+      }
+    }
+    addBubble("user", shown || (quotes.length ? '📎<span style="opacity:.75">' + esc(quotes[0].text.slice(0, 15)) + "…</span>" : ""));
+    const context = quotes.length ? { quoted_nodes: quotes } : null;
     syncMap().then(() => {
       fetch(api("prompt"), {
         method: "POST", headers: { "Content-Type": "application/json", "X-Lang": lang() },

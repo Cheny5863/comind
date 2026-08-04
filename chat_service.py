@@ -527,16 +527,31 @@ class ChatSessionManager:
             self._lang_pref[skey] = lang
         sess = self.get_or_spawn(map_key, branch_uid)
         parts = []
+        quoted_nodes = []
         if context:
-            quoted = context.get("quoted_node")
-            if quoted:
-                uid = quoted.get("uid", "") if isinstance(quoted, dict) else ""
-                text = quoted.get("text", "") if isinstance(quoted, dict) else str(quoted)
-                prefix = f"[NODE_ASSIST uid={uid}]" if uid else "[NODE_ASSIST]"
-                parts.append(f"{prefix} 用户在节点「{text}」上求助")
-                note = quoted.get("note", "") if isinstance(quoted, dict) else ""
-                if note:
-                    parts.append(f"[该节点的备注内容：{note}]")
+            qn = context.get("quoted_nodes") or []
+            if not qn and context.get("quoted_node"):
+                qn = [context["quoted_node"]]
+            quoted_nodes = [q for q in qn if isinstance(q, dict)]
+        if quoted_nodes:
+            first = quoted_nodes[0]
+            uid = first.get("uid", "")
+            text = first.get("text", "")
+            prefix = f"[NODE_ASSIST uid={uid}]" if uid else "[NODE_ASSIST]"
+            parts.append(f"{prefix} 用户在节点「{text}」上求助")
+            note = first.get("note", "")
+            if note:
+                parts.append(f"[该节点的备注内容：{note}]")
+            if len(quoted_nodes) > 1:
+                parts.append("引用节点（消息中的 [引用N] 占位符指代这里的节点）：")
+                for i, q in enumerate(quoted_nodes, 1):
+                    qtext = q.get("text", "")
+                    quid = q.get("uid", "")
+                    qnote = q.get("note", "")
+                    line = f"[引用{i}] uid={quid} 「{qtext}」"
+                    if qnote:
+                        line += f"（备注：{qnote}）"
+                    parts.append(line)
         parts.append(message)
         full_msg = "\n".join(parts)
         self.record_turn_start(map_key, branch_uid, message)
@@ -1080,6 +1095,7 @@ class ChatSessionManager:
             out.append({
                 "user_msg_idx": um["user_msg_idx"],
                 "user_msg": msg_by_idx.get(um["user_msg_idx"], um["user_msg"]),
+                "quoted_list": um.get("quoted_list") or [],
                 "quoted": um.get("quoted"),
                 "ts": um["ts"],
                 "diff_summary": summary,
@@ -1126,12 +1142,12 @@ class ChatSessionManager:
         if cut is None:
             return {"ok": False, "error": "找不到目标轮次消息（session 文件已变化）"}
         target_msg = ""
-        target_quoted = None
+        target_quoted_list = []
         ums = _user_messages_from_jsonl(Path(session_file))
         for um in ums:
             if um["user_msg_idx"] == user_msg_idx:
                 target_msg = um["user_msg"]
-                target_quoted = um.get("quoted")
+                target_quoted_list = um.get("quoted_list") or []
                 break
         keep = lines[:cut]
         _atomic_write(Path(session_file), "\n".join(keep) + ("\n" if keep else ""))
@@ -1147,21 +1163,23 @@ class ChatSessionManager:
         # 5. mapping 指向同一 session 文件——前端 SSE 重连时 get_or_spawn 加载截断文件
         self._mapping[skey] = session_file
         self._save_mapping()
-        # 6. 检查目标轮引用节点在回滚后的树中是否存在（供前端决定是否放回 chip）
-        quoted_exists = False
-        if target_quoted and target_quoted.get("uid"):
-            try:
-                _, file_md, _, _ = _load_doc_for_write(self, map_key)
-                root = file_md.get("root", file_md)
-                quoted_exists = target_quoted["uid"] in _index_by_uid(root)
-            except Exception:
-                quoted_exists = False
+        # 6. 检查目标轮各引用节点在回滚后的树中是否存在（供前端决定是否放回 chip）
+        quoted_list_exists = []
+        try:
+            _, file_md, _, _ = _load_doc_for_write(self, map_key)
+            root = file_md.get("root", file_md)
+            uid_index = _index_by_uid(root) if isinstance(root, dict) else {}
+        except Exception:
+            uid_index = {}
+        for q in target_quoted_list:
+            quoted_list_exists.append(bool(q.get("uid") and q["uid"] in uid_index))
         return {
             "ok": True,
             "skipped": skipped,
             "user_msg": target_msg,
-            "quoted": target_quoted,
-            "quoted_exists": quoted_exists,
+            "quoted_list": target_quoted_list,
+            "quoted": target_quoted_list[0] if target_quoted_list else None,
+            "quoted_list_exists": quoted_list_exists,
             "map_restored": map_restored,
         }
 
@@ -2046,46 +2064,78 @@ def _user_messages_from_jsonl(path: Path) -> list[dict]:
                 c.get("text", "") for c in content
                 if isinstance(c, dict) and c.get("type") == "text"
             )
-        quoted = _parse_node_assist(text)
-        # 剥离 NODE_ASSIST 前缀（引用求助时 prompt 注入的说明行 + 备注行）
-        if text.startswith("[NODE_ASSIST"):
-            rest = []
-            for ln in text.split("\n")[1:]:
-                if ln.startswith("[该节点的备注内容："):
-                    continue
-                rest.append(ln)
-            text = "\n".join(rest).strip()
+        quoted_list, body = _parse_node_assist(text)
         ts = msg.get("timestamp") or e.get("timestamp") or 0
         if ts and ts > 1e12:
             ts = ts / 1000.0
-        out.append({"user_msg_idx": idx, "user_msg": text, "ts": ts, "quoted": quoted})
+        out.append({
+            "user_msg_idx": idx,
+            "user_msg": body,
+            "quoted_list": quoted_list,
+            "quoted": quoted_list[0] if quoted_list else None,
+            "ts": ts,
+        })
     return out
 
 
-def _parse_node_assist(text: str) -> dict | None:
+def _parse_node_assist(text: str) -> tuple[list[dict], str]:
     """从 jsonl user 消息原文解析 NODE_ASSIST 引用信息。
 
-    格式（prompt() 拼装）：
+    新格式（prompt() 拼装，多引用）：
         [NODE_ASSIST uid=xxx] 用户在节点「text」上求助
-        [该节点的备注内容：note]（可选，note 含换行时只取到第一个 ]）
-    返回 {uid, text, note}；非引用消息返回 None。
+        [该节点的备注内容：note]（可选，第一个引用的）
+        引用节点（消息中的 [引用N] 占位符指代这里的节点）：
+        [引用1] uid=xxx 「text1」（备注：note1）
+        [引用2] uid=yyy 「text2」
+        用户消息原文（含 [引用N] 占位符）
+
+    旧格式（单引用，向后兼容）：
+        [NODE_ASSIST uid=xxx] 用户在节点「text」上求助
+        [该节点的备注内容：note]（可选）
+        用户消息原文
+
+    返回 (quoted_list, body)：
+        quoted_list: [{uid, text, note}, ...] 按消息中引用出现顺序
+        body: 用户消息原文（剥离前缀/备注/引用列表段，保留 [引用N] 占位符）
+        非引用消息返回 ([], text)。
     """
     if not text or not text.startswith("[NODE_ASSIST"):
-        return None
+        return [], text
     lines = text.split("\n")
     m = re.match(r"^\[NODE_ASSIST(?: uid=([^\]]*))?\]\s*用户在节点「(.+)」上求助$", lines[0])
     if not m:
-        return None
-    quoted = {"uid": m.group(1) or "", "text": m.group(2), "note": ""}
+        return [], text
+    quoted_list = [{"uid": m.group(1) or "", "text": m.group(2), "note": ""}]
+    # 首行后的内容：备注行（第一个引用的）/ 引用列表段 / 用户消息原文
+    body_lines = []
+    ref_re = re.compile(r"^\[引用(\d+)\] uid=([^\s「」]*) 「(.+)」(?:（备注：(.+)）)?$")
     for ln in lines[1:]:
         ln = ln.strip()
-        if ln.startswith("[该节点的备注内容："):
+        if not ln:
+            continue
+        if ln.startswith("[该节点的备注内容：") and len(quoted_list) == 1:
             note = ln[len("[该节点的备注内容："):]
             if note.endswith("]"):
                 note = note[:-1]
-            quoted["note"] = note
-            break
-    return quoted
+            quoted_list[0]["note"] = note
+            continue
+        rm = ref_re.match(ln)
+        if rm:
+            ref = {
+                "uid": rm.group(2),
+                "text": rm.group(3),
+                "note": rm.group(4) or "",
+            }
+            idx = int(rm.group(1))
+            while len(quoted_list) < idx:
+                quoted_list.append({"uid": "", "text": "", "note": ""})
+            quoted_list[idx - 1] = ref
+            continue
+        if ln.startswith("引用节点"):
+            continue  # 引用列表段标题
+        body_lines.append(ln)
+    body = "\n".join(body_lines).strip()
+    return quoted_list, body
 
 
 def _compute_net_diff(before_root: dict, after_root: dict) -> list[dict]:

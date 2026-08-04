@@ -153,28 +153,65 @@ class TestTurnsStore:
 
 class TestParseNodeAssist:
     def test_pure_quote_with_note(self):
-        q = _parse_node_assist("[NODE_ASSIST uid=abc123] 用户在节点「多模态融合方案」上求助\n[该节点的备注内容：参考了 2024 论文]\n（引用节点求助）")
-        assert q == {"uid": "abc123", "text": "多模态融合方案", "note": "参考了 2024 论文"}
+        ql, body = _parse_node_assist("[NODE_ASSIST uid=abc123] 用户在节点「多模态融合方案」上求助\n[该节点的备注内容：参考了 2024 论文]\n（引用节点求助）")
+        assert ql == [{"uid": "abc123", "text": "多模态融合方案", "note": "参考了 2024 论文"}]
+        assert body == "（引用节点求助）"
 
     def test_pure_quote_no_note(self):
-        q = _parse_node_assist("[NODE_ASSIST uid=xyz789] 用户在节点「损失函数设计」上求助\n（引用节点求助）")
-        assert q == {"uid": "xyz789", "text": "损失函数设计", "note": ""}
+        ql, body = _parse_node_assist("[NODE_ASSIST uid=xyz789] 用户在节点「损失函数设计」上求助\n（引用节点求助）")
+        assert ql == [{"uid": "xyz789", "text": "损失函数设计", "note": ""}]
+        assert body == "（引用节点求助）"
 
     def test_quote_with_user_text(self):
-        q = _parse_node_assist("[NODE_ASSIST uid=abc123] 用户在节点「多模态融合方案」上求助\n帮我展开这个节点")
-        assert q == {"uid": "abc123", "text": "多模态融合方案", "note": ""}
+        ql, body = _parse_node_assist("[NODE_ASSIST uid=abc123] 用户在节点「多模态融合方案」上求助\n帮我展开这个节点")
+        assert ql == [{"uid": "abc123", "text": "多模态融合方案", "note": ""}]
+        assert body == "帮我展开这个节点"
 
     def test_old_format_no_uid(self):
-        q = _parse_node_assist("[NODE_ASSIST] 用户在节点「旧格式节点」上求助\n（引用节点求助）")
-        assert q == {"uid": "", "text": "旧格式节点", "note": ""}
+        ql, body = _parse_node_assist("[NODE_ASSIST] 用户在节点「旧格式节点」上求助\n（引用节点求助）")
+        assert ql == [{"uid": "", "text": "旧格式节点", "note": ""}]
+        assert body == "（引用节点求助）"
 
     def test_plain_text_not_quote(self):
-        assert _parse_node_assist("今天天气怎么样") is None
-        assert _parse_node_assist("") is None
+        assert _parse_node_assist("今天天气怎么样") == ([], "今天天气怎么样")
+        assert _parse_node_assist("") == ([], "")
 
     def test_nested_quotes_in_node_text(self):
-        q = _parse_node_assist("[NODE_ASSIST uid=q1] 用户在节点「他说「你好」世界」上求助\n（引用节点求助）")
-        assert q == {"uid": "q1", "text": "他说「你好」世界", "note": ""}
+        ql, body = _parse_node_assist("[NODE_ASSIST uid=q1] 用户在节点「他说「你好」世界」上求助\n（引用节点求助）")
+        assert ql == [{"uid": "q1", "text": "他说「你好」世界", "note": ""}]
+        assert body == "（引用节点求助）"
+
+    def test_multi_quote_keeps_order(self):
+        # 多引用新格式：前缀（第一个引用）+ 引用列表段 + 用户消息原文（含 [引用N] 占位符）
+        text = (
+            "[NODE_ASSIST uid=aaa] 用户在节点「第一个节点」上求助\n"
+            "引用节点（消息中的 [引用N] 占位符指代这里的节点）：\n"
+            "[引用1] uid=aaa 「第一个节点」\n"
+            "[引用2] uid=bbb 「第二个节点」\n"
+            "这个 [引用1] 是什么意思呢？然后 [引用2] 呢？"
+        )
+        ql, body = _parse_node_assist(text)
+        assert ql == [
+            {"uid": "aaa", "text": "第一个节点", "note": ""},
+            {"uid": "bbb", "text": "第二个节点", "note": ""},
+        ]
+        assert body == "这个 [引用1] 是什么意思呢？然后 [引用2] 呢？"
+
+    def test_multi_quote_with_note(self):
+        text = (
+            "[NODE_ASSIST uid=aaa] 用户在节点「第一个节点」上求助\n"
+            "[该节点的备注内容：主备注]\n"
+            "引用节点（消息中的 [引用N] 占位符指代这里的节点）：\n"
+            "[引用1] uid=aaa 「第一个节点」（备注：主备注）\n"
+            "[引用2] uid=bbb 「第二个节点」（备注：次备注）\n"
+            "帮我对比一下 [引用1] 和 [引用2]"
+        )
+        ql, body = _parse_node_assist(text)
+        assert ql == [
+            {"uid": "aaa", "text": "第一个节点", "note": "主备注"},
+            {"uid": "bbb", "text": "第二个节点", "note": "次备注"},
+        ]
+        assert body == "帮我对比一下 [引用1] 和 [引用2]"
 
 
 class TestUserMessagesQuoted:
@@ -193,11 +230,26 @@ class TestUserMessagesQuoted:
         ])
         ums = _user_messages_from_jsonl(f)
         assert ums[0]["quoted"] is None
+        assert ums[0]["quoted_list"] == []
         assert ums[0]["user_msg"] == "第一轮"
-        assert ums[1]["quoted"] == {"uid": "abc", "text": "多模态融合", "note": "备注内容"}
+        assert ums[1]["quoted_list"] == [{"uid": "abc", "text": "多模态融合", "note": "备注内容"}]
         assert ums[1]["user_msg"] == "（引用节点求助）"  # 占位符剥离后保留，note 行不残留
-        assert ums[2]["quoted"] == {"uid": "xyz", "text": "损失函数", "note": ""}
+        assert ums[2]["quoted_list"] == [{"uid": "xyz", "text": "损失函数", "note": ""}]
         assert ums[2]["user_msg"] == "帮我展开"
+
+    def test_multi_quote_roundtrip(self, tmp_path):
+        """多引用轮次：quoted_list 按顺序，user_msg 保留 [引用N] 占位符（回填放回 chip 的依据）。"""
+        f = self._session(tmp_path, [
+            json.dumps({"type": "message", "message": {"role": "user", "content": "第一轮"}}),
+            json.dumps({"type": "message", "message": {"role": "user",
+                        "content": "[NODE_ASSIST uid=aaa] 用户在节点「第一个」上求助\n引用节点（消息中的 [引用N] 占位符指代这里的节点）：\n[引用1] uid=aaa 「第一个」\n[引用2] uid=bbb 「第二个」\n这个 [引用1] 是什么意思呢？然后 [引用2] 呢？"}}),
+        ])
+        ums = _user_messages_from_jsonl(f)
+        assert ums[1]["quoted_list"] == [
+            {"uid": "aaa", "text": "第一个", "note": ""},
+            {"uid": "bbb", "text": "第二个", "note": ""},
+        ]
+        assert ums[1]["user_msg"] == "这个 [引用1] 是什么意思呢？然后 [引用2] 呢？"
 
 
 class TestListTurnsAndRollbackQuoted:
@@ -219,10 +271,11 @@ class TestListTurnsAndRollbackQuoted:
         turns = be.chat_manager.list_turns("test.smm.json")
         assert len(turns) == 3
         assert turns[0]["quoted"] is None
+        assert turns[0]["quoted_list"] == []
         assert turns[0]["user_msg"] == "第一轮"
-        assert turns[1]["quoted"] == {"uid": "abc", "text": "多模态融合", "note": ""}
+        assert turns[1]["quoted_list"] == [{"uid": "abc", "text": "多模态融合", "note": ""}]
         assert turns[1]["user_msg"] == "（引用节点求助）"
-        assert turns[2]["quoted"] == {"uid": "xyz", "text": "损失函数", "note": ""}
+        assert turns[2]["quoted_list"] == [{"uid": "xyz", "text": "损失函数", "note": ""}]
         assert turns[2]["user_msg"] == "帮我展开"
 
     def test_rollback_returns_quoted_and_exists(self, env, tmp_path, monkeypatch):
@@ -240,9 +293,9 @@ class TestListTurnsAndRollbackQuoted:
         res = be.chat_manager.rollback("test.smm.json", "", 2)
         assert res["ok"] is True
         assert res["user_msg"] == "（引用节点求助）"
-        assert res["quoted"] == {"uid": "abc", "text": "节点A", "note": ""}
+        assert res["quoted_list"] == [{"uid": "abc", "text": "节点A", "note": ""}]
         # 引用节点 abc 在测试脑图里存在（a-1 的 uid 是 a-1，这里 abc 不存在）→ False
-        assert res["quoted_exists"] is False
+        assert res["quoted_list_exists"] == [False]
 
     def test_rollback_quoted_exists_true(self, env, tmp_path):
         import backend as be
@@ -257,6 +310,26 @@ class TestListTurnsAndRollbackQuoted:
         be.chat_manager._mapping["test.smm.json"] = sf
         res = be.chat_manager.rollback("test.smm.json", "", 2)
         assert res["ok"] is True
-        assert res["quoted"]["uid"] == "a-1"
+        assert res["quoted_list"][0]["uid"] == "a-1"
         # a-1 是测试树里的真实节点 → exists True
-        assert res["quoted_exists"] is True
+        assert res["quoted_list_exists"] == [True]
+
+    def test_rollback_multi_quote_exists_mixed(self, env, tmp_path):
+        """多引用回滚：存在性按引用顺序逐个返回（存在/不存在混合）。"""
+        import backend as be
+        from chat_service import SESSION_DIR, safe_key_slug
+        client = env
+        sf = str(SESSION_DIR / (safe_key_slug("test.smm.json") + "__rollback-multi.jsonl"))
+        Path(sf).write_text("\n".join([
+            json.dumps({"type": "message", "message": {"role": "user", "content": "第一轮"}}),
+            json.dumps({"type": "message", "message": {"role": "user",
+                        "content": "[NODE_ASSIST uid=a-1] 用户在节点「节点A」上求助\n引用节点（消息中的 [引用N] 占位符指代这里的节点）：\n[引用1] uid=a-1 「节点A」\n[引用2] uid=ghost 「不存在的节点」\n这个 [引用1] 和 [引用2] 对比一下"}}),
+        ]))
+        be.chat_manager._mapping["test.smm.json"] = sf
+        res = be.chat_manager.rollback("test.smm.json", "", 2)
+        assert res["ok"] is True
+        assert len(res["quoted_list"]) == 2
+        # a-1 真实存在，ghost 不存在
+        assert res["quoted_list_exists"] == [True, False]
+        # user_msg 保留占位符（前端据此把存在的 [引用1] 还原成 chip，[引用2] 丢弃）
+        assert "这个 [引用1] 和 [引用2] 对比一下" in res["user_msg"]

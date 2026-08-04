@@ -1123,7 +1123,9 @@ class ChatSessionManager:
         # 1. 直接 kill pi（回滚语义 = 回到那轮之前，正在进行的回复本就该丢弃）
         if sess and sess.alive:
             sess.kill()
-        self._sessions.pop(skey, None)
+        # 注意：先不 pop _sessions——_apply_reverse → _commit_map 要广播
+        # mindmap_update 给本 session 的 SSE 订阅者，pop 早了前端画布收不到
+        # （toast 成功但界面不刷新）。改图广播完成后才移出活跃池。
         # 2. 截断 jsonl 到目标轮 user 消息之前（保留 header + 之前所有行）
         lines = Path(session_file).read_text().splitlines()
         cut = None
@@ -1162,15 +1164,24 @@ class ChatSessionManager:
         # 4. 脑图反向应用（只撤销该 session 的 AI 改动，冲突节点跳过）
         map_restored = bool(later_diffs)
         skipped = _apply_reverse(self, map_key, later_diffs, branch_uid) if later_diffs else []
+        # 4.5 广播完成（_commit_map 已发 mindmap_update 给本 session 的 SSE 订阅者），
+        #     现在才把 session 移出活跃池——旧 SSE 连接由前端 connectSSE() 重连替换
+        self._sessions.pop(skey, None)
         # 5. mapping 指向同一 session 文件——前端 SSE 重连时 get_or_spawn 加载截断文件
         self._mapping[skey] = session_file
         self._save_mapping()
         # 6. 检查目标轮各引用节点在回滚后的树中是否存在（供前端决定是否放回 chip）
         quoted_list_exists = []
+        new_root = None
         try:
-            _, file_md, _, _ = _load_doc_for_write(self, map_key)
-            root = file_md.get("root", file_md)
-            uid_index = _index_by_uid(root) if isinstance(root, dict) else {}
+            st = self._map_state.get(map_key)
+            if st:
+                new_root = _state_root(st)
+            if new_root is None:
+                # 服务重启后未 sync 的脑图：_map_state 为空，从磁盘兜底（回滚已落盘）
+                _, file_md, _, _ = _load_doc_for_write(self, map_key)
+                new_root = file_md.get("root", file_md)
+            uid_index = _index_by_uid(new_root) if new_root else {}
         except Exception:
             uid_index = {}
         for q in target_quoted_list:
@@ -1183,6 +1194,10 @@ class ChatSessionManager:
             "quoted": target_quoted_list[0] if target_quoted_list else None,
             "quoted_list_exists": quoted_list_exists,
             "map_restored": map_restored,
+            # 回滚后的完整树：_commit_map 已更新 _map_state 为反向应用后的树。
+            # 前端用它直接 setData 刷新画布——SSE 广播在 kill 后靠 EventSource
+            # 自动重连不可靠（重连晚于广播，旧 queue 已 unsub），响应带树最稳。
+            "tree": new_root if map_restored else None,
         }
 
 

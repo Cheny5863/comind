@@ -941,6 +941,9 @@
         placed = true;
       }
       if (placed) input.focus();
+      // 画布刷新：后端响应带回滚后完整树（kill 后 SSE 广播靠 EventSource 自动
+      // 重连不可靠——重连晚于广播、旧 queue 已 unsub），直接 setData 最稳
+      if (res.tree) applyMapUpdate(res.tree);
       loadHistory();      // 截断后的历史
       refreshAgents();    // 更新 label / 活跃 session
       connectSSE();

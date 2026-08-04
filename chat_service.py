@@ -92,13 +92,18 @@ def _display_label(label: str, max_len: int = 5) -> str:
 def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> str:
     """取分支根节点的文本标签，用于注入 system prompt 分支职责说明。
 
-    state 是 _map_state 中该脑图的 mindMapData（可选）；优先用它，找不到
-    兜底从磁盘脑图文件找。都找不到返回 uid 本身。
+    磁盘优先（用户手动编辑/AI 改图最终都落盘，磁盘是权威；_map_state
+    快照只在 sync/apply 时更新，会过期），state 兜底（覆盖磁盘上还不存在
+    的新节点——用户在 UI 新建未保存）。都找不到返回 uid 本身。
     """
     label = branch_uid
     try:
-        if state:
-            root = _state_root(state)
+        # 磁盘优先
+        fpath = Path(PROJECT_CWD) / map_key
+        if map_key.endswith(".smm.json") and fpath.is_file():
+            doc = json.loads(fpath.read_text())
+            md = doc.get("mindMapData") or {}
+            root = _state_root(md)
             if isinstance(root, dict):
                 idx = _index_by_uid(root)
                 node = idx.get(branch_uid)
@@ -106,12 +111,9 @@ def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> s
                     t = _strip_html(node["data"].get("text", ""))
                     if t:
                         return t[:40]
-        # 磁盘兜底
-        fpath = Path(PROJECT_CWD) / map_key
-        if map_key.endswith(".smm.json") and fpath.is_file():
-            doc = json.loads(fpath.read_text())
-            md = doc.get("mindMapData") or {}
-            root = _state_root(md)
+        # state 兜底
+        if state:
+            root = _state_root(state)
             if isinstance(root, dict):
                 idx = _index_by_uid(root)
                 node = idx.get(branch_uid)

@@ -179,11 +179,13 @@
     try { return JSON.parse(localStorage.getItem(lastViewKey()) || "null"); } catch (_) { return null; }
   }
   function recordLastView(file, branch) {
-    if (!file) return;
+    // 允许 file 为空但 branch 非空：新分支还没发消息时没有 session 文件，
+    // 也要记住「停在这个分支」，否则关面板重开会丢新分支、恢复旧 session
+    if (!file && !branch) return;
     try {
       const cur = readLastView();
-      if (cur && cur.file === file && (cur.branch || "") === (branch || "")) return;
-      localStorage.setItem(lastViewKey(), JSON.stringify({ file, branch: branch || "", ts: Date.now() }));
+      if (cur && cur.file === (file || "") && (cur.branch || "") === (branch || "")) return;
+      localStorage.setItem(lastViewKey(), JSON.stringify({ file: file || "", branch: branch || "", ts: Date.now() }));
     } catch (_) {}
   }
 
@@ -381,11 +383,32 @@
             loadModels(); startPolling();
           } else { openPanelRoutine(); }
         }).catch(() => openPanelRoutine());
+      } else if (rec && rec.branch) {
+        // 新分支还没发消息（无 session 文件）——恢复到该分支而不是旧 session
+        restoreBranch(rec.branch);
+        loadModels(); startPolling();
       } else { openPanelRoutine(); }
     } else { disconnectSSE(); stopPolling(); }
   }
   function openPanelRoutine() {
     loadHistory(); connectSSE(); loadModels(); recoverStreamState(); refreshAgents(); startPolling();
+  }
+  // 恢复到「已绑定但还没发消息的分支」（无 session 文件）：
+  // 清空消息区、挂到该分支的 SSE、等用户发消息时自然创建 session。
+  // 区别于 switchSession——那里要求 session 文件已存在。
+  function restoreBranch(branch) {
+    _currentBranch = branch || "";
+    _currentSessionFile = "";
+    setStreaming(false);
+    disconnectSSE();
+    const msgs = document.getElementById("ai-messages");
+    if (msgs) msgs.innerHTML = "";
+    const slist = document.getElementById("ai-session-list");
+    if (slist) slist.classList.add("hidden");
+    loadAgentLabel();
+    refreshAgents();
+    connectSSE();
+    recoverStreamState();
   }
   function openPanelFlash() {
     const panel = document.getElementById("ai-panel");
@@ -648,6 +671,11 @@
         _currentSessionFile = cur.session_file;
         markRead(_currentSessionFile);  // 正在查看 = 已读，历史列表不显示红点
         recordLastView(_currentSessionFile, _currentBranch);  // 记住"上次查看"，刷新后恢复
+      } else if (cur && _currentBranch) {
+        // 分支已绑定但还没发消息（无 session 文件）——记住分支本身，
+        // 否则关面板重开会丢新分支、恢复旧 session
+        _currentSessionFile = "";
+        recordLastView("", _currentBranch);
       }
       if (cb) cb(_agents);
     }).catch(() => {});
@@ -721,6 +749,9 @@
     const doSwitch = () => {
       _currentBranch = branch || "";
       _currentSessionFile = "";  // 新建/切换后等待 agents 刷新同步活跃会话
+      // 立刻记住分支（不等 refreshAgents）：新分支还没发消息没有 session 文件，
+      // 用户关面板再开时能恢复到该分支，而不是旧的 lastView session
+      if (branch) recordLastView("", branch);
       if (!branch) _pendingBranchLabel = "";  // root 用固定文案
       setStreaming(false);  // 清掉旧 session 的"思考中/中止"UI 残留
       disconnectSSE();

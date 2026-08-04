@@ -76,11 +76,13 @@ def _background_text(map_key: str) -> str:
     return ""
 
 
-def _display_label(label: str, max_len: int = 5) -> str:
+def _display_label(label: str, max_len: int = 20) -> str:
     """给用户 UI 看的分支名：前 max_len 个字符，超出加省略号。
 
     与 _branch_label（给 AI system prompt 的完整名）分开：AI 需要全名
-    理解上下文，用户界面只显示短标签避免撑爆面板。
+    理解上下文，用户界面显示适度短标签。默认 20 字（2026-08-05 从 5 提上来：
+    5 字太短，"ART Hook" 都被砍成 "ART H…"；超长标题由前端 CSS
+    max-width 140px + ellipsis 兜底截断，双保险）。
     """
     if not label:
         return label

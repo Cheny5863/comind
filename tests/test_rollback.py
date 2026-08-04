@@ -13,6 +13,8 @@ from chat_service import (
     _compute_net_diff,
     _build_reverse_ops,
     _user_message_count,
+    _user_messages_from_jsonl,
+    _parse_node_assist,
     _load_turns,
     _save_turns,
     _turns_path,
@@ -147,3 +149,114 @@ class TestTurnsStore:
             json.dumps({"type": "message", "id": "m3", "message": {"role": "user", "content": [{"type": "text", "text": "hi2"}]}}),
         ]))
         assert _user_message_count(f) == 2
+
+
+class TestParseNodeAssist:
+    def test_pure_quote_with_note(self):
+        q = _parse_node_assist("[NODE_ASSIST uid=abc123] 用户在节点「多模态融合方案」上求助\n[该节点的备注内容：参考了 2024 论文]\n（引用节点求助）")
+        assert q == {"uid": "abc123", "text": "多模态融合方案", "note": "参考了 2024 论文"}
+
+    def test_pure_quote_no_note(self):
+        q = _parse_node_assist("[NODE_ASSIST uid=xyz789] 用户在节点「损失函数设计」上求助\n（引用节点求助）")
+        assert q == {"uid": "xyz789", "text": "损失函数设计", "note": ""}
+
+    def test_quote_with_user_text(self):
+        q = _parse_node_assist("[NODE_ASSIST uid=abc123] 用户在节点「多模态融合方案」上求助\n帮我展开这个节点")
+        assert q == {"uid": "abc123", "text": "多模态融合方案", "note": ""}
+
+    def test_old_format_no_uid(self):
+        q = _parse_node_assist("[NODE_ASSIST] 用户在节点「旧格式节点」上求助\n（引用节点求助）")
+        assert q == {"uid": "", "text": "旧格式节点", "note": ""}
+
+    def test_plain_text_not_quote(self):
+        assert _parse_node_assist("今天天气怎么样") is None
+        assert _parse_node_assist("") is None
+
+    def test_nested_quotes_in_node_text(self):
+        q = _parse_node_assist("[NODE_ASSIST uid=q1] 用户在节点「他说「你好」世界」上求助\n（引用节点求助）")
+        assert q == {"uid": "q1", "text": "他说「你好」世界", "note": ""}
+
+
+class TestUserMessagesQuoted:
+    def _session(self, tmp_path, lines):
+        f = tmp_path / "s.jsonl"
+        f.write_text("\n".join(lines))
+        return f
+
+    def test_pure_quote_strips_prefix_and_note_line(self, tmp_path):
+        f = self._session(tmp_path, [
+            json.dumps({"type": "message", "message": {"role": "user", "content": "第一轮"}}),
+            json.dumps({"type": "message", "message": {"role": "user",
+                        "content": "[NODE_ASSIST uid=abc] 用户在节点「多模态融合」上求助\n[该节点的备注内容：备注内容]\n（引用节点求助）"}}),
+            json.dumps({"type": "message", "message": {"role": "user",
+                        "content": "[NODE_ASSIST uid=xyz] 用户在节点「损失函数」上求助\n帮我展开"}}),
+        ])
+        ums = _user_messages_from_jsonl(f)
+        assert ums[0]["quoted"] is None
+        assert ums[0]["user_msg"] == "第一轮"
+        assert ums[1]["quoted"] == {"uid": "abc", "text": "多模态融合", "note": "备注内容"}
+        assert ums[1]["user_msg"] == "（引用节点求助）"  # 占位符剥离后保留，note 行不残留
+        assert ums[2]["quoted"] == {"uid": "xyz", "text": "损失函数", "note": ""}
+        assert ums[2]["user_msg"] == "帮我展开"
+
+
+class TestListTurnsAndRollbackQuoted:
+    """list_turns / rollback 的 quoted 传递（回退列表区分度 + 回填 chip 依据）。"""
+
+    def test_list_turns_carries_quoted(self, env, tmp_path):
+        import backend as be
+        from chat_service import SESSION_DIR, safe_key_slug
+        client = env
+        sf = str(SESSION_DIR / (safe_key_slug("test.smm.json") + "__quoted-test.jsonl"))
+        Path(sf).write_text("\n".join([
+            json.dumps({"type": "message", "message": {"role": "user", "content": "第一轮"}}),
+            json.dumps({"type": "message", "message": {"role": "user",
+                        "content": "[NODE_ASSIST uid=abc] 用户在节点「多模态融合」上求助\n（引用节点求助）"}}),
+            json.dumps({"type": "message", "message": {"role": "user",
+                        "content": "[NODE_ASSIST uid=xyz] 用户在节点「损失函数」上求助\n帮我展开"}}),
+        ]))
+        be.chat_manager._mapping["test.smm.json"] = sf
+        turns = be.chat_manager.list_turns("test.smm.json")
+        assert len(turns) == 3
+        assert turns[0]["quoted"] is None
+        assert turns[0]["user_msg"] == "第一轮"
+        assert turns[1]["quoted"] == {"uid": "abc", "text": "多模态融合", "note": ""}
+        assert turns[1]["user_msg"] == "（引用节点求助）"
+        assert turns[2]["quoted"] == {"uid": "xyz", "text": "损失函数", "note": ""}
+        assert turns[2]["user_msg"] == "帮我展开"
+
+    def test_rollback_returns_quoted_and_exists(self, env, tmp_path, monkeypatch):
+        import backend as be
+        from chat_service import SESSION_DIR, safe_key_slug
+        client = env
+        sf = str(SESSION_DIR / (safe_key_slug("test.smm.json") + "__rollback-quoted.jsonl"))
+        Path(sf).write_text("\n".join([
+            json.dumps({"type": "message", "message": {"role": "user", "content": "第一轮"}}),
+            json.dumps({"type": "message", "message": {"role": "user",
+                        "content": "[NODE_ASSIST uid=abc] 用户在节点「节点A」上求助\n（引用节点求助）"}}),
+        ]))
+        be.chat_manager._mapping["test.smm.json"] = sf
+        # 回滚到第 2 轮（引用轮次）之前 → 截断后只剩第 1 轮
+        res = be.chat_manager.rollback("test.smm.json", "", 2)
+        assert res["ok"] is True
+        assert res["user_msg"] == "（引用节点求助）"
+        assert res["quoted"] == {"uid": "abc", "text": "节点A", "note": ""}
+        # 引用节点 abc 在测试脑图里存在（a-1 的 uid 是 a-1，这里 abc 不存在）→ False
+        assert res["quoted_exists"] is False
+
+    def test_rollback_quoted_exists_true(self, env, tmp_path):
+        import backend as be
+        from chat_service import SESSION_DIR, safe_key_slug
+        client = env
+        sf = str(SESSION_DIR / (safe_key_slug("test.smm.json") + "__rollback-quoted2.jsonl"))
+        Path(sf).write_text("\n".join([
+            json.dumps({"type": "message", "message": {"role": "user", "content": "第一轮"}}),
+            json.dumps({"type": "message", "message": {"role": "user",
+                        "content": "[NODE_ASSIST uid=a-1] 用户在节点「节点A」上求助\n（引用节点求助）"}}),
+        ]))
+        be.chat_manager._mapping["test.smm.json"] = sf
+        res = be.chat_manager.rollback("test.smm.json", "", 2)
+        assert res["ok"] is True
+        assert res["quoted"]["uid"] == "a-1"
+        # a-1 是测试树里的真实节点 → exists True
+        assert res["quoted_exists"] is True

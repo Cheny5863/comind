@@ -180,6 +180,9 @@
   background: #fdf6ec; border-radius: 4px; padding: 1px 6px; white-space: nowrap;
 }
 .ai-session-item.rollback-item { color: #303133; }
+.ai-session-item.rollback-item .ai-rollback-msg {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 /* 背景信息编辑 / 设置抽屉：覆盖 ai-body 区域（跟随 header/toolbar 高度，无硬编码） */
 .ai-bg-drawer {
   position: absolute; inset: 0; background: #fff; z-index: 2;

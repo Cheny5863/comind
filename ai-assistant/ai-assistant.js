@@ -774,6 +774,17 @@
   }
 
   /* ── 轮次回滚（按对话轮次线性回滚）── */
+  // 占位符判断：兼容中英两种语言（session 语言可能与当前 UI 语言不同）
+  function isPlaceholderMsg(s) {
+    return !s || s === "（引用节点求助）" || s === "(Assist with node)";
+  }
+  // 轮次显示文本：纯引用 → 📎 节点文本（有区分度）；混合 → 📎 节点文本：用户文本；普通 → 原文
+  function rollbackDisplay(quoted, userMsg) {
+    if (quoted && quoted.text) {
+      return "📎 " + quoted.text + (isPlaceholderMsg(userMsg) ? "" : "：" + userMsg);
+    }
+    return isPlaceholderMsg(userMsg) ? t("nodeAssistFallback") : userMsg;
+  }
   function toggleRollbackList() {
     const list = document.getElementById("ai-rollback-list");
     if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
@@ -796,8 +807,8 @@
           div.className = "ai-session-item rollback-item";
           const d = new Date((tn.ts || 0) * 1000);
           const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
-          const rawMsg = tn.user_msg || "";
-          const msg = esc((rawMsg || t("nodeAssistFallback")).slice(0, 24));
+          // 纯引用轮次显示引用节点文本（有区分度），否则显示用户消息
+          const display = rollbackDisplay(tn.quoted, tn.user_msg || "");
           const s = tn.diff_summary || {};
           const parts = [];
           if (s.add) parts.push("+" + s.add);
@@ -805,16 +816,16 @@
           if (s.delete) parts.push("-" + s.delete);
           if (s.move) parts.push("↔" + s.move);
           const badge = parts.length ? '<span class="ai-rollback-badge">' + parts.join(" ") + "</span>" : "";
-          div.innerHTML = "<span class='ai-session-time'>" + time + "</span>" + msg + badge;
-          div.title = tn.user_msg || "";
+          div.innerHTML = "<span class='ai-session-time'>" + time + "</span><span class='ai-rollback-msg'>" + esc(display) + "</span>" + badge;
+          div.title = display;
           div.addEventListener("click", () => handleRollback(tn));
           list.appendChild(div);
         });
       }).catch(() => {});
   }
   function handleRollback(turn) {
-    const msg = ((turn.user_msg || "").slice(0, 30)) || t("nodeAssistFallback");
-    if (!window.confirm(t("rollbackConfirm", { msg }))) return;
+    const preview = rollbackDisplay(turn.quoted, turn.user_msg || "");
+    if (!window.confirm(t("rollbackConfirm", { msg: preview.slice(0, 30) }))) return;
     fetch(api("rollback"), {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_msg_idx: turn.user_msg_idx, branch_uid: _currentBranch }),
@@ -825,13 +836,22 @@
       const box = document.getElementById("ai-messages");
       box.innerHTML = "";
       document.getElementById("ai-rollback-list").classList.add("hidden");
-      // 把目标轮那句话放回输入框（可直接编辑重发）
+      // 把目标轮那句话放回输入框（可直接编辑重发）：
+      // 用户发了什么就放回什么——引用轮次放回 chip（引用节点已不存在则不放），文本按原文放回
       const input = document.getElementById("ai-input");
       input.innerHTML = "";
-      if (res.user_msg) {
-        input.appendChild(document.createTextNode(res.user_msg));
-        input.focus();
+      let placed = false;
+      const rq = res.quoted;
+      if (rq && rq.uid && res.quoted_exists) {
+        insertQuoteChip(rq.uid, rq.text || "", rq.note || "");
+        placed = true;
       }
+      // 用户实际文本才放回（纯引用轮次的占位符不放，双语都判断）
+      if (res.user_msg && !isPlaceholderMsg(res.user_msg)) {
+        input.appendChild(document.createTextNode(res.user_msg));
+        placed = true;
+      }
+      if (placed) input.focus();
       loadHistory();      // 截断后的历史
       refreshAgents();    // 更新 label / 活跃 session
       connectSSE();

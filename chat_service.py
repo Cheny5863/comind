@@ -1080,6 +1080,7 @@ class ChatSessionManager:
             out.append({
                 "user_msg_idx": um["user_msg_idx"],
                 "user_msg": msg_by_idx.get(um["user_msg_idx"], um["user_msg"]),
+                "quoted": um.get("quoted"),
                 "ts": um["ts"],
                 "diff_summary": summary,
                 "has_diff": bool(diff),
@@ -1125,10 +1126,12 @@ class ChatSessionManager:
         if cut is None:
             return {"ok": False, "error": "找不到目标轮次消息（session 文件已变化）"}
         target_msg = ""
+        target_quoted = None
         ums = _user_messages_from_jsonl(Path(session_file))
         for um in ums:
             if um["user_msg_idx"] == user_msg_idx:
                 target_msg = um["user_msg"]
+                target_quoted = um.get("quoted")
                 break
         keep = lines[:cut]
         _atomic_write(Path(session_file), "\n".join(keep) + ("\n" if keep else ""))
@@ -1144,10 +1147,21 @@ class ChatSessionManager:
         # 5. mapping 指向同一 session 文件——前端 SSE 重连时 get_or_spawn 加载截断文件
         self._mapping[skey] = session_file
         self._save_mapping()
+        # 6. 检查目标轮引用节点在回滚后的树中是否存在（供前端决定是否放回 chip）
+        quoted_exists = False
+        if target_quoted and target_quoted.get("uid"):
+            try:
+                _, file_md, _, _ = _load_doc_for_write(self, map_key)
+                root = file_md.get("root", file_md)
+                quoted_exists = target_quoted["uid"] in _index_by_uid(root)
+            except Exception:
+                quoted_exists = False
         return {
             "ok": True,
             "skipped": skipped,
             "user_msg": target_msg,
+            "quoted": target_quoted,
+            "quoted_exists": quoted_exists,
             "map_restored": map_restored,
         }
 
@@ -1999,7 +2013,9 @@ def _user_messages_from_jsonl(path: Path) -> list[dict]:
     """从 session jsonl 提取全部轮次（user 消息）——轮次清单的权威来源。
 
     所有 session 天然有轮次（对话历史），不依赖 turns.json 的 diff 记录。
-    返回 [{user_msg_idx, user_msg, ts}]；user_msg 剥离 NODE_ASSIST 前缀。
+    返回 [{user_msg_idx, user_msg, ts, quoted}]；
+    user_msg 剥离 NODE_ASSIST 前缀（含备注行），quoted 是解析出的引用信息
+    {uid, text, note}（非引用轮次为 None）。
     """
     out = []
     try:
@@ -2030,15 +2046,46 @@ def _user_messages_from_jsonl(path: Path) -> list[dict]:
                 c.get("text", "") for c in content
                 if isinstance(c, dict) and c.get("type") == "text"
             )
-        # 剥离 NODE_ASSIST 前缀（引用求助时 prompt 注入的说明行）
+        quoted = _parse_node_assist(text)
+        # 剥离 NODE_ASSIST 前缀（引用求助时 prompt 注入的说明行 + 备注行）
         if text.startswith("[NODE_ASSIST"):
-            parts = text.split("\n", 1)
-            text = parts[1].strip() if len(parts) > 1 else ""
+            rest = []
+            for ln in text.split("\n")[1:]:
+                if ln.startswith("[该节点的备注内容："):
+                    continue
+                rest.append(ln)
+            text = "\n".join(rest).strip()
         ts = msg.get("timestamp") or e.get("timestamp") or 0
         if ts and ts > 1e12:
             ts = ts / 1000.0
-        out.append({"user_msg_idx": idx, "user_msg": text, "ts": ts})
+        out.append({"user_msg_idx": idx, "user_msg": text, "ts": ts, "quoted": quoted})
     return out
+
+
+def _parse_node_assist(text: str) -> dict | None:
+    """从 jsonl user 消息原文解析 NODE_ASSIST 引用信息。
+
+    格式（prompt() 拼装）：
+        [NODE_ASSIST uid=xxx] 用户在节点「text」上求助
+        [该节点的备注内容：note]（可选，note 含换行时只取到第一个 ]）
+    返回 {uid, text, note}；非引用消息返回 None。
+    """
+    if not text or not text.startswith("[NODE_ASSIST"):
+        return None
+    lines = text.split("\n")
+    m = re.match(r"^\[NODE_ASSIST(?: uid=([^\]]*))?\]\s*用户在节点「(.+)」上求助$", lines[0])
+    if not m:
+        return None
+    quoted = {"uid": m.group(1) or "", "text": m.group(2), "note": ""}
+    for ln in lines[1:]:
+        ln = ln.strip()
+        if ln.startswith("[该节点的备注内容："):
+            note = ln[len("[该节点的备注内容："):]
+            if note.endswith("]"):
+                note = note[:-1]
+            quoted["note"] = note
+            break
+    return quoted
 
 
 def _compute_net_diff(before_root: dict, after_root: dict) -> list[dict]:

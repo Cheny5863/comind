@@ -256,6 +256,11 @@ class ChatSession:
         # 进行中回合的事件缓冲：页面刷新/SSE 重连时重放，
         # 让前端恢复流式状态和已输出的内容。回合结束清空。
         self._buffer: deque[str] = deque(maxlen=2000)
+        # 最近一次 mindmap_update 事件（AI 改图广播）。与 _buffer 不同：
+        # _buffer 只缓存 pi 回合事件，mindmap_update 不进 _buffer；SSE 重连时
+        # 若只重放 _buffer，重连窗口期的改图广播会永久丢失（前端画布不更新，
+        # 直到手动刷新）。subscribe(replay=True) 时重放它兜底。
+        self.last_map_event: str | None = None
         self.last_active = time.time()
         self._reader_thread: threading.Thread | None = None
         self._alive = False
@@ -417,6 +422,13 @@ class ChatSession:
                     q.put_nowait(line)
                 except Exception:
                     break
+            # 重放最近一次 AI 改图广播（重连窗口期的 mindmap_update 兜底，
+            # 否则前端画布停在旧状态直到手动刷新才看到 AI 改动）
+            if self.last_map_event:
+                try:
+                    q.put_nowait(self.last_map_event)
+                except Exception:
+                    pass
         self.listeners.append(q)
         return q
 
@@ -1745,6 +1757,8 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
     )
     for skey, sess in list(manager._sessions.items()):
         if skey == key or skey.startswith(key + "::"):
+            # 缓存最近一次改图广播：SSE 重连时 subscribe(replay) 重放兜底
+            sess.last_map_event = event
             for q in list(sess.listeners):
                 try:
                     q.put_nowait(event)

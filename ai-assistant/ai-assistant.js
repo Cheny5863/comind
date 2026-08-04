@@ -462,6 +462,33 @@
       // （例如旧 session 在思考、切到空闲的新 session——不主动清就会残留）
       setStreaming(!!d.streaming);
     }).catch(function() {});
+    // 画布版本对齐兜底：多 session 并发时，SSE 重连窗口期的 mindmap_update
+    // 可能丢失（后端已缓存 last_map_event 重放兜底，但后端 session 被
+    // MAX_SESSIONS 淘汰重建时缓存也没了）。这里对比版本，落后则主动拉最新树。
+    try {
+      fetch("/api/ver?name=" + encodeURIComponent(mapKey()))
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          const serverVer = (d && d.version) || 0;
+          const localVer = window.__comindMapVer || 0;
+          if (serverVer <= localVer || !_mindMap) return;
+          fetch("/api/load?name=" + encodeURIComponent(mapKey()))
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+              const md = (data && data.mindMapData) || data || {};
+              const root = md.root || null;
+              if (root) {
+                applyMapUpdateSilent(root);
+                window.__comindMapVer = serverVer;
+              }
+            }).catch(function() {});
+        }).catch(function() {});
+    } catch (_) {}
+  }
+  // 版本对齐专用：与 applyMapUpdate 相同但静默（重连恢复不弹 "+N -M" 动画）
+  function applyMapUpdateSilent(tree) {
+    if (!_mindMap || !tree) return;
+    _mindMap.updateData(tree);
   }
 
   function setStreaming(on) {
@@ -831,7 +858,11 @@
   }
   function switchSession(file, branch) {
     // 已在查看目标 session，短路（避免无谓断开重连/重建）
-    if (file === _currentSessionFile && (branch || "") === _currentBranch) return;
+    if (file === _currentSessionFile && (branch || "") === _currentBranch) {
+      // 短路也要做画布版本对齐：可能错过了其他分支的 mindmap_update 广播
+      recoverStreamState();
+      return;
+    }
     fetch(api("switch", branch), {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_file: file }),

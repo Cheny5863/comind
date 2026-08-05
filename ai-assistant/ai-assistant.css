@@ -261,6 +261,15 @@
 }
 .ai-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
+/* 上下文压缩提示（pi 上下文满自动压缩时的可见反馈） */
+.ai-compacting {
+  text-align: center; color: #909399; font-size: 12px;
+  padding: 8px 12px; margin: 6px 0;
+  background: #f4f4f5; border-radius: 8px;
+}
+.ai-compacting.done { color: #67c23a; background: #f0f9eb; }
+.ai-compacting.fail { color: #f56c6c; background: #fef0f0; }
+
 /* AI 改图成功提示：页面底部按重力抛起 "+N -M" 符号（不打扰画布操作）
    物理模型：上抛到顶 3s（v₀=29.4m/s, h=44.1m）→ 自由落体 3s（√(2h/g)=3s），总 6s。
    上抛段 ease-out（匀减速）、下落段 ease-in（匀加速），最高点 60vh（过半屏）。 */
@@ -362,6 +371,9 @@
   .ai-title { font-size: 15px; }
   .ai-btn-sm { width: 36px; height: 36px; font-size: 17px; border-radius: 8px; }
   .ai-status { font-size: 12px; }
+  /* ⚠️ v0.1.25 回退：移动端适配整体放弃（bug 多，用 PC 端模式访问），
+     label-group 恢复 v0.1.21 原样（绝对居中悬浮，窄屏可能与按钮重叠，
+     但移动端已不在维护范围） */
   .ai-agent-label { max-width: 110px; }
   /* 工具条：按钮只留图标，模型选择撑满 */
   .ai-toolbar { padding: 8px 12px; gap: 8px; }

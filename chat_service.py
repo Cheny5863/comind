@@ -632,7 +632,7 @@ class ChatSessionManager:
         try:
             while True:
                 try:
-                    line = q.get(timeout=30)
+                    line = q.get(timeout=10)
                 except Empty:
                     yield "event: ping\ndata: {}\n\n"
                     continue
@@ -1724,6 +1724,34 @@ def _map_uid_stats(old_state, new_state) -> dict:
     return {"added": added, "removed": removed, "updated": updated}
 
 
+def _broadcast_map_update(manager: ChatSessionManager, key: str, new_data: dict, old_state: dict | None, source: str = "ai", branch_uid: str = "") -> None:
+    """广播 mindmap_update 给同脑图的所有 SSE 会话（root + 各分支）。
+
+    当前只由 AI 写盘（_commit_map）调用：让并行工作的其他 agent 前端
+    实时看到结构变化。带 ver 供前端对齐画布版本，带 stats 供前端播放
+    修改提示，带 branch（写者分支）供前端区分「本会话自己的改图」vs
+    「其他分支的改图」——气泡提示只在来源匹配当前选中会话时显示。
+    ⚠️ 不要给前端人类保存广播（v0.1.25 实测：广播回自己会触发 updateData
+    重建画布，折叠弹开/Tab 节点被删）。
+    """
+    stats = _map_uid_stats(old_state, new_data)
+    event = json.dumps(
+        {"type": "mindmap_update", "tree": new_data.get("root"),
+         "ver": manager._map_ver[key], "stats": stats, "source": source,
+         "branch": branch_uid},
+        ensure_ascii=False,
+    )
+    for skey, sess in list(manager._sessions.items()):
+        if skey == key or skey.startswith(key + "::"):
+            # 缓存最近一次改图广播：SSE 重连时 subscribe(replay) 重放兜底
+            sess.last_map_event = event
+            for q in list(sess.listeners):
+                try:
+                    q.put_nowait(event)
+                except Exception:
+                    pass
+
+
 def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict, branch_uid: str = "") -> None:
     """提交新 mindMapData：更新内存、备份、落盘、SSE 广播。
 
@@ -1752,20 +1780,7 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
     # 广播 mindmap_update 给同脑图的所有 agent 会话（root + 各分支），
     # 让并行工作的其他 agent 前端实时看到结构变化；带 ver 供前端对齐画布版本，
     # 带 stats 供前端播放 "+N -M" 修改动画（不闪的增量更新提示）
-    stats = _map_uid_stats(old_state, new_data)
-    event = json.dumps(
-        {"type": "mindmap_update", "tree": new_data.get("root"), "ver": manager._map_ver[key], "stats": stats},
-        ensure_ascii=False,
-    )
-    for skey, sess in list(manager._sessions.items()):
-        if skey == key or skey.startswith(key + "::"):
-            # 缓存最近一次改图广播：SSE 重连时 subscribe(replay) 重放兜底
-            sess.last_map_event = event
-            for q in list(sess.listeners):
-                try:
-                    q.put_nowait(event)
-                except Exception:
-                    pass
+    _broadcast_map_update(manager, key, new_data, old_state, source="ai", branch_uid=branch_uid)
 
 
 def apply_map(manager: ChatSessionManager, key: str, tree: dict, branch_uid: str = "") -> str | None:

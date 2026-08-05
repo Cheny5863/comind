@@ -58,6 +58,9 @@
       rollbackSkipped: "{n} 个节点未回滚",
       rollbackFail: "回滚失败：{err}",
       rollbackNoMap: "对话已回滚，脑图未自动恢复",
+      compacting: "上下文已满，正在压缩历史…",
+      compactDone: "上下文压缩完成，继续对话",
+      compactFail: "上下文压缩失败：{err}",
     },
     en: {
       assistant: "AI Assistant",
@@ -113,6 +116,9 @@
       rollbackSkipped: "{n} node(s) not rolled back",
       rollbackFail: "Rollback failed: {err}",
       rollbackNoMap: "Conversation rolled back, map not restored",
+      compacting: "Context is full, compacting history…",
+      compactDone: "Context compacted, continue chatting",
+      compactFail: "Context compaction failed: {err}",
     },
   };
   let _lang = null;
@@ -420,10 +426,43 @@
   }
   /* ── SSE ── */
   function connectSSE() {
-    if (_es) return;
+    // 幂等：已存在且连接打开（OPEN=1）时不重建；CONNECTING(0)/CLOSED(2) 说明
+    // EventSource 对象还在但连接已断（浏览器自动重连中/失败）→ 必须重建，
+    // 否则 prompt 发出去了 SSE 收不到，消息静默丢失（真机移动端"断联要刷新"根因）
+    if (_es && _es.readyState === 1) return;
+    if (_es) { try { _es.close(); } catch (_) {} _es = null; }
     _es = new EventSource(api("events"));
     _es.addEventListener("agent_start", () => setStreaming(true));
     _es.addEventListener("agent_end", () => setStreaming(false));
+    // 上下文压缩（pi 上下文满时自动触发）：给用户可见反馈，
+    // 否则压缩会默默占用 5~15s，用户只感觉"这轮怎么这么慢"
+    _es.addEventListener("compaction_start", () => {
+      const box = document.getElementById("ai-messages");
+      if (!box) return;
+      const div = document.createElement("div");
+      div.className = "ai-compacting";
+      div.textContent = "⏳ " + t("compacting");
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    });
+    _es.addEventListener("compaction_end", (e) => {
+      const box = document.getElementById("ai-messages");
+      if (!box) return;
+      const el = box.querySelector(".ai-compacting");
+      if (!el) return;
+      try {
+        const ev = JSON.parse(e.data);
+        if (ev.errorMessage) {
+          el.textContent = "⚠️ " + t("compactFail", { err: ev.errorMessage });
+          el.classList.add("fail");
+          setTimeout(() => el.remove(), 6000);
+          return;
+        }
+      } catch (_) {}
+      el.textContent = "✅ " + t("compactDone");
+      el.classList.add("done");
+      setTimeout(() => el.remove(), 4000);
+    });
     // On SSE reconnect (browser auto-reconnects), recover state
     _es.addEventListener("open", () => recoverStreamState());
     _es.addEventListener("message_update", (e) => {
@@ -447,7 +486,18 @@
     _es.addEventListener("mindmap_update", (e) => {
       try {
         const ev = JSON.parse(e.data);
-        applyMapUpdate(ev.tree, ev.stats);
+        // ⚠️ 后端 events() 对每次连接都 subscribe(replay=True)，会重放
+        // last_map_event（最近一次 AI 改图广播）。刷新场景画布已从磁盘加载
+        // 最新数据（版本=注入的 __comindMapVer），重放广播版本 <= 画布版本
+        // → 数据已最新，跳过（不再重复弹 "+N -M" 动画）；只有真落后
+        // （SSE 断线窗口期错过的广播，ver 更大）才需要应用。
+        const localVer = window.__comindMapVer || 0;
+        if (typeof ev.ver === "number" && ev.ver <= localVer) return;
+        // 气泡只在「写者分支 == 当前选中分支」时弹进本会话消息流；后台
+        // 其他分支的改图只同步画布 + 播 +N -M 动画，不往当前会话插气泡
+        // （ev.branch 是后端广播的写者分支；undefined = 旧版后端，按自己的处理）
+        const mine = ev.branch === undefined || (ev.branch || "") === (_currentBranch || "");
+        applyMapUpdate(ev.tree, ev.stats, !mine);
         // 对齐画布写版本：保存时后端据此判断前端是否落后（防旧画布覆盖 AI 改动）
         if (typeof ev.ver === "number") window.__comindMapVer = ev.ver;
       } catch (_) {}
@@ -461,6 +511,9 @@
       // 双向同步：后端 streaming=false 时也要清掉残留的"思考中/中止"UI
       // （例如旧 session 在思考、切到空闲的新 session——不主动清就会残留）
       setStreaming(!!d.streaming);
+      // 后端空闲时强制刷新消息区：SSE 断线重连窗口（移动端浏览器掐线）内
+      // agent 可能已跑完、_buffer 被 agent_end 清空，重放补不到 → 直接拉磁盘历史
+      if (!d.streaming) loadHistory(true);
     }).catch(function() {});
     // 画布版本对齐兜底：多 session 并发时，SSE 重连窗口期的 mindmap_update
     // 可能丢失（后端已缓存 last_map_event 重放兜底，但后端 session 被
@@ -488,7 +541,13 @@
   // 版本对齐专用：与 applyMapUpdate 相同但静默（重连恢复不弹 "+N -M" 动画）
   function applyMapUpdateSilent(tree) {
     if (!_mindMap || !tree) return;
-    _mindMap.updateData(tree);
+    // 抑制回声保存：updateData 触发 data_change → 自动保存会无意义递增版本
+    window.__comindSuppressSave = true;
+    try {
+      _mindMap.updateData(tree);
+    } finally {
+      window.__comindSuppressSave = false;
+    }
   }
 
   function setStreaming(on) {
@@ -529,15 +588,24 @@
   }
 
   /* ── AI 改图：mindmap_update ── */
-  function applyMapUpdate(tree, stats) {
+  // silent=true：不往聊天消息流弹「脑图已更新」气泡（后台其他分支的改图），
+  // 但画布更新和 +N -M 动画照常（动画是全图画布变化提示，本来就该有）
+  function applyMapUpdate(tree, stats, silent) {
     if (!_mindMap || !tree) return;
     // 用 updateData 而不是 setData：setData 会 CLEAR_ACTIVE_NODE + clearHistory +
     // reRender（强制全量重建节点实例、重算布局）→ 整图闪一下、用户正在编辑的
     // 节点被销毁（编辑内容丢失）。updateData 不设 reRender，节点实例按 uid 从
     // 缓存复用，只有数据变化的节点重算 → 默默增量修改，不闪不移动不丢编辑。
     // 后端 SSE 推来的 tree 就是纯节点树根 {data, children}，直接 updateData。
-    _mindMap.updateData(tree);
-    addBubble("assistant", t("mapUpdated"));
+    // 抑制回声保存：AI 写盘后广播的树与磁盘一致，updateData 触发的 data_change
+    // → 自动保存会无意义递增版本（双人协作死循环源头之一）
+    window.__comindSuppressSave = true;
+    try {
+      _mindMap.updateData(tree);
+    } finally {
+      window.__comindSuppressSave = false;
+    }
+    if (!silent) addBubble("assistant", t("mapUpdated"));
     if (stats && (stats.added || stats.removed)) showMapDiffToast(stats);
   }
 
@@ -684,9 +752,11 @@
     out += esc(body.slice(last));
     return out || (ql.length ? ql.map(chipHtml).join(" ") : "");
   }
-  function loadHistory() {
+  function loadHistory(force) {
     fetch(api("history")).then((r) => r.json()).then((msgs) => {
       const box = document.getElementById("ai-messages");
+      // 强制模式：清空后重新加载（SSE 重连补历史用，防移动端断线窗口丢消息）
+      if (force) box.innerHTML = "";
       if (box.children.length > 0 || !msgs || !msgs.length) return;
       msgs.forEach((m) => {
         if (m.role === "user") addBubble("user", renderUserMsg(m.text));
@@ -738,6 +808,12 @@
     return branch ? branch.slice(0, 5) : t("rootAgent");
   }
   function pollTick() {
+    // SSE 健康检查：EventSource 断线（readyState≠OPEN）时浏览器自动重连可能
+    // 很慢/失败（真机移动端省电模式常见），主动重建连接 + 补拉历史
+    if (_es && _es.readyState !== 1) {
+      connectSSE();
+      recoverStreamState();
+    }
     fetch(api("agents")).then((r) => r.json()).then((list) => {
       const snap = {};
       (list || []).forEach((a) => { snap[a.branch_uid || ""] = !!a.streaming; });
@@ -750,6 +826,12 @@
         else if (!cur && prev) toast(t("agentDone", { name: agentLabelOf(b, list) }));
       });
       _agentsSnapshot = snap;
+      // 当前分支 streaming true→false：agent 完成。若 SSE 正常，消息已实时
+      // 渲染（loadHistory 检测 box 非空会跳过）；若 SSE 断线（真机移动端常见），
+      // box 为空 → loadHistory 从磁盘补拉 → 用户不需要刷新也能看到回复
+      const curStreaming = snap[_currentBranch] === undefined ? false : !!snap[_currentBranch];
+      const prevStreaming = _agentsSnapshot[_currentBranch] === undefined ? false : !!_agentsSnapshot[_currentBranch];
+      if (prevStreaming && !curStreaming && !_streaming) loadHistory();
       // header 活跃计数：其他分支正在工作的数量
       const busy = Object.keys(snap).filter((b) => snap[b] && b !== _currentBranch).length;
       const el = document.getElementById("ai-busy");
@@ -925,6 +1007,8 @@
           list.innerHTML += '<div class="ai-session-item">' + t("rollbackEmpty") + "</div>";
           return;
         }
+        // 越新的轮次排越靠前（后端返回按 jsonl 顺序=旧→新，这里反转）
+        turns = turns.slice().reverse();
         turns.forEach((tn) => {
           const div = document.createElement("div");
           div.className = "ai-session-item rollback-item";
@@ -1062,6 +1146,10 @@
     addBubble("user", shown || (quotes.length ? '📎<span style="opacity:.75">' + esc(quotes[0].text.slice(0, 15)) + "…</span>" : ""));
     const context = quotes.length ? { quoted_nodes: quotes } : null;
     syncMap().then(() => {
+      // 确保 SSE 接收通道已建立且连接打开：switchSession/restoreBranch 是异步流程，
+      // connectSSE 可能在 .then 里延迟执行；且 EventSource 断线后对象仍在
+      // （readyState≠OPEN）——用户发消息时若连接未就绪，回复会静默丢失
+      if (!_es || _es.readyState !== 1) connectSSE();
       fetch(api("prompt"), {
         method: "POST", headers: { "Content-Type": "application/json", "X-Lang": lang() },
         body: JSON.stringify({ message: msg || t("nodeAssistFallback"), context, branch_uid: _currentBranch }),

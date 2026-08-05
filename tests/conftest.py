@@ -58,8 +58,10 @@ def sample_doc():
 def env(tmp_path, monkeypatch):
     """每个测试：独立 tmp 目录作为 PROJECT_CWD，写入样例脑图并同步到后端。"""
     monkeypatch.setattr(chat_service, "PROJECT_CWD", str(tmp_path))
+    monkeypatch.setattr(backend, "WORKSPACE", str(tmp_path))
     backend.chat_manager._map_state.clear()
     backend.chat_manager._map_snapshot.clear()
+    backend.chat_manager._map_ver.clear()
     doc = sample_doc()
     (tmp_path / MAP_KEY).write_text(json.dumps(doc, ensure_ascii=False, indent=2))
     client = TestClient(backend.app)

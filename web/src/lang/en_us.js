@@ -382,6 +382,7 @@ export default {
   },
   search: {
     searchPlaceholder: 'Enter the search content and press Enter',
+    searchChatPlaceholder: 'Search this chat…',
     replacePlaceholder: 'Please enter replacement content',
     replace: 'Replace',
     replaceAll: 'Replace all',

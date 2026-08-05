@@ -368,6 +368,7 @@ export default {
   },
   search: {
     searchPlaceholder: '输入查找内容后按回车键',
+    searchChatPlaceholder: '搜索当前对话…',
     replacePlaceholder: '请输入替换内容',
     replace: '替换',
     replaceAll: '全部替换',

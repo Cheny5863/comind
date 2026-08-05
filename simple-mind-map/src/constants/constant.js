@@ -240,8 +240,31 @@ export const cssContent = `
     stroke-width: 2;
   }
 
+  .smm-node-search-match .smm-hover-node{
+    display: block;
+    opacity: 0.55;
+    stroke: rgb(64, 158, 255);
+    stroke-width: 1;
+  }
+
+  .smm-node-highlight .smm-hover-node{
+    stroke: rgb(64, 158, 255);
+  }
+
   .smm-text-node-wrap, .smm-expand-btn-text {
     user-select: none;
+  }
+
+  mark.smm-search-text-mark {
+    background: #ffe58f;
+    color: inherit;
+    padding: 0 1px;
+    border-radius: 2px;
+  }
+
+  mark.smm-search-text-mark.active {
+    background: #ffc53d;
+    outline: 1px solid #d48806;
   }
 `
 

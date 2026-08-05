@@ -58,6 +58,7 @@
       rollbackSkipped: "{n} 个节点未回滚",
       rollbackFail: "回滚失败：{err}",
       rollbackNoMap: "对话已回滚，脑图未自动恢复",
+      focusBranch: "定位分支",
     },
     en: {
       assistant: "AI Assistant",
@@ -113,6 +114,7 @@
       rollbackSkipped: "{n} node(s) not rolled back",
       rollbackFail: "Rollback failed: {err}",
       rollbackNoMap: "Conversation rolled back, map not restored",
+      focusBranch: "Focus branch",
     },
   };
   let _lang = null;
@@ -161,6 +163,10 @@
   let _currentSessionFile = "";  // 当前正在查看的 session 文件（前端维护，历史列表高亮用）
   let _pollTimer = null;         // 后台 agent 状态轮询（面板打开期间每 3s）
   let _agentsSnapshot = {};      // 上次轮询的 branch_uid → streaming，用于检测开始/完成
+  let _sessionItems = [];
+  let _rollbackTurns = [];
+  let _aiFocusWithin = false;
+  let _aiSearchSavedHtml = new WeakMap();
 
   /* ── 已读标记：localStorage 记每个 session 最后查看时间，历史列表据此显示未读红点 ── */
   function readTs(file) {
@@ -179,13 +185,11 @@
     try { return JSON.parse(localStorage.getItem(lastViewKey()) || "null"); } catch (_) { return null; }
   }
   function recordLastView(file, branch) {
-    // 允许 file 为空但 branch 非空：新分支还没发消息时没有 session 文件，
-    // 也要记住「停在这个分支」，否则关面板重开会丢新分支、恢复旧 session
-    if (!file && !branch) return;
+    if (!file) return;
     try {
       const cur = readLastView();
-      if (cur && cur.file === (file || "") && (cur.branch || "") === (branch || "")) return;
-      localStorage.setItem(lastViewKey(), JSON.stringify({ file: file || "", branch: branch || "", ts: Date.now() }));
+      if (cur && cur.file === file && (cur.branch || "") === (branch || "")) return;
+      localStorage.setItem(lastViewKey(), JSON.stringify({ file, branch: branch || "", ts: Date.now() }));
     } catch (_) {}
   }
 
@@ -220,7 +224,7 @@
       <div class="ai-header" id="ai-header">
         <span class="ai-title" id="ai-title">🤖 ${t("assistant")}</span>
         <div class="ai-label-group">
-          <span class="ai-agent-label" id="ai-agent-label" title="${t("switchAgent")}"></span>
+          <span class="ai-agent-label" id="ai-agent-label" title="${t("focusBranch")}"></span>
           <span class="ai-busy hidden" id="ai-busy" title="${t("busyTitle")}"></span>
         </div>
         <span class="ai-status" id="ai-status"></span>
@@ -284,8 +288,8 @@
     document.getElementById("ai-keys-list").addEventListener("click", onKeysListClick);
     document.getElementById("ai-model").addEventListener("change", onModelChange);
     document.getElementById("ai-thinking").addEventListener("change", onThinkingChange);
-    // 点击左上角分支标签 → 脑图聚焦到该分支根节点
     document.getElementById("ai-agent-label").addEventListener("click", focusBranchNode);
+    initAiSearchBridge(panel);
 
     const input = document.getElementById("ai-input");
     input.addEventListener("keydown", onInputKeydown);
@@ -383,32 +387,11 @@
             loadModels(); startPolling();
           } else { openPanelRoutine(); }
         }).catch(() => openPanelRoutine());
-      } else if (rec && rec.branch) {
-        // 新分支还没发消息（无 session 文件）——恢复到该分支而不是旧 session
-        restoreBranch(rec.branch);
-        loadModels(); startPolling();
       } else { openPanelRoutine(); }
     } else { disconnectSSE(); stopPolling(); }
   }
   function openPanelRoutine() {
     loadHistory(); connectSSE(); loadModels(); recoverStreamState(); refreshAgents(); startPolling();
-  }
-  // 恢复到「已绑定但还没发消息的分支」（无 session 文件）：
-  // 清空消息区、挂到该分支的 SSE、等用户发消息时自然创建 session。
-  // 区别于 switchSession——那里要求 session 文件已存在。
-  function restoreBranch(branch) {
-    _currentBranch = branch || "";
-    _currentSessionFile = "";
-    setStreaming(false);
-    disconnectSSE();
-    const msgs = document.getElementById("ai-messages");
-    if (msgs) msgs.innerHTML = "";
-    const slist = document.getElementById("ai-session-list");
-    if (slist) slist.classList.add("hidden");
-    loadAgentLabel();
-    refreshAgents();
-    connectSSE();
-    recoverStreamState();
   }
   function openPanelFlash() {
     const panel = document.getElementById("ai-panel");
@@ -447,7 +430,7 @@
     _es.addEventListener("mindmap_update", (e) => {
       try {
         const ev = JSON.parse(e.data);
-        applyMapUpdate(ev.tree, ev.stats);
+        applyMapUpdate(ev.tree);
         // 对齐画布写版本：保存时后端据此判断前端是否落后（防旧画布覆盖 AI 改动）
         if (typeof ev.ver === "number") window.__comindMapVer = ev.ver;
       } catch (_) {}
@@ -462,33 +445,6 @@
       // （例如旧 session 在思考、切到空闲的新 session——不主动清就会残留）
       setStreaming(!!d.streaming);
     }).catch(function() {});
-    // 画布版本对齐兜底：多 session 并发时，SSE 重连窗口期的 mindmap_update
-    // 可能丢失（后端已缓存 last_map_event 重放兜底，但后端 session 被
-    // MAX_SESSIONS 淘汰重建时缓存也没了）。这里对比版本，落后则主动拉最新树。
-    try {
-      fetch("/api/ver?name=" + encodeURIComponent(mapKey()))
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-          const serverVer = (d && d.version) || 0;
-          const localVer = window.__comindMapVer || 0;
-          if (serverVer <= localVer || !_mindMap) return;
-          fetch("/api/load?name=" + encodeURIComponent(mapKey()))
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-              const md = (data && data.mindMapData) || data || {};
-              const root = md.root || null;
-              if (root) {
-                applyMapUpdateSilent(root);
-                window.__comindMapVer = serverVer;
-              }
-            }).catch(function() {});
-        }).catch(function() {});
-    } catch (_) {}
-  }
-  // 版本对齐专用：与 applyMapUpdate 相同但静默（重连恢复不弹 "+N -M" 动画）
-  function applyMapUpdateSilent(tree) {
-    if (!_mindMap || !tree) return;
-    _mindMap.updateData(tree);
   }
 
   function setStreaming(on) {
@@ -529,31 +485,14 @@
   }
 
   /* ── AI 改图：mindmap_update ── */
-  function applyMapUpdate(tree, stats) {
+  function applyMapUpdate(tree) {
     if (!_mindMap || !tree) return;
-    // 用 updateData 而不是 setData：setData 会 CLEAR_ACTIVE_NODE + clearHistory +
-    // reRender（强制全量重建节点实例、重算布局）→ 整图闪一下、用户正在编辑的
-    // 节点被销毁（编辑内容丢失）。updateData 不设 reRender，节点实例按 uid 从
-    // 缓存复用，只有数据变化的节点重算 → 默默增量修改，不闪不移动不丢编辑。
-    // 后端 SSE 推来的 tree 就是纯节点树根 {data, children}，直接 updateData。
-    _mindMap.updateData(tree);
+    // 后端 SSE 推来的 tree 就是纯节点树根 {data, children}，直接 setData。
+    // 不要包成 getData()+root 的形式——setData 期望纯树，包 root 会导致
+    // 界面渲染旧树（AI 改图不生效），且垃圾 root 属性污染后续 sync。
+    _mindMap.setData(tree);
+    _mindMap.render();
     addBubble("assistant", t("mapUpdated"));
-    if (stats && (stats.added || stats.removed)) showMapDiffToast(stats);
-  }
-
-  /* ── 修改动画：页面底部按重力抛起 "+N -M" 符号（上抛 3s 到 60vh + 自由落体 3s）── */
-  function showMapDiffToast(stats) {
-    // 新 toast 前清掉旧的（避免动画叠加混乱）；旧 el 若残留则由其自身 timer 移除
-    document.querySelectorAll(".ai-map-diff").forEach(function(o){ if (o.parentNode) o.parentNode.removeChild(o); });
-    const el = document.createElement("div");
-    el.className = "ai-map-diff";
-    const parts = [];
-    if (stats.added) parts.push('<span class="ai-diff-add">+' + stats.added + "</span>");
-    if (stats.removed) parts.push('<span class="ai-diff-remove">-' + stats.removed + "</span>");
-    el.innerHTML = '<span class="ai-diff-flag">✨</span>' + parts.join(" ");
-    document.body.appendChild(el);
-    // 动画 6s（上抛 3s + 下落 3s），结束后移除元素
-    setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 6300);
   }
 
   /* ── 消息渲染（流式安全）──
@@ -642,47 +581,18 @@
   }
 
   /* ── 历史 ── */
-  // 把历史用户消息里的 [NODE_ASSIST...] 协议原文还原成引用 chip（含多引用），
-  // 而不是把协议原文裸显示出来。用户怎么写的就怎么显示。
+  // 把历史用户消息里的 [NODE_ASSIST uid=xxx] 前缀还原成引用 chip，
+  // 而不是把协议原文裸显示出来
   function renderUserMsg(text) {
-    if (!text || !text.startsWith("[NODE_ASSIST")) return esc(text);
-    const lines = text.split("\n");
-    const m = lines[0].match(/^\[NODE_ASSIST(?: uid=([^\]]*))?\]\s*用户在节点「([\s\S]*?)」上求助\s*$/);
+    const m = text.match(/^\[NODE_ASSIST uid=([^\]]*)\] 用户在节点「([\s\S]*?)」上求助\s*\n?/);
     if (!m) return esc(text);
-    // 收集引用列表（含首行第一个引用）
-    const ql = [{ uid: m[1] || "", text: m[2] }];
-    const bodyLines = [];
-    for (let i = 1; i < lines.length; i++) {
-      const ln = lines[i].trim();
-      if (!ln) continue;
-      if (ln.startsWith("[该节点的备注内容：")) continue;
-      const rm = ln.match(/^\[引用(\d+)\] uid=([^\s「」]*) 「([\s\S]*?)」(?:（备注：.*）)?$/);
-      if (rm) {
-        const idx = parseInt(rm[1], 10);
-        ql[idx - 1] = { uid: rm[2], text: rm[3] };
-        continue;
-      }
-      if (ln.startsWith("引用节点")) continue;
-      bodyLines.push(ln);
-    }
-    const body = bodyLines.join("\n").trim();
-    // [引用N] 占位符还原成 chip（历史消息保留 chip 样式，节点可点击定位）
-    const chipHtml = (q) => {
-      const label = (q.text || "").length > 20 ? q.text.slice(0, 20) + "…" : (q.text || "");
-      return '<span class="ai-quote-chip" data-uid="' + esc(q.uid || "") + '" data-full-text="' +
-        esc(q.text || "") + '"><span>📎 ' + esc(label) + "</span></span>";
-    };
-    let out = "";
-    const refRe = /\[引用(\d+)\]/g;
-    let last = 0, rm2;
-    while ((rm2 = refRe.exec(body)) !== null) {
-      out += esc(body.slice(last, rm2.index));
-      const q = ql[parseInt(rm2[1], 10) - 1];
-      out += q ? chipHtml(q) : rm2[0];
-      last = rm2.index + rm2[0].length;
-    }
-    out += esc(body.slice(last));
-    return out || (ql.length ? ql.map(chipHtml).join(" ") : "");
+    const uid = m[1], nodeText = m[2];
+    let rest = text.slice(m[0].length).trim();
+    if (rest === "（引用节点求助）" || rest === "(Assist with node)") rest = "";
+    const label = nodeText.length > 20 ? nodeText.slice(0, 20) + "…" : nodeText;
+    const chip = '<span class="ai-quote-chip" data-uid="' + esc(uid) + '" data-full-text="' +
+      esc(nodeText) + '"><span>📎 ' + esc(label) + "</span></span>";
+    return chip + (rest ? " " + esc(rest) : "");
   }
   function loadHistory() {
     fetch(api("history")).then((r) => r.json()).then((msgs) => {
@@ -693,6 +603,129 @@
         else if (m.role === "assistant" && m.text) addBubble("assistant", renderMd(m.text));
       });
     }).catch(() => {});
+  }
+
+
+  /* ── 搜索桥接：复用主界面 Ctrl+F 搜索栏 ── */
+  function closeAllDrawers() {
+    ["ai-session-list", "ai-rollback-list", "ai-bg-drawer", "ai-keys-drawer"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.add("hidden");
+    });
+  }
+  function aiPanelOpen() {
+    const panel = document.getElementById("ai-panel");
+    return panel && !panel.classList.contains("hidden");
+  }
+  function highlightBubbleText(bubble, q, isActive) {
+    if (!bubble || !q) return;
+    if (!_aiSearchSavedHtml.has(bubble)) _aiSearchSavedHtml.set(bubble, bubble.innerHTML);
+    bubble.innerHTML = _aiSearchSavedHtml.get(bubble);
+    const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT, null);
+    const textNodes = [];
+    while (walker.nextNode()) textNodes.push(walker.currentNode);
+    const lowerQ = q.toLowerCase();
+    textNodes.forEach((node) => {
+      const raw = node.nodeValue || "";
+      const lower = raw.toLowerCase();
+      let idx = lower.indexOf(lowerQ);
+      if (idx < 0) return;
+      const frag = document.createDocumentFragment();
+      let pos = 0;
+      while (idx >= 0) {
+        if (idx > pos) frag.appendChild(document.createTextNode(raw.slice(pos, idx)));
+        const mark = document.createElement("mark");
+        mark.className = "ai-find-mark" + (isActive ? " active" : "");
+        mark.textContent = raw.slice(idx, idx + q.length);
+        frag.appendChild(mark);
+        pos = idx + q.length;
+        idx = lower.indexOf(lowerQ, pos);
+      }
+      if (pos < raw.length) frag.appendChild(document.createTextNode(raw.slice(pos)));
+      node.parentNode.replaceChild(frag, node);
+    });
+  }
+  function clearAiSearchMarks() {
+    document.querySelectorAll("#ai-messages .ai-bubble").forEach((b) => {
+      b.classList.remove("ai-search-hit", "ai-search-hit-active");
+      if (_aiSearchSavedHtml.has(b)) {
+        b.innerHTML = _aiSearchSavedHtml.get(b);
+        _aiSearchSavedHtml.delete(b);
+      }
+    });
+    document.querySelectorAll("#ai-messages .ai-find-mark").forEach((m) => {
+      const p = m.parentNode;
+      if (!p) return;
+      p.replaceChild(document.createTextNode(m.textContent || ""), m);
+      p.normalize();
+    });
+  }
+  function aiFindAll(q) {
+    clearAiSearchMarks();
+    const needle = (q || "").trim().toLowerCase();
+    if (!needle) return [];
+    const box = document.getElementById("ai-messages");
+    if (!box) return [];
+    const hits = [];
+    box.querySelectorAll(".ai-bubble").forEach((bubble, index) => {
+      const text = (bubble.textContent || "").trim();
+      if (!text.toLowerCase().includes(needle)) return;
+      highlightBubbleText(bubble, q.trim(), false);
+      bubble.classList.add("ai-search-hit");
+      const role = bubble.classList.contains("user") ? (lang().startsWith("zh") ? "用户" : "User")
+        : (lang().startsWith("zh") ? "助手" : "Assistant");
+      const preview = role + ": " + text.replace(/\s+/g, " ").slice(0, 120);
+      hits.push({ el: bubble, name: preview, preview, role, index });
+    });
+    return hits;
+  }
+  function aiJumpHit(index, hits) {
+    const list = hits || [];
+    if (!list.length) return;
+    const idx = Math.max(0, Math.min(index, list.length - 1));
+    document.querySelectorAll("#ai-messages .ai-search-hit-active").forEach((el) => el.classList.remove("ai-search-hit-active"));
+    document.querySelectorAll("#ai-messages .ai-find-mark.active").forEach((m) => m.classList.remove("active"));
+    const hit = list[idx];
+    if (!hit || !hit.el) return;
+    const q = (window.__aiSearchQuery || "").trim();
+    if (q) highlightBubbleText(hit.el, q, true);
+    document.querySelectorAll("#ai-messages .ai-search-hit").forEach((el) => {
+      if (el !== hit.el && q) highlightBubbleText(el, q, false);
+    });
+    hit.el.classList.add("ai-search-hit-active");
+    hit.el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+  function initAiSearchBridge(panel) {
+    window.__aiSearch = {
+      shouldUseAiScope() {
+        if (!aiPanelOpen()) return false;
+        const ae = document.activeElement;
+        if (ae && panel.contains(ae)) return true;
+        return _aiFocusWithin;
+      },
+      findAll(q) {
+        window.__aiSearchQuery = q || "";
+        return aiFindAll(q);
+      },
+      jump(index, hits) { aiJumpHit(index, hits); },
+      clearMarks() {
+        window.__aiSearchQuery = "";
+        clearAiSearchMarks();
+      },
+    };
+    panel.addEventListener("mousedown", () => { _aiFocusWithin = true; });
+    panel.addEventListener("focusin", () => { _aiFocusWithin = true; });
+    document.addEventListener("mousedown", (e) => {
+      const fab = document.getElementById("ai-fab");
+      if (!panel.contains(e.target) && e.target !== fab) _aiFocusWithin = false;
+    });
+    document.addEventListener("keydown", (e) => {
+      if (!(e.ctrlKey || e.metaKey) || (e.key !== "f" && e.key !== "F")) return;
+      if (!aiPanelOpen() || !window.__aiSearch.shouldUseAiScope()) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (window.$bus) window.$bus.$emit("show_search", { scope: "ai" });
+    }, true);
   }
 
   /* ── Agent 列表（多 agent 并行）── */
@@ -715,11 +748,6 @@
         _currentSessionFile = cur.session_file;
         markRead(_currentSessionFile);  // 正在查看 = 已读，历史列表不显示红点
         recordLastView(_currentSessionFile, _currentBranch);  // 记住"上次查看"，刷新后恢复
-      } else if (cur && _currentBranch) {
-        // 分支已绑定但还没发消息（无 session 文件）——记住分支本身，
-        // 否则关面板重开会丢新分支、恢复旧 session
-        _currentSessionFile = "";
-        recordLastView("", _currentBranch);
       }
       if (cb) cb(_agents);
     }).catch(() => {});
@@ -793,9 +821,6 @@
     const doSwitch = () => {
       _currentBranch = branch || "";
       _currentSessionFile = "";  // 新建/切换后等待 agents 刷新同步活跃会话
-      // 立刻记住分支（不等 refreshAgents）：新分支还没发消息没有 session 文件，
-      // 用户关面板再开时能恢复到该分支，而不是旧的 lastView session
-      if (branch) recordLastView("", branch);
       if (!branch) _pendingBranchLabel = "";  // root 用固定文案
       setStreaming(false);  // 清掉旧 session 的"思考中/中止"UI 残留
       disconnectSSE();
@@ -819,6 +844,7 @@
   function toggleSessions() {
     const list = document.getElementById("ai-session-list");
     if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
+    document.getElementById("ai-rollback-list")?.classList.add("hidden");
     list.classList.remove("hidden");
     refreshSessionList();
   }
@@ -827,42 +853,46 @@
     if (!list || list.classList.contains("hidden")) return;
     fetch(api("all_sessions"))
       .then((r) => r.json()).then((items) => {
-        list.innerHTML = "";
-        if (!items.length) {
-          list.innerHTML = '<div class="ai-session-item">' + t("noHistory") + '</div>';
-          return;
-        }
-        items.forEach((it) => {
-          const div = document.createElement("div");
-          // 高亮判定：纯前端逻辑——当前正在查看的 session 文件才标 active
-          const isActive = it.file === _currentSessionFile;
-          // 未读：最后消息时间 > 用户上次查看时间（+1s 容差），且不是当前查看的
-          const isUnread = !isActive && (it.modified || 0) > (readTs(it.file) || 0) + 1;
-          div.className = "ai-session-item" + (isActive ? " active" : "") + (isUnread ? " unread" : "");
-          const d = new Date((it.modified || 0) * 1000);
-          const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
-          const branchTag = it.branch_uid
-            ? '<span class="ai-session-branch">' + esc(it.display_label || it.branch_label || it.branch_uid.slice(0, 5)) + "</span>"
-            : '<span class="ai-session-branch root">root</span>';
-          const msgCount = '<span class="ai-session-count">' + it.user_messages + t("nMessages") + "</span>";
-          const dot = isUnread ? '<span class="ai-dot"></span>' : "";
-          const spin = it.streaming ? '<span class="ai-spin" title="' + t("working") + '"></span>' : "";
-          div.innerHTML = dot + spin + "<span class='ai-session-time'>" + time + "</span>" + branchTag + msgCount;
-          div.title = it.name + (it.branch_label ? " — " + it.branch_label : "") + (it.streaming ? " [" + t("working") + "]" : "");
-          div.dataset.file = it.file;
-          div.dataset.branch = it.branch_uid || "";
-          div.addEventListener("click", () => switchSession(it.file, it.branch_uid || ""));
-          list.appendChild(div);
-        });
+        _sessionItems = items || [];
+        renderSessionItems();
       }).catch(() => {});
+  }
+  function renderSessionItems() {
+    const list = document.getElementById("ai-session-list");
+    if (!list) return;
+    list.innerHTML = "";
+    const items = _sessionItems || [];
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "ai-session-item";
+      empty.textContent = t("noHistory");
+      list.appendChild(empty);
+      return;
+    }
+    items.forEach((it) => {
+      const div = document.createElement("div");
+      const isActive = it.file === _currentSessionFile;
+      const isUnread = !isActive && (it.modified || 0) > (readTs(it.file) || 0) + 1;
+      div.className = "ai-session-item" + (isActive ? " active" : "") + (isUnread ? " unread" : "");
+      const d = new Date((it.modified || 0) * 1000);
+      const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
+      const branchTag = it.branch_uid
+        ? '<span class="ai-session-branch">' + esc(it.display_label || it.branch_label || it.branch_uid.slice(0, 5)) + "</span>"
+        : '<span class="ai-session-branch root">root</span>';
+      const msgCount = '<span class="ai-session-count">' + it.user_messages + t("nMessages") + "</span>";
+      const dot = isUnread ? '<span class="ai-dot"></span>' : "";
+      const spin = it.streaming ? '<span class="ai-spin" title="' + t("working") + '"></span>' : "";
+      div.innerHTML = dot + spin + "<span class='ai-session-time'>" + time + "</span>" + branchTag + msgCount;
+      div.title = it.name + (it.branch_label ? " — " + it.branch_label : "") + (it.streaming ? " [" + t("working") + "]" : "");
+      div.dataset.file = it.file;
+      div.dataset.branch = it.branch_uid || "";
+      div.addEventListener("click", () => switchSession(it.file, it.branch_uid || ""));
+      list.appendChild(div);
+    });
   }
   function switchSession(file, branch) {
     // 已在查看目标 session，短路（避免无谓断开重连/重建）
-    if (file === _currentSessionFile && (branch || "") === _currentBranch) {
-      // 短路也要做画布版本对齐：可能错过了其他分支的 mindmap_update 广播
-      recoverStreamState();
-      return;
-    }
+    if (file === _currentSessionFile && (branch || "") === _currentBranch) return;
     fetch(api("switch", branch), {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_file: file }),
@@ -882,32 +912,6 @@
   }
 
   /* ── 轮次回滚（按对话轮次线性回滚）── */
-  // 占位符判断：兼容中英两种语言（session 语言可能与当前 UI 语言不同）
-  function isPlaceholderMsg(s) {
-    return !s || s === "（引用节点求助）" || s === "(Assist with node)";
-  }
-  // 把消息文本里的 [引用N] 占位符还原成可读的 📎 节点文本（quoted_list 提供对应节点）
-  function replaceRefPlaceholders(text, quotedList) {
-    if (!quotedList || !quotedList.length) return text;
-    return (text || "").replace(/\[引用(\d+)\]/g, (m, n) => {
-      const q = quotedList[parseInt(n, 10) - 1];
-      return q && q.text ? "📎" + q.text : m;
-    });
-  }
-  // 轮次显示文本：纯引用 → 📎 节点文本列表（有区分度）；混合 → 原文（[引用N] 还原成 📎）；普通 → 原文
-  function rollbackDisplay(quotedList, userMsg) {
-    const ql = quotedList || [];
-    const rest = isPlaceholderMsg(userMsg) ? "" : (userMsg || "");
-    if (rest) {
-      // 混合轮次：显示用户原文（占位符还原成 📎 节点文本），保留编排顺序
-      return replaceRefPlaceholders(rest, ql).trim() || (ql.length ? ql.map((q) => "📎" + (q.text || "")).join(" ") : "");
-    }
-    if (ql.length) {
-      // 纯引用轮次：显示引用节点列表
-      return ql.map((q) => "📎" + (q.text || "")).join(" ");
-    }
-    return t("nodeAssistFallback");
-  }
   function toggleRollbackList() {
     const list = document.getElementById("ai-rollback-list");
     if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
@@ -920,35 +924,49 @@
     if (!list || list.classList.contains("hidden")) return;
     fetch(api("turns"))
       .then((r) => r.json()).then((turns) => {
-        list.innerHTML = '<div class="ai-rollback-head">' + t("rollbackTitle") + "</div>";
-        if (!turns || !turns.length) {
-          list.innerHTML += '<div class="ai-session-item">' + t("rollbackEmpty") + "</div>";
-          return;
-        }
-        turns.forEach((tn) => {
-          const div = document.createElement("div");
-          div.className = "ai-session-item rollback-item";
-          const d = new Date((tn.ts || 0) * 1000);
-          const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
-          // 纯引用轮次显示引用节点文本（有区分度），否则显示用户消息
-          const display = rollbackDisplay(tn.quoted_list, tn.user_msg || "");
-          const s = tn.diff_summary || {};
-          const parts = [];
-          if (s.add) parts.push("+" + s.add);
-          if (s.update_text) parts.push("~" + s.update_text);
-          if (s.delete) parts.push("-" + s.delete);
-          if (s.move) parts.push("↔" + s.move);
-          const badge = parts.length ? '<span class="ai-rollback-badge">' + parts.join(" ") + "</span>" : "";
-          div.innerHTML = "<span class='ai-session-time'>" + time + "</span><span class='ai-rollback-msg'>" + esc(display) + "</span>" + badge;
-          div.title = display;
-          div.addEventListener("click", () => handleRollback(tn));
-          list.appendChild(div);
-        });
+        _rollbackTurns = turns || [];
+        renderRollbackItems();
       }).catch(() => {});
   }
+  function renderRollbackItems() {
+    const list = document.getElementById("ai-rollback-list");
+    if (!list) return;
+    list.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "ai-rollback-head";
+    head.textContent = t("rollbackTitle");
+    list.appendChild(head);
+    const turns = _rollbackTurns || [];
+    if (!turns.length) {
+      const empty = document.createElement("div");
+      empty.className = "ai-session-item";
+      empty.textContent = t("rollbackEmpty");
+      list.appendChild(empty);
+      return;
+    }
+    turns.forEach((tn) => {
+      const div = document.createElement("div");
+      div.className = "ai-session-item rollback-item";
+      const d = new Date((tn.ts || 0) * 1000);
+      const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
+      const rawMsg = tn.user_msg || "";
+      const msg = esc((rawMsg || t("nodeAssistFallback")).slice(0, 24));
+      const s = tn.diff_summary || {};
+      const parts = [];
+      if (s.add) parts.push("+" + s.add);
+      if (s.update_text) parts.push("~" + s.update_text);
+      if (s.delete) parts.push("-" + s.delete);
+      if (s.move) parts.push("↔" + s.move);
+      const badge = parts.length ? '<span class="ai-rollback-badge">' + parts.join(" ") + "</span>" : "";
+      div.innerHTML = "<span class='ai-session-time'>" + time + "</span>" + msg + badge;
+      div.title = tn.user_msg || "";
+      div.addEventListener("click", () => handleRollback(tn));
+      list.appendChild(div);
+    });
+  }
   function handleRollback(turn) {
-    const preview = rollbackDisplay(turn.quoted_list, turn.user_msg || "");
-    if (!window.confirm(t("rollbackConfirm", { msg: preview.slice(0, 30) }))) return;
+    const msg = ((turn.user_msg || "").slice(0, 30)) || t("nodeAssistFallback");
+    if (!window.confirm(t("rollbackConfirm", { msg }))) return;
     fetch(api("rollback"), {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_msg_idx: turn.user_msg_idx, branch_uid: _currentBranch }),
@@ -959,39 +977,13 @@
       const box = document.getElementById("ai-messages");
       box.innerHTML = "";
       document.getElementById("ai-rollback-list").classList.add("hidden");
-      // 把目标轮那句话放回输入框（可直接编辑重发）：
-      // 用户发了什么就放回什么——引用轮次放回 chip（引用节点已不存在则不放），
-      // 文本按原文放回，引用位置用 chip 还原（保留用户编排顺序）
+      // 把目标轮那句话放回输入框（可直接编辑重发）
       const input = document.getElementById("ai-input");
       input.innerHTML = "";
-      let placed = false;
-      const rqList = res.quoted_list || [];
-      const rqExists = res.quoted_list_exists || [];
-      // 旧格式纯引用轮次的占位符不是用户输入，不参与回填
-      let rqMsg = isPlaceholderMsg(res.user_msg) ? "" : (res.user_msg || "");
-      // 按 [引用N] 占位符顺序重建输入框：chip 存在则放 chip，否则丢弃占位符
-      const refRe = /\[引用(\d+)\]/g;
-      let last = 0, m;
-      while ((m = refRe.exec(rqMsg)) !== null) {
-        if (m.index > last) {
-          input.appendChild(document.createTextNode(rqMsg.slice(last, m.index)));
-        }
-        const qi = parseInt(m[1], 10) - 1;
-        const q = rqList[qi];
-        if (q && q.uid && rqExists[qi]) {
-          insertQuoteChip(q.uid, q.text || "", q.note || "");
-          placed = true;
-        }
-        last = m.index + m[0].length;
+      if (res.user_msg) {
+        input.appendChild(document.createTextNode(res.user_msg));
+        input.focus();
       }
-      if (last < rqMsg.length) {
-        input.appendChild(document.createTextNode(rqMsg.slice(last)));
-        placed = true;
-      }
-      if (placed) input.focus();
-      // 画布刷新：后端响应带回滚后完整树（kill 后 SSE 广播靠 EventSource
-      // 自动重连不可靠——重连晚于广播、旧 queue 已 unsub），直接应用最稳
-      if (res.tree) applyMapUpdate(res.tree, res.stats);
       loadHistory();      // 截断后的历史
       refreshAgents();    // 更新 label / 活跃 session
       connectSSE();
@@ -1011,56 +1003,27 @@
       body: JSON.stringify(_mindMap.getData()),
     }).catch(() => {});
   }
-  // 提取输入框内容：chip 原位替换成 [引用N] 占位符（保留用户编排顺序），
-  // 同时返回按出现顺序的 quotes 数组。用户怎么写的就怎么发。
-  function collectInputMessage() {
-    const input = document.getElementById("ai-input");
-    const quotes = [];
-    let text = "";
-    let refIdx = 0;
-    input.childNodes.forEach((node) => {
-      if (node.nodeType === Node.TEXT_NODE) {
-        text += node.textContent;
-      } else if (node.classList && node.classList.contains("ai-quote-chip")) {
-        refIdx++;
-        quotes.push({
-          uid: node.dataset.uid || "",
-          text: node.dataset.fullText || "",
-          note: node.dataset.note || "",
-        });
-        text += "[引用" + refIdx + "]";
-      } else {
-        text += node.textContent || "";
-      }
-    });
-    return { text: text.trim(), quotes };
-  }
   function getInputText() {
-    return collectInputMessage().text;
+    const input = document.getElementById("ai-input");
+    const clone = input.cloneNode(true);
+    clone.querySelectorAll(".ai-quote-chip").forEach((c) => c.remove());
+    return clone.textContent || "";
   }
   function collectQuotes() {
-    return collectInputMessage().quotes;
+    return Array.from(document.querySelectorAll("#ai-input .ai-quote-chip"))
+      .map((c) => ({ uid: c.dataset.uid || "", text: c.dataset.fullText || "", note: c.dataset.note || "" }));
   }
   function sendMessage() {
     if (_streaming) return;
-    const { text: msg, quotes } = collectInputMessage();
+    const msg = getInputText().trim();
+    const quotes = collectQuotes();
     if (!msg && !quotes.length) return;
     const input = document.getElementById("ai-input");
     input.innerHTML = "";
-    // 气泡显示也按用户原顺序：把 [引用N] 占位符还原成 chip 样式
-    let shown = "";
-    let refIdx = 0;
-    const parts = msg.split(/\[引用(\d+)\]/g);
-    for (let i = 0; i < parts.length; i++) {
-      if (i % 2 === 0) {
-        shown += esc(parts[i]);
-      } else {
-        const q = quotes[parseInt(parts[i], 10) - 1];
-        if (q) shown += '<span style="opacity:.75">📎' + esc(q.text.slice(0, 15)) + "…</span>";
-      }
-    }
-    addBubble("user", shown || (quotes.length ? '📎<span style="opacity:.75">' + esc(quotes[0].text.slice(0, 15)) + "…</span>" : ""));
-    const context = quotes.length ? { quoted_nodes: quotes } : null;
+    let shown = esc(msg);
+    quotes.forEach((q) => { shown = '<span style="opacity:.75">📎' + esc(q.text.slice(0, 15)) + "…</span> " + shown; });
+    addBubble("user", shown);
+    const context = quotes.length ? { quoted_node: quotes[0] } : null;
     syncMap().then(() => {
       fetch(api("prompt"), {
         method: "POST", headers: { "Content-Type": "application/json", "X-Lang": lang() },

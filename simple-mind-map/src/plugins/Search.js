@@ -25,6 +25,8 @@ class Search {
     this.notResetSearchText = false
     // 是否自动跳转下一个匹配节点
     this.isJumpNext = false
+    this.textHighlightSaved = new Map()
+    this.plainTextHighlightSaved = new Map()
 
     this.bindEvent()
   }
@@ -94,15 +96,176 @@ class Search {
   // 结束搜索
   endSearch() {
     if (!this.isSearching) return
-    if (this.mindMap.opt.readonly && this.matchNodeList[this.currentIndex]) {
-      this.matchNodeList[this.currentIndex].closeHighlight()
-    }
+    this.clearAllSearchHighlights()
     this.searchText = ''
     this.updateMatchNodeList([])
     this.currentIndex = -1
     this.notResetSearchText = false
     this.isSearching = false
     this.emitEvent()
+  }
+
+  resolveNodeInstance(node) {
+    if (this.isNodeInstance(node)) return node
+    const uid = node.data && node.data.uid
+    return uid ? this.mindMap.renderer.findNodeByUid(uid) : null
+  }
+
+  clearAllSearchHighlights() {
+    this.clearTextHighlights()
+    this.matchNodeList.forEach(node => {
+      const n = this.resolveNodeInstance(node)
+      if (n) {
+        n.closeHighlight()
+        n.closeSearchMatchHighlight()
+      }
+    })
+  }
+
+  escapeRegExp(text) {
+    return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  }
+
+  getNodeTextEl(nodeInst) {
+    try {
+      if (!nodeInst._textData || !nodeInst._textData.node) return null
+      const fo = nodeInst._textData.node.findOne('foreignObject')
+      if (fo && fo.node) {
+        return (
+          fo.node.querySelector('.smm-richtext-node-wrap') ||
+          fo.node.firstElementChild
+        )
+      }
+    } catch (_) {}
+    return null
+  }
+
+  wrapTextMatches(rootEl, query, isActive) {
+    const lowerQ = query.toLowerCase()
+    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, null)
+    const nodes = []
+    while (walker.nextNode()) nodes.push(walker.currentNode)
+    nodes.forEach(node => {
+      const raw = node.nodeValue || ''
+      const lower = raw.toLowerCase()
+      let idx = lower.indexOf(lowerQ)
+      if (idx < 0) return
+      const frag = document.createDocumentFragment()
+      let pos = 0
+      while (idx >= 0) {
+        if (idx > pos) frag.appendChild(document.createTextNode(raw.slice(pos, idx)))
+        const mark = document.createElement('mark')
+        mark.className = 'smm-search-text-mark' + (isActive ? ' active' : '')
+        mark.textContent = raw.slice(idx, idx + query.length)
+        frag.appendChild(mark)
+        pos = idx + query.length
+        idx = lower.indexOf(lowerQ, pos)
+      }
+      if (pos < raw.length) frag.appendChild(document.createTextNode(raw.slice(pos)))
+      node.parentNode.replaceChild(frag, node)
+    })
+  }
+
+  applyPlainTextHighlight(nodeInst, query, isActive) {
+    if (!nodeInst._textData || !nodeInst._textData.node) return
+    const uid = nodeInst.getData('uid')
+    const texts = nodeInst._textData.node.find('.smm-text-node-wrap')
+    if (!texts || texts.length === 0) return
+    const lowerQ = query.toLowerCase()
+    texts.forEach((textNode, index) => {
+      const content = textNode.text()
+      if (!content || !content.toLowerCase().includes(lowerQ)) return
+      const key = uid + ':' + index
+      if (!this.plainTextHighlightSaved.has(key)) {
+        this.plainTextHighlightSaved.set(key, {
+          text: content,
+          fill: textNode.attr('fill'),
+          fontWeight: textNode.attr('font-weight')
+        })
+      }
+      const reg = new RegExp(this.escapeRegExp(query), 'gi')
+      textNode.clear()
+      let lastIndex = 0
+      let match
+      const defaultFill = textNode.attr('fill') || '#333'
+      while ((match = reg.exec(content)) !== null) {
+        if (match.index > lastIndex) {
+          textNode.tspan(content.slice(lastIndex, match.index)).fill(defaultFill)
+        }
+        textNode
+          .tspan(match[0])
+          .fill(isActive ? '#d48806' : '#409eff')
+          .attr('font-weight', 'bold')
+        lastIndex = match.index + match[0].length
+      }
+      if (lastIndex < content.length) {
+        textNode.tspan(content.slice(lastIndex)).fill(defaultFill)
+      }
+    })
+  }
+
+  clearPlainTextHighlight(nodeInst) {
+    if (!nodeInst._textData || !nodeInst._textData.node) return
+    const uid = nodeInst.getData('uid')
+    const texts = nodeInst._textData.node.find('.smm-text-node-wrap')
+    if (!texts || texts.length === 0) return
+    texts.forEach((textNode, index) => {
+      const key = uid + ':' + index
+      const saved = this.plainTextHighlightSaved.get(key)
+      if (!saved) return
+      textNode.clear()
+      textNode.text(saved.text).fill(saved.fill || '#333')
+      if (saved.fontWeight) textNode.attr('font-weight', saved.fontWeight)
+      else textNode.attr('font-weight', null)
+    })
+  }
+
+  clearTextHighlights() {
+    this.textHighlightSaved.forEach((html, uid) => {
+      const n = this.mindMap.renderer.findNodeByUid(uid)
+      if (!n) return
+      const el = this.getNodeTextEl(n)
+      if (el) el.innerHTML = html
+    })
+    this.textHighlightSaved.clear()
+    this.plainTextHighlightSaved.forEach((_, key) => {
+      const uid = key.split(':')[0]
+      const n = this.mindMap.renderer.findNodeByUid(uid)
+      if (n) this.clearPlainTextHighlight(n)
+    })
+    this.plainTextHighlightSaved.clear()
+  }
+
+  applyTextHighlights(activeIndex = -1) {
+    const query = (this.searchText || '').trim()
+    if (!query || !this.isSearching) return
+    this.matchNodeList.forEach((node, index) => {
+      const n = this.resolveNodeInstance(node)
+      if (!n) return
+      const uid = n.getData('uid')
+      const el = this.getNodeTextEl(n)
+      const isActive = index === activeIndex
+      if (el) {
+        if (!this.textHighlightSaved.has(uid)) {
+          this.textHighlightSaved.set(uid, el.innerHTML)
+        }
+        el.innerHTML = this.textHighlightSaved.get(uid)
+        this.wrapTextMatches(el, query, isActive)
+        return
+      }
+      this.applyPlainTextHighlight(n, query, isActive)
+    })
+  }
+
+  applyMatchHighlights(activeIndex = -1) {
+    this.clearAllSearchHighlights()
+    this.matchNodeList.forEach((node, index) => {
+      const n = this.resolveNodeInstance(node)
+      if (!n) return
+      if (index === activeIndex) n.highlight()
+      else n.searchMatchHighlight()
+    })
+    this.applyTextHighlights(activeIndex)
   }
 
   // 搜索匹配的节点
@@ -150,6 +313,7 @@ class Search {
       })
     })
     this.updateMatchNodeList(matchList)
+    this.applyMatchHighlights(this.currentIndex)
   }
 
   // 判断对象是否是节点实例
@@ -174,9 +338,6 @@ class Search {
         this.currentIndex = 0
       }
     }
-    const { readonly } = this.mindMap.opt
-    // 只读模式下需要清除之前节点的高亮
-    this.clearHighlightOnReadonly()
     const currentNode = this.matchNodeList[this.currentIndex]
     this.notResetSearchText = true
     const uid = this.isNodeInstance(currentNode)
@@ -193,10 +354,7 @@ class Search {
         this.updateMatchNodeList(this.matchNodeList)
       }
       callback()
-      // 只读模式下节点无法激活，所以通过高亮的方式
-      if (readonly) {
-        node.highlight()
-      }
+      this.applyMatchHighlights(this.currentIndex)
       // 如果当前节点实例已经存在，则不会触发data_change事件，那么需要手动把标志复位
       if (targetNode) {
         this.notResetSearchText = false
@@ -204,16 +362,9 @@ class Search {
     })
   }
 
-  // 只读模式下清除现有匹配节点的高亮
+  // 只读模式下清除现有匹配节点的高亮（兼容旧调用）
   clearHighlightOnReadonly() {
-    const { readonly } = this.mindMap.opt
-    if (readonly) {
-      this.matchNodeList.forEach(node => {
-        if (this.isNodeInstance(node)) {
-          node.closeHighlight()
-        }
-      })
-    }
+    this.clearAllSearchHighlights()
   }
 
   // 定位到指定搜索结果索引的节点

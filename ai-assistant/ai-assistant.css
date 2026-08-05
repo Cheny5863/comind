@@ -180,9 +180,6 @@
   background: #fdf6ec; border-radius: 4px; padding: 1px 6px; white-space: nowrap;
 }
 .ai-session-item.rollback-item { color: #303133; }
-.ai-session-item.rollback-item .ai-rollback-msg {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
 /* 背景信息编辑 / 设置抽屉：覆盖 ai-body 区域（跟随 header/toolbar 高度，无硬编码） */
 .ai-bg-drawer {
   position: absolute; inset: 0; background: #fff; z-index: 2;
@@ -260,32 +257,6 @@
   opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s;
 }
 .ai-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-
-/* AI 改图成功提示：页面底部按重力抛起 "+N -M" 符号（不打扰画布操作）
-   物理模型：上抛到顶 3s（v₀=29.4m/s, h=44.1m）→ 自由落体 3s（√(2h/g)=3s），总 6s。
-   上抛段 ease-out（匀减速）、下落段 ease-in（匀加速），最高点 60vh（过半屏）。 */
-.ai-map-diff {
-  position: fixed; left: 50%; bottom: 24px;
-  transform: translateX(-50%);
-  display: flex; align-items: center; gap: 8px;
-  background: rgba(0,0,0,.78); color: #fff;
-  font-size: 17px; font-weight: 700; line-height: 1;
-  padding: 12px 22px; border-radius: 24px;
-  z-index: 10001; pointer-events: none;
-  white-space: nowrap;
-  box-shadow: 0 4px 20px rgba(0,0,0,.25);
-  animation: aiMapDiffThrow 6s linear forwards;
-}
-.ai-map-diff .ai-diff-flag { font-size: 16px; }
-.ai-map-diff .ai-diff-add { color: #67c23a; }
-.ai-map-diff .ai-diff-remove { color: #f56c6c; }
-@keyframes aiMapDiffThrow {
-  0%   { opacity: 0; transform: translateX(-50%) translateY(40px) scale(.85);
-         animation-timing-function: cubic-bezier(.2,0,.55,1); }  /* 上抛：匀减速 */
-  50%  { opacity: 1; transform: translateX(-50%) translateY(-60vh) scale(1.02);
-         animation-timing-function: cubic-bezier(.42,0,1,1); }    /* 下落：匀加速 */
-  100% { opacity: 0; transform: translateX(-50%) translateY(60px) scale(.85); }
-}
 
 /* ── 多 Agent（并行分支工作）── */
 /* 居中组：分支标签 + 后台活跃计数 badge 一起居中，两者永不分离、
@@ -405,3 +376,19 @@
     -webkit-tap-highlight-color: transparent;
   }
 }
+
+/* ── Ctrl+F 搜索高亮（复用主界面搜索栏）── */
+.ai-find-mark {
+  background: #ffe58f;
+  color: #303133 !important;
+  padding: 0 2px;
+  border-radius: 2px;
+  font-weight: 600;
+}
+.ai-bubble.user .ai-find-mark {
+  background: #fff566;
+  color: #303133 !important;
+}
+.ai-find-mark.active { background: #ffc53d; outline: 1px solid #d48806; }
+.ai-search-hit { outline: 2px solid rgba(230, 162, 60, 0.55); outline-offset: 1px; border-radius: 6px; }
+.ai-search-hit-active { outline-color: #e6a23c; background: rgba(230, 162, 60, 0.08) !important; }

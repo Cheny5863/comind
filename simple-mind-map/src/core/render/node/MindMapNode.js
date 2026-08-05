@@ -1085,6 +1085,15 @@ class MindMapNode {
     if (this.group) this.group.removeClass('smm-node-highlight')
   }
 
+  // 搜索匹配（非当前项）
+  searchMatchHighlight() {
+    if (this.group) this.group.addClass('smm-node-search-match')
+  }
+
+  closeSearchMatchHighlight() {
+    if (this.group) this.group.removeClass('smm-node-search-match')
+  }
+
   // 伪克隆节点
   // 克隆出的节点并不能真正当做一个节点使用
   fakeClone() {

@@ -61,6 +61,17 @@
       compacting: "上下文已满，正在压缩历史…",
       compactDone: "上下文压缩完成，继续对话",
       compactFail: "上下文压缩失败：{err}",
+      settings: "设置",
+      shortcutSettings: "快捷键",
+      shortcutHint: "当前绑定的快捷键一览",
+      prefs: "交互偏好",
+      followBranch: "切换会话时对焦到绑定分支",
+      followBranchHint: "关闭后切会话只切换聊天内容，脑图焦点不动",
+      scPrevNextSession: "上一个 / 下一个会话",
+      scEscBlur: "输入框取消对焦，回到脑图节点",
+      scNewSession: "新建会话",
+      scNodeAssist: "当前节点求助",
+      deleted: "已删除",
     },
     en: {
       assistant: "AI Assistant",
@@ -119,6 +130,17 @@
       compacting: "Context is full, compacting history…",
       compactDone: "Context compacted, continue chatting",
       compactFail: "Context compaction failed: {err}",
+      settings: "Settings",
+      shortcutSettings: "Shortcuts",
+      shortcutHint: "Currently bound shortcuts",
+      prefs: "Preferences",
+      followBranch: "Focus bound branch when switching sessions",
+      followBranchHint: "When off, switching sessions only switches chat content",
+      scPrevNextSession: "Previous / next session",
+      scEscBlur: "Blur input, focus back to map node",
+      scNewSession: "New session",
+      scNodeAssist: "Assist with current node",
+      deleted: "Deleted",
     },
   };
   let _lang = null;
@@ -247,12 +269,35 @@
             <button class="ai-bg-save" id="ai-bg-save">${t("save")}</button>
           </div>
         </div>
-        <div class="ai-bg-drawer hidden" id="ai-keys-drawer">
-          <div class="ai-keys-title">${t("modelSettings")}</div>
-          <div class="ai-keys-hint">${t("keysHint")}</div>
-          <div class="ai-keys-list" id="ai-keys-list"></div>
+        <div class="ai-settings-drawer hidden" id="ai-settings-drawer">
+          <div class="ai-settings-scroll" id="ai-settings-scroll">
+            <details class="ai-settings-group">
+              <summary>⚙️ ${t("modelSettings")}</summary>
+              <div class="ai-settings-body">
+                <div class="ai-keys-hint">${t("keysHint")}</div>
+                <div class="ai-keys-list" id="ai-keys-list"></div>
+              </div>
+            </details>
+            <details class="ai-settings-group">
+              <summary>⌨️ ${t("shortcutSettings")}</summary>
+              <div class="ai-settings-body">
+                <div class="ai-keys-hint">${t("shortcutHint")}</div>
+                <div class="ai-shortcut-row"><span class="ai-shortcut-keys">Ctrl+Alt+PageUp / PageDown</span><span class="ai-shortcut-desc">${t("scPrevNextSession")}</span></div>
+                <div class="ai-shortcut-row"><span class="ai-shortcut-keys">Esc</span><span class="ai-shortcut-desc">${t("scEscBlur")}</span></div>
+                <div class="ai-shortcut-row"><span class="ai-shortcut-keys">Ctrl+Alt+N</span><span class="ai-shortcut-desc">${t("scNewSession")}</span></div>
+                <div class="ai-shortcut-row"><span class="ai-shortcut-keys">Ctrl+J</span><span class="ai-shortcut-desc">${t("scNodeAssist")}</span></div>
+              </div>
+            </details>
+            <details class="ai-settings-group">
+              <summary>🎯 ${t("prefs")}</summary>
+              <div class="ai-settings-body">
+                <label class="ai-pref-row"><input type="checkbox" id="ai-pref-follow"> <span>${t("followBranch")}</span></label>
+                <div class="ai-pref-hint">${t("followBranchHint")}</div>
+              </div>
+            </details>
+          </div>
           <div class="bar">
-            <button class="ai-bg-close" id="ai-keys-close">${t("close")}</button>
+            <button class="ai-bg-close" id="ai-settings-close">${t("close")}</button>
           </div>
         </div>
       </div>
@@ -260,7 +305,7 @@
         <select class="ai-model-select" id="ai-model" title="${t("modelTitle")}"></select>
         <select class="ai-thinking-select" id="ai-thinking" title="${t("thinkingLevel")}"></select>
         <button class="ai-tool-btn" id="ai-bg" title="${t("background")}">📝 <span>${t("background")}</span></button>
-        <button class="ai-tool-btn" id="ai-keys" title="${t("modelSettings")}">⚙️ <span>${t("modelSettings")}</span></button>
+        <button class="ai-tool-btn" id="ai-settings" title="${t("settings")}">⚙️ <span>${t("settings")}</span></button>
       </div>
       <div class="ai-input-area">
         <div class="ai-input-wrap">
@@ -285,9 +330,16 @@
     document.getElementById("ai-bg").addEventListener("click", openBg);
     document.getElementById("ai-bg-close").addEventListener("click", closeBg);
     document.getElementById("ai-bg-save").addEventListener("click", saveBg);
-    document.getElementById("ai-keys").addEventListener("click", openKeys);
-    document.getElementById("ai-keys-close").addEventListener("click", closeKeys);
+    document.getElementById("ai-settings").addEventListener("click", openSettings);
+    document.getElementById("ai-settings-close").addEventListener("click", closeSettings);
     document.getElementById("ai-keys-list").addEventListener("click", onKeysListClick);
+    document.getElementById("ai-pref-follow").addEventListener("change", (e) => {
+      savePrefFollowBranch(e.target.checked);
+    });
+    // 折叠组展开状态变化 → 记忆，重开面板保持
+    document.getElementById("ai-settings-drawer").addEventListener("toggle", (e) => {
+      if (e.target && e.target.tagName === "DETAILS") saveSettingsGroupStates();
+    });
     document.getElementById("ai-model").addEventListener("change", onModelChange);
     document.getElementById("ai-thinking").addEventListener("change", onThinkingChange);
     // 点击左上角分支标签 → 脑图聚焦到该分支根节点
@@ -770,8 +822,9 @@
     const el = document.getElementById("ai-agent-label");
     if (!el) return;
     const ag = _agents.find((a) => (a.branch_uid || "") === _currentBranch);
-    const display = (ag && (ag.display_label || ag.label)) ? (ag.display_label || ag.label)
+    let display = (ag && (ag.display_label || ag.label)) ? (ag.display_label || ag.label)
       : (_pendingBranchLabel ? _pendingBranchLabel.slice(0, 5) : t("rootAgent"));
+    if (ag && ag.deleted) display = t("deleted");
     el.textContent = display;
     el.classList.toggle("is-branch", !!_currentBranch);
   }
@@ -804,6 +857,7 @@
   function stopPolling() { if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; } }
   function agentLabelOf(branch, list) {
     const ag = (list || []).find((a) => (a.branch_uid || "") === branch);
+    if (ag && ag.deleted) return t("deleted");
     if (ag && (ag.display_label || ag.label)) return (ag.display_label || ag.label);
     return branch ? branch.slice(0, 5) : t("rootAgent");
   }
@@ -924,21 +978,23 @@
           const d = new Date((it.modified || 0) * 1000);
           const time = d.toLocaleString(lang().startsWith("zh") ? "zh-CN" : "en-US", { month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
           const branchTag = it.branch_uid
-            ? '<span class="ai-session-branch">' + esc(it.display_label || it.branch_label || it.branch_uid.slice(0, 5)) + "</span>"
+            ? '<span class="ai-session-branch">' + esc(it.deleted ? t("deleted") : (it.display_label || it.branch_label || it.branch_uid.slice(0, 5))) + "</span>"
             : '<span class="ai-session-branch root">root</span>';
           const msgCount = '<span class="ai-session-count">' + it.user_messages + t("nMessages") + "</span>";
           const dot = isUnread ? '<span class="ai-dot"></span>' : "";
           const spin = it.streaming ? '<span class="ai-spin" title="' + t("working") + '"></span>' : "";
           div.innerHTML = dot + spin + "<span class='ai-session-time'>" + time + "</span>" + branchTag + msgCount;
-          div.title = it.name + (it.branch_label ? " — " + it.branch_label : "") + (it.streaming ? " [" + t("working") + "]" : "");
+          div.title = it.name + (it.deleted ? " — " + t("deleted") : (it.branch_label ? " — " + it.branch_label : "")) + (it.streaming ? " [" + t("working") + "]" : "");
           div.dataset.file = it.file;
           div.dataset.branch = it.branch_uid || "";
-          div.addEventListener("click", () => switchSession(it.file, it.branch_uid || ""));
+          div.dataset.focus = it.focus_uid || "";
+          div.dataset.focusUids = JSON.stringify(it.focus_uids || []);
+          div.addEventListener("click", () => switchSession(it.file, it.branch_uid || "", it.focus_uid || "", it.focus_uids || []));
           list.appendChild(div);
         });
       }).catch(() => {});
   }
-  function switchSession(file, branch) {
+  function switchSession(file, branch, focusUid, focusUids) {
     // 已在查看目标 session，短路（避免无谓断开重连/重建）
     if (file === _currentSessionFile && (branch || "") === _currentBranch) {
       // 短路也要做画布版本对齐：可能错过了其他分支的 mindmap_update 广播
@@ -951,6 +1007,16 @@
     }).then(() => {
       _currentBranch = branch || "";  // 切 session 时同步分支上下文
       _currentSessionFile = file;     // 前端维护当前查看的 session
+      // 跟随偏好（默认开）：优先对焦最近一次改图批次的根节点（focusUid），
+      // 没有则退回 session 绑定分支根；root session 两者皆空则不动
+      if (prefFollowBranch() && _mindMap) {
+        const targetUid = (focusUid || "").trim() || _currentBranch || "";
+        if (targetUid) focusNode(targetUid);
+        // 对焦后给最近改动的那批节点画包围盒呼吸动画，提示『agent 上次改了这里』
+        showFocusBox(focusUids);
+      }
+      // 焦点还给画布：否则焦点留在输入框/面板按钮上，方向键会被快捷键守卫屏蔽
+      blurPanelFocus();
       setStreaming(false);  // 清掉旧 session 的"思考中/中止"UI 残留
       disconnectSSE();
       document.getElementById("ai-messages").innerHTML = "";
@@ -960,6 +1026,20 @@
       loadHistory();
       connectSSE();
       recoverStreamState();  // 与目标 session 的实际 streaming 状态对齐
+    }).catch(() => {});
+  }
+
+  /* ── 快捷键：Ctrl+Alt+PageUp/PageDown 按更新时间切换会话 ── */
+  // dir=-1 上一个（更新的，历史列表更靠前）；dir=1 下一个（更旧的）
+  // 历史列表 = /api/all_sessions，按最后对话时间倒序
+  function stepSession(dir) {
+    fetch(api("all_sessions")).then((r) => r.json()).then((items) => {
+      if (!items || !items.length) return;
+      let idx = items.findIndex((it) => it.file === _currentSessionFile);
+      if (idx === -1) idx = dir === -1 ? 0 : -1; // 当前不在列表（异常）：上一个=最新一条
+      const target = items[idx + dir];
+      if (!target) return; // 边界不循环，保持简单可预期
+      switchSession(target.file, target.branch_uid || "", target.focus_uid || "", target.focus_uids || []);
     }).catch(() => {});
   }
 
@@ -1164,7 +1244,15 @@
   }
 
   function onInputKeydown(e) {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); return; }
+    if (e.key === "Escape") {
+      // Esc：取消输入框对焦回到脑图；有选中节点则居中回到该节点，无选中则仅失焦
+      e.preventDefault();
+      e.stopPropagation();
+      document.getElementById("ai-input").blur();
+      const node = activeNode();
+      if (node) { try { _mindMap.renderer.moveNodeToCenter(node); } catch (_) {} }
+    }
   }
 
   /* ── 节点引用 chip ── */
@@ -1196,6 +1284,50 @@
       try { _mindMap.renderer.moveNodeToCenter(target); } catch (_) {}
     }
   }
+  // 焦点还给画布：焦点/选区留在 AI 面板或页面其他元素（顶栏按钮等）时，
+  // 画布快捷键（方向键等）会被 customCheckEnableShortcut 屏蔽，必须移走才能键盘导航
+  // 最近改动批次包围盒呼吸动画：切 session 对焦后提示『agent 上次改了这里』
+  let _focusBoxEl = null, _focusBoxTimer = null;
+  function showFocusBox(uids) {
+    clearTimeout(_focusBoxTimer);
+    if (_focusBoxEl) { _focusBoxEl.remove(); _focusBoxEl = null; }
+    if (!_mindMap || !uids || !uids.length) return;
+    const draw = _mindMap.draw;
+    if (!draw || !draw.rect) return;
+    const nodes = uids.map((u) => findNodeByUid(_mindMap.renderer.root, u)).filter(Boolean);
+    if (!nodes.length) return;
+    // 合并节点外接矩形（draw 坐标系，自动跟随平移/缩放）
+    let minL = Infinity, minT = Infinity, maxR = -Infinity, maxB = -Infinity;
+    nodes.forEach((n) => {
+      minL = Math.min(minL, n.left); minT = Math.min(minT, n.top);
+      maxR = Math.max(maxR, n.left + n.width); maxB = Math.max(maxB, n.top + n.height);
+    });
+    if (!isFinite(minL)) return;
+    const pad = 14;
+    _focusBoxEl = draw.rect(maxR - minL + pad * 2, maxB - minT + pad * 2)
+      .move(minL - pad, minT - pad)
+      .radius(10)
+      .fill("none")
+      .stroke({ color: "#409eff", width: 2, opacity: 0.9, dasharray: "6 5" })
+      .addClass("ai-focus-box");
+    if (_focusBoxEl.node) _focusBoxEl.node.setAttribute("pointer-events", "none");
+    _focusBoxTimer = setTimeout(() => {
+      if (_focusBoxEl) { _focusBoxEl.remove(); _focusBoxEl = null; }
+    }, 3600);
+  }
+
+  function blurPanelFocus() {
+    const ae = document.activeElement;
+    if (!ae || ae === document.body || ae === document.documentElement) return;
+    // 不打断 ssm 节点文本编辑（contenteditable 且不在 AI 面板内，如节点编辑框）
+    if (ae.isContentEditable && (!ae.closest || !ae.closest("#ai-panel"))) return;
+    if (typeof ae.blur === "function") ae.blur();
+    // 残留的文本选区同样会被守卫判定为“面板内/非画布”，一并清掉
+    try {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0 && !sel.isCollapsed) sel.removeAllRanges();
+    } catch (_) {}
+  }
   function focusBranchNode() {
     // 点击 header 左上角分支标签：聚焦到当前分支根节点（root agent 无分支，忽略）
     if (!_currentBranch || !_mindMap) return;
@@ -1225,7 +1357,12 @@
   }
   function nodeAssist() {
     const node = activeNode();
-    if (!node) { openPanelFlash(); return; }
+    if (!node) {
+      // 无选中节点：打开面板并直接聚焦输入框（双向导航：随时按 Ctrl+J 回到输入框）
+      openPanelFlash();
+      document.getElementById("ai-input").focus();
+      return;
+    }
     const uid = node.nodeData.data.uid || "";
     const text = stripHtml(node.nodeData.data.text);
     const note = stripHtml(node.nodeData.data.note || "");
@@ -1269,9 +1406,38 @@
     { id: "together", name: "🤝 Together AI", placeholder: t("pasteKey") },
     { id: "kimi-coding", name: "🌙 Kimi for Coding", placeholder: t("pasteKey") },
   ];
-  function openKeys() {
-    const drawer = document.getElementById("ai-keys-drawer");
+  /* ── 交互偏好 ── */
+  const PREF_FOLLOW_BRANCH = "comind_pref_follow_branch";
+  function prefFollowBranch() {
+    try { return localStorage.getItem(PREF_FOLLOW_BRANCH) !== "0"; } catch (_) { return true; }
+  }
+  function savePrefFollowBranch(on) {
+    try { localStorage.setItem(PREF_FOLLOW_BRANCH, on ? "1" : "0"); } catch (_) {}
+  }
+  function applyPrefFollowUI() {
+    const cb = document.getElementById("ai-pref-follow");
+    if (cb) cb.checked = prefFollowBranch();
+  }
+  // 记忆设置抽屉各折叠组的展开状态，重开面板保持
+  function saveSettingsGroupStates() {
+    document.querySelectorAll("#ai-settings-drawer details").forEach((d, i) => {
+      try { localStorage.setItem("comind_settings_group_" + i, d.open ? "1" : "0"); } catch (_) {}
+    });
+  }
+  function restoreSettingsGroupStates() {
+    document.querySelectorAll("#ai-settings-drawer details").forEach((d, i) => {
+      try {
+        const v = localStorage.getItem("comind_settings_group_" + i);
+        if (v !== null) d.open = v === "1";
+      } catch (_) {}
+    });
+  }
+
+  function openSettings() {
+    const drawer = document.getElementById("ai-settings-drawer");
     drawer.classList.remove("hidden");
+    restoreSettingsGroupStates();
+    applyPrefFollowUI();
     const list = document.getElementById("ai-keys-list");
     list.innerHTML = '<div class="ai-keys-loading">' + t("loading") + '</div>';
     fetch("/api/keys").then((r) => r.json()).then((d) => {
@@ -1298,8 +1464,8 @@
       list.innerHTML = '<div class="ai-keys-loading">' + t("loadFailed") + '</div>';
     });
   }
-  function closeKeys() {
-    document.getElementById("ai-keys-drawer").classList.add("hidden");
+  function closeSettings() {
+    document.getElementById("ai-settings-drawer").classList.add("hidden");
   }
   function onKeysListClick(e) {
     const eyeBtn = e.target.closest(".ai-key-eye");
@@ -1326,7 +1492,7 @@
     }).then((r) => {
       if (!r.ok) return r.json().then((d) => { throw new Error((d && d.detail) || t("saveFailed")); });
       toast(isClear ? t("clearedKey", { name: name.name || prov }) : t("savedKey"));
-      openKeys(); // 刷新状态徽章
+      openSettings(); // 刷新状态徽章
     }).catch((err) => toast(t("saveFailed") + ": " + (err && err.message ? err.message : "")));
   }
 
@@ -1486,6 +1652,17 @@
           startPolling();
         }
         newAgent();
+      }
+      // Ctrl+Alt+PageUp / PageDown：按更新时间切换上一个/下一个会话
+      if ((e.ctrlKey || e.metaKey) && e.altKey && e.key === "PageUp") {
+        e.preventDefault();
+        stepSession(-1);
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.altKey && e.key === "PageDown") {
+        e.preventDefault();
+        stepSession(1);
+        return;
       }
       // Ctrl+J：当前节点求助
       if ((e.ctrlKey || e.metaKey) && (e.key === "j" || e.key === "J")) {

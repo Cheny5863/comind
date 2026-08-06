@@ -43,9 +43,67 @@ def test_branch_label_state_fallback(env):
 
 
 def test_branch_label_uid_fallback(env):
-    """uid 不存在 → 返回 uid 本身。"""
+    """uid 不存在（分支已被删除）→ 返回「已删除」而非 uid 本身。"""
     label = chat_service._branch_label(MAP_KEY, "no-such-uid", None)
-    assert label == "no-such-uid"
+    assert label == "已删除"
+    # en 界面返回英文标记
+    label_en = chat_service._branch_label(MAP_KEY, "no-such-uid", None, "en")
+    assert label_en == "Deleted"
+
+
+def test_branch_label_node_exists_empty_text_keeps_uid(env):
+    """节点存在但文本为空 → 仍退回 uid（罕见，保留可追踪性）。"""
+    state = json.loads(json.dumps(backend.chat_manager._map_state.get(MAP_KEY)))
+    root = chat_service._state_root(state)
+    root["children"].append(node("empty-uid-1", ""))
+    label = chat_service._branch_label(MAP_KEY, "empty-uid-1", state)
+    assert label == "empty-uid-1"
+
+
+def _delete_node_from_disk_and_state(uid):
+    """从磁盘和 _map_state 快照同时删除节点（模拟用户删除分支节点）。"""
+    fpath = Path(chat_service.PROJECT_CWD) / MAP_KEY
+    doc = json.loads(fpath.read_text())
+    root = doc["mindMapData"]["root"]
+    root["children"] = [c for c in root["children"] if c["data"]["uid"] != uid]
+    fpath.write_text(json.dumps(doc, ensure_ascii=False))
+    state = backend.chat_manager._map_state.get(MAP_KEY)
+    if state:
+        sroot = chat_service._state_root(state)
+        sroot["children"] = [c for c in sroot.get("children", []) if c["data"]["uid"] != uid]
+
+
+def test_list_agents_deleted_branch_label(env):
+    """分支节点从脑图删除后，agents 接口返回 deleted 标记（UI 文案由前端字典翻译）。"""
+    client = env
+    backend.chat_manager._mapping[f"{MAP_KEY}::a-1"] = "/tmp/fake-session-a1.jsonl"
+    _delete_node_from_disk_and_state("a-1")
+    r = client.get(f"/api/chat/{MAP_KEY}/agents")
+    assert r.status_code == 200
+    agents = r.json()
+    a1 = [a for a in agents if a["branch_uid"] == "a-1"][0]
+    assert a1["deleted"] is True
+    # root agent 的 deleted 恒为 False
+    root_ag = [a for a in agents if a["branch_uid"] == ""][0]
+    assert root_ag["deleted"] is False
+
+
+def test_all_sessions_deleted_branch_label(env, tmp_path, monkeypatch):
+    """历史 session 列表：分支被删后返回 deleted 标记。"""
+    client = env
+    monkeypatch.setattr(chat_service, "SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(chat_service, "MAPPING_PATH", tmp_path / "sessions" / "mapping.json")
+    sdir = tmp_path / "sessions"
+    sdir.mkdir(exist_ok=True)
+    sf = str(sdir / f"test.smm.json__a-1__2026-01-01T00-00-00-000Z.jsonl")
+    Path(sf).write_text('{"type": "meta", "sessionId": "s1"}\n')
+    backend.chat_manager._mapping[f"{MAP_KEY}::a-1"] = sf
+    _delete_node_from_disk_and_state("a-1")
+    r = client.get(f"/api/chat/{MAP_KEY}/all_sessions")
+    assert r.status_code == 200
+    sessions = r.json()
+    s1 = [s for s in sessions if s["file"] == sf][0]
+    assert s1["deleted"] is True
 
 
 def test_list_agents_label_from_disk(env):

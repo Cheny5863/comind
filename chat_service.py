@@ -91,14 +91,16 @@ def _display_label(label: str, max_len: int = 20) -> str:
     return label[:max_len] + "…"
 
 
-def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> str:
+def _branch_label(map_key: str, branch_uid: str, state: dict | None = None, lang: str = "zh") -> str:
     """取分支根节点的文本标签，用于注入 system prompt 分支职责说明。
 
     磁盘优先（用户手动编辑/AI 改图最终都落盘，磁盘是权威；_map_state
     快照只在 sync/apply 时更新，会过期），state 兜底（覆盖磁盘上还不存在
-    的新节点——用户在 UI 新建未保存）。都找不到返回 uid 本身。
+    的新节点——用户在 UI 新建未保存）。两处都找不到 = 分支节点已被删除，
+    返回「已删除」标记（按 lang 中英文），不再显示 uid 本身；
+    节点存在但文本为空时仍退回 uid（罕见，保留可追踪性）。
     """
-    label = branch_uid
+    found = False
     try:
         # 磁盘优先
         fpath = Path(PROJECT_CWD) / map_key
@@ -110,6 +112,7 @@ def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> s
                 idx = _index_by_uid(root)
                 node = idx.get(branch_uid)
                 if node and isinstance(node.get("data"), dict):
+                    found = True
                     t = _strip_html(node["data"].get("text", ""))
                     if t:
                         return t[:40]
@@ -120,12 +123,40 @@ def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> s
                 idx = _index_by_uid(root)
                 node = idx.get(branch_uid)
                 if node and isinstance(node.get("data"), dict):
+                    found = True
                     t = _strip_html(node["data"].get("text", ""))
                     if t:
                         return t[:40]
     except Exception:
         pass
-    return label
+    if not found:
+        return "Deleted" if (lang or "").startswith("en") else "已删除"
+    return branch_uid
+
+
+def _branch_deleted(map_key: str, branch_uid: str, state: dict | None = None) -> bool:
+    """分支节点是否已被删除（磁盘 + _map_state 都找不到）。
+
+    与 _branch_label 的查找范围一致，但返回布尔标记而不是本地化文本——
+    UI 文案由前端 I18N 字典翻译（项目习惯），后端只负责给标记。
+    """
+    try:
+        # 磁盘优先
+        fpath = Path(PROJECT_CWD) / map_key
+        if map_key.endswith(".smm.json") and fpath.is_file():
+            doc = json.loads(fpath.read_text())
+            md = doc.get("mindMapData") or {}
+            root = _state_root(md)
+            if isinstance(root, dict) and branch_uid in _index_by_uid(root):
+                return False
+        # state 兜底
+        if state:
+            root = _state_root(state)
+            if isinstance(root, dict) and branch_uid in _index_by_uid(root):
+                return False
+    except Exception:
+        pass
+    return True
 
 
 # provider id → 环境变量名（也用作 private/keys.json 的键名）
@@ -296,7 +327,7 @@ class ChatSession:
         # 分支职责：绑定分支的 agent 只能改自己的分支，root agent 管全图
         if self.branch_uid:
             state = (self._map_state or {}).get(self.map_key)
-            branch_label = _branch_label(self.map_key, self.branch_uid, state)
+            branch_label = _branch_label(self.map_key, self.branch_uid, state, self.lang)
             system_prompt += (
                 "\n\n## 你负责的分支（重要）\n\n"
                 f"你绑定在脑图的分支「{branch_label}」（根节点 uid={self.branch_uid}）上工作。\n"
@@ -754,6 +785,7 @@ class ChatSessionManager:
         """
         prefix = safe_key_slug(map_key) + "__"
         sessions = []
+        root = _state_root(self._map_state.get(map_key))
         for f in SESSION_DIR.glob(f"{prefix}*.jsonl"):
             try:
                 stem = f.name[len(prefix):]
@@ -766,6 +798,23 @@ class ChatSessionManager:
                     branch_uid = self._branch_uid_for_file(map_key, str(f))
                 text = f.read_text()
                 user_count = text.count('"role": "user"') + text.count('"role":"user"')
+                # 跟随对焦目标：从最新一轮往回找第一个有实际改动（且节点仍在
+                # 树里）的轮次，取其改动批次的根节点 uid；全部没有则空（前端
+                # 退回 session 绑定分支）。数据源 = turns（持久化，重启不丢）
+                focus_uid = ""
+                focus_uids: list[str] = []
+                uid_index = _index_by_uid(root) if root else {}
+                for turn in reversed(_load_turns(str(f))):
+                    diff = turn.get("diff") or []
+                    uids = [d.get("uid") for d in diff
+                            if d.get("uid") and d.get("uid") in uid_index]
+                    if not uids:
+                        continue
+                    focus_uids = uids
+                    focus_uid = _lca_uid(uids, root)
+                    if focus_uid:
+                        break
+                branch_lang = self._lang_pref.get(session_key(map_key, branch_uid), "zh")
                 sessions.append({
                     "file": str(f),
                     "name": f.stem,
@@ -774,9 +823,12 @@ class ChatSessionManager:
                     "user_messages": user_count,
                     "streaming": self._session_streaming(map_key, str(f), branch_uid),
                     "branch_uid": branch_uid,
-                    "branch_label": _branch_label(map_key, branch_uid, self._map_state.get(map_key)) if branch_uid else "",
+                    "focus_uid": focus_uid,
+                    "focus_uids": focus_uids,
+                    "deleted": _branch_deleted(map_key, branch_uid, self._map_state.get(map_key)) if branch_uid else False,
+                    "branch_label": _branch_label(map_key, branch_uid, self._map_state.get(map_key), branch_lang) if branch_uid else "",
                     "display_label": _display_label(
-                        _branch_label(map_key, branch_uid, self._map_state.get(map_key))
+                        _branch_label(map_key, branch_uid, self._map_state.get(map_key), branch_lang)
                     ) if branch_uid else "",
                 })
             except Exception:
@@ -859,6 +911,7 @@ class ChatSessionManager:
         root_sf = self._mapping.get(map_key)
         agents[""] = {
             "branch_uid": "",
+            "deleted": False,
             "label": "",
             "display_label": "",
             "session_file": root_sf,
@@ -872,9 +925,10 @@ class ChatSessionManager:
             if mkey != map_key or not b:
                 continue
             sess = self._sessions.get(skey)
-            full = _branch_label(map_key, b, self._map_state.get(map_key))
+            full = _branch_label(map_key, b, self._map_state.get(map_key), self._lang_pref.get(skey, "zh"))
             agents[b] = {
                 "branch_uid": b,
+                "deleted": _branch_deleted(map_key, b, self._map_state.get(map_key)),
                 "label": full,
                 "display_label": _display_label(full),
                 "session_file": sf,
@@ -1702,6 +1756,44 @@ def _merge_save_tree(disk_root: dict, front_root: dict) -> dict:
     }
 
 
+def _lca_uid(uids: list[str], root: dict | None) -> str:
+    """给定一批节点 uid，返回它们的最小公共祖先（含自身）的 uid；找不到返回空。
+
+    用于切换 session 时对焦到『最近一次改图那批节点的根节点』：
+    - 单节点 → 它自己
+    - 同一分支内多个节点 → 包含它们的最小子树根
+    - 节点已被删除 / 不在树里 → 跳过（全跳过则返回空）
+    """
+    if not uids or root is None:
+        return ""
+    parent: dict[str, str] = {}
+
+    def walk(n: dict, p: str) -> None:
+        uid = (n.get("data") or {}).get("uid") or ""
+        if uid:
+            parent[uid] = p
+        for c in n.get("children") or []:
+            walk(c, uid)
+
+    walk(root, "")
+    chains: list[list[str]] = []
+    for u in uids:
+        chain, cur = [], u
+        while cur and cur in parent:
+            chain.append(cur)
+            cur = parent[cur]
+        if chain:
+            chains.append(chain)
+    if not chains:
+        return ""
+    base = chains[0]
+    others = [set(c) for c in chains[1:]]
+    for n in base:  # 自身 → 根，第一个同时出现在所有链里的就是最深公共祖先
+        if all(n in s for s in others):
+            return n
+    return ""
+
+
 def _map_uid_stats(old_state, new_state) -> dict:
     """对比两次 mindMapData 状态的 uid 集合，统计 added/removed/updated 数量。
 
@@ -1752,6 +1844,23 @@ def _broadcast_map_update(manager: ChatSessionManager, key: str, new_data: dict,
                     pass
 
 
+def _ensure_map_ver_cs(manager: ChatSessionManager, key: str) -> int:
+    """返回脑图当前写版本。内存中没有时从磁盘 _comind_ver 恢复（服务重启场景）。"""
+    ver = manager._map_ver.get(key)
+    if ver is not None:
+        return ver
+    fpath = Path(PROJECT_CWD) / key
+    disk_ver = 0
+    if fpath.is_file():
+        try:
+            doc = json.loads(fpath.read_text())
+            disk_ver = doc.get("_comind_ver", 0)
+        except Exception:
+            pass
+    manager._map_ver[key] = disk_ver
+    return disk_ver
+
+
 def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict, branch_uid: str = "") -> None:
     """提交新 mindMapData：更新内存、备份、落盘、SSE 广播。
 
@@ -1761,7 +1870,7 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
     """
     old_state = manager._map_state.get(key)
     manager._map_state[key] = new_data
-    manager._map_ver[key] = manager._map_ver.get(key, 0) + 1
+    manager._map_ver[key] = _ensure_map_ver_cs(manager, key) + 1
     writer_key = session_key(key, branch_uid)
     manager._map_snapshot[writer_key] = json.loads(json.dumps(new_data))
     # 落盘（原子写）
@@ -1772,6 +1881,7 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
                 backup = fpath.with_suffix(fpath.suffix + ".aibak")
                 backup.write_text(fpath.read_text())
             doc["mindMapData"] = new_data
+            doc["_comind_ver"] = manager._map_ver[key]
             _atomic_write(fpath, json.dumps(doc, ensure_ascii=False, indent=2))
         except Exception as exc:
             # 写盘失败绝不能静默：apply_ops 会返回成功而磁盘没写（假成功），

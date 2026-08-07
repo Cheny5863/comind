@@ -57,11 +57,21 @@ def sample_doc():
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     """每个测试：独立 tmp 目录作为 PROJECT_CWD，写入样例脑图并同步到后端。"""
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(chat_service, "PROJECT_CWD", str(tmp_path))
+    monkeypatch.setattr(chat_service, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(chat_service, "MAPPING_PATH", session_dir / "mapping.json")
+    monkeypatch.setattr(chat_service, "MODELS_PATH", session_dir / "models.json")
+    monkeypatch.setattr(chat_service, "UISTATE_PATH", session_dir / "uistate.json")
     backend.chat_manager._map_state.clear()
     backend.chat_manager._map_snapshot.clear()
+    backend.chat_manager._mapping.clear()
+    backend.chat_manager._sessions.clear()
+    backend.chat_manager._model_pref.clear()
+    backend.chat_manager._panel_state.clear()
     doc = sample_doc()
-    (tmp_path / MAP_KEY).write_text(json.dumps(doc, ensure_ascii=False, indent=2))
+    (tmp_path / MAP_KEY).write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
     client = TestClient(backend.app)
     r = client.post(f"/api/chat/{MAP_KEY}/sync", json=doc["mindMapData"])
     assert r.status_code == 200
@@ -71,12 +81,12 @@ def env(tmp_path, monkeypatch):
 def read_disk_root(tmp_path, client):
     """从 PROJECT_CWD 读当前落盘的树根。"""
     fpath = Path(chat_service.PROJECT_CWD) / MAP_KEY
-    return json.loads(fpath.read_text())["mindMapData"]["root"]
+    return json.loads(fpath.read_text(encoding="utf-8"))["mindMapData"]["root"]
 
 
 def disk_doc():
     fpath = Path(chat_service.PROJECT_CWD) / MAP_KEY
-    return json.loads(fpath.read_text())
+    return json.loads(fpath.read_text(encoding="utf-8"))
 
 
 def find_by_uid(node_, uid):

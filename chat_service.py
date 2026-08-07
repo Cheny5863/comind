@@ -15,49 +15,125 @@ import sys
 import threading
 import time
 import uuid
+import shutil
+import tempfile
 from collections import deque
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Iterator
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 # PyInstaller 打包后：资源（pi-ext 等）在 _MEIPASS 只读解压目录，可写数据挪到 ~/.comind
 if getattr(sys, "frozen", False):
     _RES_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-    _DATA_DIR = Path.home() / ".comind"
 else:
     _RES_DIR = Path(__file__).resolve().parent
-    _DATA_DIR = _RES_DIR
+
+
+def _first_writable_dir(candidates: list[Path]) -> Path:
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write-test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return candidate
+        except OSError:
+            continue
+    return candidates[-1]
+
+
+def _default_data_dir() -> Path:
+    explicit = os.environ.get("SMM_DATA_DIR")
+    if explicit:
+        return Path(explicit)
+    if os.name == "nt":
+        candidates = []
+        if os.environ.get("LOCALAPPDATA"):
+            candidates.append(Path(os.environ["LOCALAPPDATA"]) / "CoMind")
+        candidates.append(Path.home() / ".comind")
+        candidates.append(Path(tempfile.gettempdir()) / "CoMind")
+        return _first_writable_dir(candidates)
+    return Path.home() / ".comind"
+
+
+_DATA_DIR = _default_data_dir()
 
 
 def _default_pi_bin() -> str:
     """发布包可选内置 smm-pi 独立二进制（免 node）；否则回退环境变量/家目录 pi。"""
     if getattr(sys, "frozen", False):
-        cand = Path(sys.executable).parent / "smm-pi"
+        for name in ("smm-pi.cmd", "smm-pi.exe", "smm-pi.ps1", "smm-pi"):
+            cand = Path(sys.executable).parent / name
+            if cand.exists():
+                return str(cand)
+    local_bin = _DATA_DIR / "pi-runtime" / "node_modules" / ".bin"
+    for name in ("pi.cmd", "pi.exe", "pi.ps1", "pi"):
+        cand = local_bin / name
         if cand.exists():
             return str(cand)
+    found = shutil.which("pi")
+    if found:
+        return found
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            npm_dir = Path(appdata) / "npm"
+            for name in ("pi.cmd", "pi.ps1", "pi.exe", "pi"):
+                cand = npm_dir / name
+                if cand.exists():
+                    return str(cand)
+        for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+            if base:
+                node_dir = Path(base) / "nodejs"
+                for name in ("pi.cmd", "pi.ps1", "pi.exe", "pi"):
+                    cand = node_dir / name
+                    if cand.exists():
+                        return str(cand)
     return os.path.expanduser("~/.npm-global/bin/pi")
 
 
-PI_BIN = os.environ.get("PI_BIN") or _default_pi_bin()
+def _resolve_pi_launch() -> tuple[list[str], bool]:
+    """解析 pi 启动方式，返回 (启动前缀参数, 是否需经 cmd.exe 中转)。
+
+    Windows 打包版优先直连内置 node.exe + cli.js：
+    - 参数走 CreateProcessW 宽字符通道，无 OEM 代码页转换，
+      --append-system-prompt 中文在非中文系统上也不会变问号；
+    - kill() 直杀 node 本体，不存在 cmd.exe 外壳死后子进程残留。
+    """
+    if getattr(sys, "frozen", False) and os.name == "nt":
+        exe_dir = Path(sys.executable).parent
+        node_exe = exe_dir / "n" / "node.exe"
+        cli_js = exe_dir / "p" / "a" / "dist" / "cli.js"
+        if node_exe.exists() and cli_js.exists():
+            return [str(node_exe), str(cli_js)], False
+        for name in ("smm-pi.cmd", "smm-pi.exe", "smm-pi.ps1"):
+            cand = exe_dir / name
+            if cand.exists():
+                return [str(cand)], True
+    bin_path = os.environ.get("PI_BIN") or _default_pi_bin()
+    if os.name == "nt" and bin_path.lower().endswith((".cmd", ".ps1", ".bat")):
+        return [bin_path], True
+    return [bin_path], False
+
+
+PI_LAUNCH, PI_NEEDS_SHELL = _resolve_pi_launch()
 BASE_DIR = _RES_DIR
 EXT_PATH = BASE_DIR / "pi-ext" / "mindmap-tools.ts"
 PROMPT_PATH = BASE_DIR / "pi-ext" / "system-prompt.md"
-SESSION_DIR = Path(os.environ.get(
-    "SMM_CHAT_SESSION_DIR",
-    os.path.expanduser("~/.comind/chat-sessions"),
-))
+SESSION_DIR = Path(os.environ.get("SMM_CHAT_SESSION_DIR") or (_DATA_DIR / "chat-sessions"))
 MAPPING_PATH = SESSION_DIR / "mapping.json"
 # 前端可写的 provider key 存储（本机私有；打包模式放 ~/.comind/private，升级不丢）
-KEYS_PATH = _DATA_DIR / "private" / "keys.json"
+KEYS_PATH = Path(os.environ.get("SMM_KEYS_PATH") or (_DATA_DIR / "private" / "keys.json"))
 MODELS_PATH = SESSION_DIR / "models.json"
 UISTATE_PATH = SESSION_DIR / "uistate.json"
 MAX_SESSIONS = 5
 IDLE_TIMEOUT = 1800  # 30 min
-PROJECT_CWD = os.path.expanduser("~/comind-maps")
+PROJECT_CWD = os.environ.get("SMM_MAP_DIR") or os.path.expanduser("~/comind-maps")
 
 
 def _background_text(map_key: str) -> str:
@@ -101,7 +177,7 @@ def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> s
         # 磁盘优先
         fpath = Path(PROJECT_CWD) / map_key
         if map_key.endswith(".smm.json") and fpath.is_file():
-            doc = json.loads(fpath.read_text())
+            doc = json.loads(fpath.read_text(encoding="utf-8"))
             md = doc.get("mindMapData") or {}
             root = _state_root(md)
             if isinstance(root, dict):
@@ -210,6 +286,54 @@ def reload_keys() -> dict:
 PROVIDER_KEYS = _load_provider_keys()
 
 
+_PROXY_ENV_NAMES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def _env_flag_enabled(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_loopback_blackhole_proxy(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+        return host in {"127.0.0.1", "localhost", "::1"} and parsed.port in {0, 9}
+    except ValueError:
+        return False
+
+
+def _sanitize_pi_proxy_env(env: dict[str, str]) -> None:
+    """Avoid passing disabled placeholder proxies to pi's EnvHttpProxyAgent."""
+    if _env_flag_enabled(env.get("SMM_PI_USE_SYSTEM_PROXY")):
+        return
+    removed = []
+    for name in _PROXY_ENV_NAMES:
+        value = env.get(name)
+        if value and _is_loopback_blackhole_proxy(value):
+            env.pop(name, None)
+            removed.append(name)
+    if removed:
+        logger.info("Ignoring disabled proxy env for pi: %s", ", ".join(sorted(set(removed))))
+
+
+def _redact_diagnostic(message: str) -> str:
+    """Remove locally configured secrets before logging pi diagnostics."""
+    clean = message
+    for secret in PROVIDER_KEYS.values():
+        if secret and len(secret) >= 8:
+            clean = clean.replace(secret, "[redacted]")
+    clean = re.sub(r"sk-[A-Za-z0-9_\-]{10,}", "sk-[redacted]", clean)
+    clean = re.sub(r"(?i)(api[_-]?key=)[^\s&]+", r"\1[redacted]", clean)
+    return clean
+
+
 def safe_key_slug(map_key: str) -> str:
     """Filesystem-safe slug for a map key (session file naming)."""
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", map_key)
@@ -224,6 +348,23 @@ def _new_session_filename(map_key: str, branch_uid: str = "") -> str:
         branch_slug = safe_key_slug(branch_uid)[:8]
         return f"{slug}__{branch_slug}__{stamp}.jsonl"
     return f"{slug}__{stamp}.jsonl"
+
+
+def _is_valid_pi_session_file(path: Path) -> bool:
+    """Return True when an existing jsonl file looks loadable by pi."""
+    try:
+        if not path.is_file():
+            return False
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                first = json.loads(line)
+                return first.get("type") == "session" and int(first.get("version", 0)) >= 3
+    except Exception:
+        return False
+    return False
 
 
 def session_key(map_key: str, branch_uid: str = "") -> str:
@@ -258,10 +399,12 @@ class ChatSession:
         self._buffer: deque[str] = deque(maxlen=2000)
         self.last_active = time.time()
         self._reader_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
         self._alive = False
         self._in_turn = False  # True between agent_start and agent_end
         self._abort_requested = False  # True after abort() until agent_end/kill
         self._abort_gen = 0  # incremented on each abort; _force_kill only acts if unchanged
+        self._shell_launch = False  # Windows 下经 cmd.exe 启动时 True（kill 需杀进程树）
 
     def spawn(self) -> None:
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -274,10 +417,14 @@ class ChatSession:
         env["SMM_API_BASE"] = os.environ.get("SMM_API_BASE", "http://localhost:8789")
         env["MAP_KEY"] = self.map_key
         env["BRANCH_UID"] = self.branch_uid
+        env.setdefault("PI_CODING_AGENT_DIR", str(_DATA_DIR / "pi-agent"))
+        env.setdefault("PI_SKIP_VERSION_CHECK", "1")
+        env.setdefault("PI_TELEMETRY", "0")
+        _sanitize_pi_proxy_env(env)
 
         system_prompt = ""
         if PROMPT_PATH.is_file():
-            system_prompt = PROMPT_PATH.read_text()
+            system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
         bg = _background_text(self.map_key)
         if bg:
             system_prompt += (
@@ -316,8 +463,8 @@ class ChatSession:
             "请始终使用该语言回复用户；工具/API 内部文本可保持英文。\n"
         )
 
-        cmd = [
-            PI_BIN, "--mode", "rpc",
+        cmd = list(PI_LAUNCH) + [
+            "--mode", "rpc",
             "--provider", "deepseek",
             "--model", "deepseek-v4-flash",
             "--thinking", "max",
@@ -331,20 +478,34 @@ class ChatSession:
         if system_prompt:
             cmd += ["--append-system-prompt", system_prompt]
 
-        self.proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            env=env,
-            cwd=PROJECT_CWD,
-        )
+        popen_kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "env": env,
+            "cwd": PROJECT_CWD,
+        }
+        self._shell_launch = os.name == "nt" and PI_NEEDS_SHELL
+        if self._shell_launch:
+            self.proc = subprocess.Popen(subprocess.list2cmdline(cmd), shell=True, **popen_kwargs)
+        else:
+            if os.name == "nt":
+                popen_kwargs = dict(popen_kwargs)
+                # 打包版 --noconsole 下避免弹出黑色控制台窗口
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.proc = subprocess.Popen(cmd, **popen_kwargs)
         self._alive = True
         self._reader_thread = threading.Thread(
             target=self._read_stdout, daemon=True, name=f"pi-reader-{self.map_key}"
         )
         self._reader_thread.start()
+        self._stderr_thread = threading.Thread(
+            target=self._read_stderr, daemon=True, name=f"pi-stderr-{self.map_key}"
+        )
+        self._stderr_thread.start()
 
     def _read_stdout(self) -> None:
         assert self.proc and self.proc.stdout
@@ -400,6 +561,29 @@ class ChatSession:
                 except Exception:
                     pass
 
+    def _read_stderr(self) -> None:
+        assert self.proc and self.proc.stderr
+        try:
+            while self._alive and self.proc.poll() is None:
+                line = self.proc.stderr.readline()
+                if not line:
+                    break
+                clean = _redact_diagnostic(line.rstrip("\n").rstrip("\r"))
+                if not clean:
+                    continue
+                logger.warning("pi stderr for %s: %s", self.map_key, clean)
+                ev = json.dumps(
+                    {"type": "runtime_error", "source": "pi", "message": clean},
+                    ensure_ascii=False,
+                )
+                for q in list(self.listeners):
+                    try:
+                        q.put_nowait(ev)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("stderr reader error for %s: %s", self.map_key, exc)
+
     def send(self, cmd: dict) -> None:
         if not self.proc or not self._alive:
             raise RuntimeError("session not alive")
@@ -430,7 +614,15 @@ class ChatSession:
         self._alive = False
         if self.proc:
             try:
-                self.proc.kill()
+                if self._shell_launch and self.proc.pid:
+                    # cmd.exe 外壳被杀后 node 子进程可能残留，杀整个进程树
+                    subprocess.Popen(
+                        ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                else:
+                    self.proc.kill()
             except Exception:
                 pass
             self.proc = None
@@ -465,10 +657,21 @@ class ChatSessionManager:
         t = threading.Thread(target=self._reap_loop, daemon=True, name="pi-reaper")
         t.start()
 
+    def shutdown(self) -> None:
+        """后端退出时调用：终止所有 pi 子进程，避免孤儿 node 残留。"""
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for sess in sessions:
+            try:
+                sess.kill()
+            except Exception:
+                pass
+
     def _load_mapping(self) -> dict[str, str]:
         if MAPPING_PATH.is_file():
             try:
-                return json.loads(MAPPING_PATH.read_text())
+                return json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
             except Exception:
                 pass
         return {}
@@ -477,19 +680,25 @@ class ChatSessionManager:
     def _load_json(path: Path) -> dict:
         if path.is_file():
             try:
-                return json.loads(path.read_text())
+                return json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 pass
         return {}
 
     @staticmethod
     def _save_json(path: Path, data: dict) -> None:
-        SESSION_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2))
+        try:
+            SESSION_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("failed to save %s: %s", path, exc)
 
     def _save_mapping(self) -> None:
-        SESSION_DIR.mkdir(parents=True, exist_ok=True)
-        MAPPING_PATH.write_text(json.dumps(self._mapping, indent=2))
+        try:
+            SESSION_DIR.mkdir(parents=True, exist_ok=True)
+            MAPPING_PATH.write_text(json.dumps(self._mapping, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("failed to save session mapping %s: %s", MAPPING_PATH, exc)
 
     def get_or_spawn(self, map_key: str, branch_uid: str = "") -> ChatSession:
         skey = session_key(map_key, branch_uid)
@@ -506,6 +715,11 @@ class ChatSessionManager:
                     oldest.kill()
                     self._sessions.pop(session_key(oldest.map_key, oldest.branch_uid), None)
             session_file = self._mapping.get(skey)
+            if session_file and not _is_valid_pi_session_file(Path(session_file)):
+                logger.warning("discarding invalid pi session mapping for %s: %s", skey, session_file)
+                self._mapping.pop(skey, None)
+                self._save_mapping()
+                session_file = None
             sess = ChatSession(map_key, branch_uid, session_file, self._lang_pref.get(skey, "zh"), self._map_state)
             sess.spawn()
             self._sessions[skey] = sess
@@ -671,7 +885,7 @@ class ChatSessionManager:
                     if is_branch:
                         continue
                 stat = f.stat()
-                text = f.read_text()
+                text = f.read_text(encoding="utf-8")
                 user_count = text.count('"role": "user"') + text.count('"role":"user"')
                 sessions.append({
                     "file": str(f),
@@ -694,7 +908,7 @@ class ChatSessionManager:
         """
         try:
             last = 0.0
-            for line in Path(session_file).read_text().splitlines():
+            for line in Path(session_file).read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -750,7 +964,7 @@ class ChatSessionManager:
                 if is_branch:
                     # 文件名里 slug 不是完整 uid，用 mapping 反查该文件属于哪个分支
                     branch_uid = self._branch_uid_for_file(map_key, str(f))
-                text = f.read_text()
+                text = f.read_text(encoding="utf-8")
                 user_count = text.count('"role": "user"') + text.count('"role":"user"')
                 sessions.append({
                     "file": str(f),
@@ -806,7 +1020,7 @@ class ChatSessionManager:
             fpath = Path(PROJECT_CWD) / map_key
             if map_key.endswith(".smm.json") and fpath.is_file():
                 try:
-                    doc = json.loads(fpath.read_text())
+                    doc = json.loads(fpath.read_text(encoding="utf-8"))
                     state = doc.get("mindMapData") or {}
                 except Exception:
                     state = None
@@ -828,7 +1042,7 @@ class ChatSessionManager:
         if not session_file or not Path(session_file).is_file():
             return False
         try:
-            text = Path(session_file).read_text()
+            text = Path(session_file).read_text(encoding="utf-8")
             return '"role": "user"' in text or '"role":"user"' in text
         except Exception:
             return False
@@ -877,6 +1091,8 @@ class ChatSessionManager:
         # Only allow switching to files that belong to this map key (+branch).
         prefix = safe_key_slug(map_key) + "__"
         if path.parent != SESSION_DIR or not path.name.startswith(prefix):
+            return False
+        if not _is_valid_pi_session_file(path):
             return False
         skey = session_key(map_key, branch_uid)
         with self._lock:
@@ -1127,7 +1343,7 @@ class ChatSessionManager:
         # mindmap_update 给本 session 的 SSE 订阅者，pop 早了前端画布收不到
         # （toast 成功但界面不刷新）。改图广播完成后才移出活跃池。
         # 2. 截断 jsonl 到目标轮 user 消息之前（保留 header + 之前所有行）
-        lines = Path(session_file).read_text().splitlines()
+        lines = Path(session_file).read_text(encoding="utf-8").splitlines()
         cut = None
         user_count = 0
         for i, line in enumerate(lines):
@@ -1204,7 +1420,7 @@ class ChatSessionManager:
 def parse_session(path: Path) -> list[dict]:
     """Parse pi session JSONL (v3 tree), return user/assistant messages."""
     entries = []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -1400,7 +1616,7 @@ def _ensure_map_state(manager: ChatSessionManager, key: str) -> None:
     fpath = Path(PROJECT_CWD) / key
     if key.endswith(".smm.json") and fpath.is_file():
         try:
-            doc = json.loads(fpath.read_text())
+            doc = json.loads(fpath.read_text(encoding="utf-8"))
             md = doc.get("mindMapData") or {}
             if md:
                 manager._map_state[key] = md
@@ -1595,7 +1811,7 @@ def _load_doc_for_write(manager: ChatSessionManager, key: str):
     fpath = Path(PROJECT_CWD) / key
     if key.endswith(".smm.json") and fpath.is_file():
         try:
-            doc = json.loads(fpath.read_text())
+            doc = json.loads(fpath.read_text(encoding="utf-8"))
             file_md = doc.get("mindMapData") or {}
         except Exception as exc:
             logger.warning("read %s failed: %s", key, exc)
@@ -1702,7 +1918,7 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
         try:
             if fpath.is_file():
                 backup = fpath.with_suffix(fpath.suffix + ".aibak")
-                backup.write_text(fpath.read_text())
+                backup.write_text(fpath.read_text(encoding="utf-8"), encoding="utf-8")
             doc["mindMapData"] = new_data
             _atomic_write(fpath, json.dumps(doc, ensure_ascii=False, indent=2))
         except Exception as exc:
@@ -2054,7 +2270,7 @@ def _user_messages_from_jsonl(path: Path) -> list[dict]:
     """
     out = []
     try:
-        lines = path.read_text().splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except Exception:
         return out
     idx = 0

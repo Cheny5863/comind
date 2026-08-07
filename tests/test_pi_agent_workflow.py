@@ -136,7 +136,7 @@ class TestUnsavedNodes:
 
     def test_ops_on_unsaved_node(self, env, tmp_path):
         """磁盘没有 uid=new-1，但 sync 中有 → apply_ops 能操作它。"""
-        md = json.loads((tmp_path / MAP_KEY).read_text())["mindMapData"]
+        md = json.loads((tmp_path / MAP_KEY).read_text(encoding="utf-8"))["mindMapData"]
         root = md["root"]
         root["children"].append(node("new-1", "前端新增"))
         sync(env, md)  # 这里 sync 的是 mindMapData 结构
@@ -146,7 +146,7 @@ class TestUnsavedNodes:
 
     def test_add_child_to_unsaved_node(self, env, tmp_path):
         """在前端新增的未落盘节点下 add 子节点。"""
-        md = json.loads((tmp_path / MAP_KEY).read_text())["mindMapData"]
+        md = json.loads((tmp_path / MAP_KEY).read_text(encoding="utf-8"))["mindMapData"]
         root = md["root"]
         root["children"].append(node("new-1", "前端新增"))
         sync(env, md)
@@ -156,7 +156,7 @@ class TestUnsavedNodes:
 
     def test_delete_unsaved_node(self, env, tmp_path):
         """删除前端新增的未落盘节点。"""
-        md = json.loads((tmp_path / MAP_KEY).read_text())["mindMapData"]
+        md = json.loads((tmp_path / MAP_KEY).read_text(encoding="utf-8"))["mindMapData"]
         root = md["root"]
         root["children"].append(node("new-1", "前端新增"))
         sync(env, md)

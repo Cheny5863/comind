@@ -423,7 +423,21 @@
     if (_es) return;
     _es = new EventSource(api("events"));
     _es.addEventListener("agent_start", () => setStreaming(true));
-    _es.addEventListener("agent_end", () => setStreaming(false));
+    _es.addEventListener("agent_end", (e) => {
+      try {
+        const ev = JSON.parse(e.data || "{}");
+        const msgs = ev.messages || [];
+        const last = msgs[msgs.length - 1] || {};
+        if (last.errorMessage) addBubble("assistant", "[Error] " + esc(last.errorMessage));
+      } catch (_) {}
+      setStreaming(false);
+    });
+    _es.addEventListener("runtime_error", (e) => {
+      try {
+        const ev = JSON.parse(e.data || "{}");
+        if (ev.source === "pi" && ev.message) addBubble("assistant", "[Pi] " + esc(ev.message));
+      } catch (_) {}
+    });
     // On SSE reconnect (browser auto-reconnects), recover state
     _es.addEventListener("open", () => recoverStreamState());
     _es.addEventListener("message_update", (e) => {
@@ -1017,7 +1031,17 @@
       fetch(api("prompt"), {
         method: "POST", headers: { "Content-Type": "application/json", "X-Lang": lang() },
         body: JSON.stringify({ message: msg || t("nodeAssistFallback"), context, branch_uid: _currentBranch }),
-      }).catch(() => {});
+      }).then((r) => {
+        if (!r.ok) {
+          return r.text().then((text) => {
+            addBubble("assistant", "[Error] " + esc(text || r.statusText));
+            setStreaming(false);
+          });
+        }
+      }).catch((err) => {
+        addBubble("assistant", "[Error] " + esc(err && err.message ? err.message : "Request failed"));
+        setStreaming(false);
+      });
     });
   }
   function abortChat() {

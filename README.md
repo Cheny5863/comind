@@ -46,11 +46,45 @@ bash install.sh comind--linux-x64-<版本>.tar.gz
 > 更新：`bash update.sh`（对比版本 → 下载 → sha256 校验 → 备份 → 覆盖 → 重启）
 > 回滚：`~/.comind/backup/app.prev` 保留上一版，手动恢复即可
 
+## Windows 源码部署
+
+```powershell
+# 在仓库根目录执行
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+也可以直接双击 [install.cmd](install.cmd) 或运行 [update.cmd](update.cmd)。Windows 方案会自动完成这些事：
+1. 创建 `.venv` 并安装后端依赖
+2. 安装或复用 Node.js，然后安装 `pi-coding-agent`
+3. 构建前端到 `dist/`，并同步根目录 `index.html`
+4. 启动后端并把日志写到 `%LOCALAPPDATA%\CoMind\comind.log`
+
+日常启动可以直接双击 [start.cmd](start.cmd)，停止服务可以双击 [stop.cmd](stop.cmd)。想要登录 Windows 后自动后台启动，可以运行 [service-install.cmd](service-install.cmd)；取消自启动运行 [service-uninstall.cmd](service-uninstall.cmd)。查看运行状态运行 [status.cmd](status.cmd)，做一次本机冒烟测试运行 [test.cmd](test.cmd)。
+
+Windows 版会把运行数据放在 `%LOCALAPPDATA%\CoMind`：
+- `private\keys.json`：模型 API key
+- `chat-sessions\`：AI 会话
+- `pi-runtime\`：CoMind 自己管理的 pi coding agent
+- `comind.log` / `comind.pid`：日志和进程号
+
+如果环境里有 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 指向 `127.0.0.1:9` 这类失效占位代理，后端会默认不传给 pi，避免 AI 返回 `Connection error`。确实需要让 pi 使用系统代理时，启动前设置 `SMM_PI_USE_SYSTEM_PROXY=1`。
+
+更新时重新执行 [install.ps1](install.ps1) 或 [update.ps1](update.ps1)，脚本会先停掉旧进程再重新构建并启动。
+
+## Windows 发布打包
+
+维护者可以运行 [package-windows.cmd](package-windows.cmd) 生成两类 Windows 包：
+
+- `CoMind-user-<version>-win-x64.zip`：给普通用户，解压后双击 `Start CoMind.cmd` 即可使用，内置 `CoMind.exe`、前端资源、便携 Node 和 pi runtime，不要求用户安装 Python / git / Node。
+- `CoMind-windows-dev-<version>.zip`：给 Windows 开发者或部署者，保留源码和一键脚本，解压后运行 `install.cmd` 即可部署。
+
+Windows 包的使用入口见 [WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md)。详细构建说明、前置要求和离线 Node 包用法见 [WINDOWS_PACKAGING.md](WINDOWS_PACKAGING.md)。
+
 ## 配置模型 Key
 
 1. 打开网页，点击 AI 助理面板右上角 ⚙️
 2. 粘贴 DeepSeek / Kimi 的 API key，点「保存」
-3. 立即生效（key 仅保存在本机 `~/.comind/private/keys.json`，权限 600，不会上传）
+3. 立即生效（key 仅保存在本机 Windows `%LOCALAPPDATA%\CoMind\private\keys.json` / Linux `~/.comind/private/keys.json`，不会上传）
 
 ## 特性一览
 
@@ -94,7 +128,7 @@ pytest                      # 脑图 diff/apply/ops + pi 工作流
 
 **Q: 需要 GPU 吗？** 不需要。AI 推理走 DeepSeek/Kimi 的云端 API。
 
-**Q: 支持 Windows/macOS？** 当前发布包面向 Linux x64；Windows/macOS 可跑源码（后端 + 前端构建）。
+**Q: 支持 Windows/macOS？** 当前发布包面向 Linux x64；Windows 可直接用 [install.ps1](install.ps1) 源码部署，macOS 仍建议按源码方式运行。
 
 **Q: 脑图数据安全吗？** 所有数据存本机，AI 只通过扩展工具读写你授权的脑图。
 

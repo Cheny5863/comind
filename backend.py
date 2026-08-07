@@ -1,23 +1,77 @@
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import json, os, sys, zipfile, datetime, threading
+import json, os, sys, zipfile, datetime, threading, traceback
+import webbrowser
 from pathlib import Path
 
 import chat_service
 
+_NULL_STREAMS = []
+
+
+def _packaged_log_path() -> str:
+    base = (
+        os.environ.get("SMM_LOG_DIR")
+        or os.environ.get("LOCALAPPDATA")
+        or os.path.expanduser("~")
+    )
+    path = os.path.join(base, "CoMind")
+    os.makedirs(path, exist_ok=True)
+    return os.path.join(path, "comind-exe.log")
+
+
+def _ensure_standard_streams() -> None:
+    """PyInstaller --noconsole leaves stdio as None; uvicorn logging expects streams."""
+    global _NULL_STREAMS
+    log_path = _packaged_log_path() if getattr(sys, "frozen", False) else os.devnull
+    if sys.stdin is None:
+        sys.stdin = open(os.devnull, "r", encoding="utf-8", errors="replace")
+        _NULL_STREAMS.append(sys.stdin)
+    if sys.stdout is None:
+        sys.stdout = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+        _NULL_STREAMS.append(sys.stdout)
+    if sys.stderr is None:
+        sys.stderr = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+        _NULL_STREAMS.append(sys.stderr)
+
+
+_ensure_standard_streams()
+
 app = FastAPI()
+
+
+@app.exception_handler(Exception)
+async def json_exception_handler(request: Request, exc: Exception):
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal Server Error. See local CoMind log for details.",
+            "path": str(request.url.path),
+        },
+    )
+
 
 # AI 助理会话管理器（pi --mode rpc 子进程池 + 脑图状态/diff/apply）
 chat_manager = chat_service.ChatSessionManager()
+
+
+@app.on_event("shutdown")
+def _shutdown_cleanup():
+    """后端退出时终止所有 pi 子进程（Windows 上避免孤儿 node 残留）。"""
+    try:
+        chat_manager.shutdown()
+    except Exception:
+        pass
 
 # PyInstaller 打包后资源解压在 _MEIPASS；开发模式为项目根目录
 if getattr(sys, "frozen", False):
     BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-WORKSPACE = os.path.expanduser("~/comind-maps")
+WORKSPACE = os.environ.get("SMM_MAP_DIR") or os.path.expanduser("~/comind-maps")
 
 # 挂载静态资源（目录不存在时跳过——dev/CI 无 dist 构建也能启动；打包后 _MEIPASS 内含 dist/ai-assistant）
 def _mount_static(prefix: str, name: str, directory: str) -> None:
@@ -30,11 +84,26 @@ _mount_static("/dist", "dist", os.path.join(BASE_DIR, "dist"))
 # AI 助理前端资源
 _mount_static("/ai-assistant", "ai-assistant", os.path.join(BASE_DIR, "ai-assistant"))
 
+
+def _resource_path(*parts: str) -> str:
+    """Find packaged resources across PyInstaller and source layouts."""
+    candidates = [os.path.join(BASE_DIR, *parts)]
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        candidates.append(os.path.join(exe_dir, *parts))
+        candidates.append(os.path.join(exe_dir, "_internal", *parts))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
 # 脑图切换器
 @app.get("/map-switcher.js")
 def map_switcher_js():
     from fastapi.responses import FileResponse
-    return FileResponse(os.path.join(BASE_DIR, "map-switcher.js"), media_type="application/javascript")
+    return FileResponse(_resource_path("map-switcher.js"), media_type="application/javascript")
 
 
 # ─── 版本信息（供前端「检查更新」） ───
@@ -160,11 +229,61 @@ def load_from_file(fname):
         raise HTTPException(400, f"不支持的文件类型: {fname} / Unsupported file type: {fname}")
 
 
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+WINDOWS_INVALID_FILENAME_CHARS = set('<>:"/\\|?*')
+
+
+def _validate_windows_filename_stem(stem: str) -> None:
+    if not stem:
+        raise HTTPException(400, "文件名不能为空 / File name is required")
+    if stem.endswith(".") or stem.endswith(" "):
+        raise HTTPException(400, "文件名不能以空格或点结尾 / File name cannot end with a space or dot")
+    bad = sorted({c for c in stem if c in WINDOWS_INVALID_FILENAME_CHARS or ord(c) < 32})
+    if bad:
+        chars = "".join(bad)
+        raise HTTPException(400, f"文件名不能包含这些字符: {chars} / File name contains invalid characters: {chars}")
+    if stem.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
+        raise HTTPException(400, "这是 Windows 保留文件名 / This is a reserved Windows file name")
+
+
+def _normalize_workspace_file_name(
+    name: str,
+    *,
+    allowed_exts: tuple[str, ...] = (".smm.json", ".xmind"),
+    default_ext: str | None = None,
+) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(400, "文件名不能为空 / File name is required")
+    if default_ext and not any(name.endswith(ext) for ext in allowed_exts):
+        name += default_ext
+    _check_map_key(name)
+
+    ext = next((ext for ext in allowed_exts if name.endswith(ext)), None)
+    if not ext:
+        raise HTTPException(400, "不支持的文件类型 / Unsupported file type")
+    _validate_windows_filename_stem(name[:-len(ext)])
+    return name
+
+
+def _normalize_new_map_name(name: str) -> str:
+    return _normalize_workspace_file_name(
+        name,
+        allowed_exts=(".smm.json",),
+        default_ext=".smm.json",
+    )
+
+
 # ─── API ──
 
 @app.post("/api/save_xmind")
 async def api_save_xmind(request: Request, name: str = Query(..., description="文件名")):
     """接收 XMind 二进制 zip 数据，直接写入文件"""
+    name = _normalize_workspace_file_name(name, allowed_exts=(".xmind",), default_ext=".xmind")
     fpath = os.path.join(WORKSPACE, name)
     os.makedirs(WORKSPACE, exist_ok=True)
     body = await request.body()
@@ -179,6 +298,7 @@ def api_list():
 
 @app.get("/api/load")
 def api_load(name: str = Query(..., description="文件名")):
+    name = _normalize_workspace_file_name(name)
     return load_from_file(name)
 
 
@@ -186,16 +306,15 @@ def api_load(name: str = Query(..., description="文件名")):
 def api_ver(name: str = Query(...)):
     """返回脑图当前写版本（AI 写盘次数）。前端画布 load 时初始化、收到
     mindmap_update 时对齐；保存时带版本，后端据此判断前端是否落后。"""
-    _check_map_key(name)
+    name = _normalize_workspace_file_name(name, allowed_exts=(".smm.json",), default_ext=".smm.json")
     return {"version": chat_manager._map_ver.get(name, 0)}
 
 
 @app.post("/api/save")
 def api_save(name: str = Query(...), body: dict = None, version: int = 0):
-    # 确保文件名是 .smm.json
-    if not name.endswith(".smm.json"):
-        name = name.rsplit(".", 1)[0] + ".smm.json"
+    name = _normalize_workspace_file_name(name, allowed_exts=(".smm.json",), default_ext=".smm.json")
     fpath = Path(WORKSPACE) / name
+    os.makedirs(WORKSPACE, exist_ok=True)
     # 与 apply_ops/apply_map 共用 per-map 写锁（写队列串行化）+ 原子写：
     # 防多 session 并发（AI 写盘 vs 前端保存）互相覆盖/截断损坏。
     # 曾因此丢 AI 改动（前端旧画布保存覆盖）并损坏文件（UnicodeDecodeError）
@@ -206,7 +325,7 @@ def api_save(name: str = Query(...), body: dict = None, version: int = 0):
         # version 落后（前端未同步 AI 新增）→ merge 保留磁盘独有节点
         if isinstance(body, dict) and "mindMapData" in body and fpath.is_file():
             try:
-                disk_doc = json.loads(fpath.read_text())
+                disk_doc = json.loads(fpath.read_text(encoding="utf-8"))
                 disk_md = (disk_doc or {}).get("mindMapData") or {}
                 front_md = body["mindMapData"]
                 if isinstance(disk_md, dict) and isinstance(front_md, dict):
@@ -230,8 +349,8 @@ def api_save(name: str = Query(...), body: dict = None, version: int = 0):
 
 @app.post("/api/new")
 def api_new(name: str = Query(..., description="新脑图文件名")):
-    if not name.endswith(".smm.json"):
-        name += ".smm.json"
+    name = _normalize_new_map_name(name)
+    os.makedirs(WORKSPACE, exist_ok=True)
     fpath = os.path.join(WORKSPACE, name)
     if os.path.exists(fpath):
         raise HTTPException(409, f"文件 {name} 已存在 / File {name} already exists")
@@ -257,6 +376,7 @@ def api_new(name: str = Query(..., description="新脑图文件名")):
 
 @app.post("/api/delete")
 def api_delete(name: str = Query(..., description="文件名")):
+    name = _normalize_workspace_file_name(name)
     fpath = os.path.join(WORKSPACE, name)
     if not os.path.exists(fpath):
         raise HTTPException(404, f"文件 {name} 不存在")
@@ -266,6 +386,7 @@ def api_delete(name: str = Query(..., description="文件名")):
 
 @app.post("/api/rename")
 def api_rename(old_name: str = Query(...), new_name: str = Query(...)):
+    old_name = _normalize_workspace_file_name(old_name)
     old_path = os.path.join(WORKSPACE, old_name)
     if not os.path.exists(old_path):
         raise HTTPException(404, f"文件 {old_name} 不存在 / File {old_name} not found")
@@ -275,8 +396,7 @@ def api_rename(old_name: str = Query(...), new_name: str = Query(...)):
         ext = ".xmind"
     else:
         raise HTTPException(400, "不支持的文件类型 / Unsupported file type")
-    if not new_name.endswith(ext):
-        new_name += ext
+    new_name = _normalize_workspace_file_name(new_name, allowed_exts=(ext,), default_ext=ext)
     new_path = os.path.join(WORKSPACE, new_name)
     if os.path.exists(new_path):
         raise HTTPException(409, f"文件 {new_name} 已存在 / File {new_name} already exists")
@@ -456,6 +576,8 @@ def api_keys_post(body: KeysBody):
         chat_service.save_key(body.provider, body.key)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    except OSError as exc:
+        raise HTTPException(500, f"保存 key 失败 / Failed to save key: {exc}")
     chat_service.reload_keys()
     n = chat_manager.restart_all()
     return {"status": "ok", "restarted": n}
@@ -577,7 +699,7 @@ def index():
 @app.get("/editor", response_class=HTMLResponse)
 def editor(name: str = Query("", description="文件名")):
     # 读取原始 index.html 并注入文件名
-    index_path = os.path.join(BASE_DIR, "index.html")
+    index_path = _resource_path("index.html")
     with open(index_path, "r", encoding="utf-8") as f:
         html = f.read()
 
@@ -845,7 +967,7 @@ window.onload = async () => {{
     # 注入脑图切换器 + AI 助理
     ai_js = os.path.join(BASE_DIR, "ai-assistant", "ai-assistant.js")
     ai_ver = int(os.path.getmtime(ai_js)) if os.path.exists(ai_js) else 0
-    switcher_js = os.path.join(BASE_DIR, "map-switcher.js")
+    switcher_js = _resource_path("map-switcher.js")
     switcher_ver = int(os.path.getmtime(switcher_js)) if os.path.exists(switcher_js) else 0
     extra_inject = (
         f'<script src="/map-switcher.js?v={switcher_ver}"></script>'
@@ -1070,7 +1192,7 @@ function onPointerStart(e, wrapper) {
     activeWrapper = null; activeItem = null; return;
   }
 
-  var m = (activeItem.style.transform || '').match(/-?\d+/);
+  var m = (activeItem.style.transform || '').match(/-?\\d+/);
   touchStartOffset = m ? parseInt(m[0]) : 0;
 
   if (openWrapper && openWrapper !== wrapper) {
@@ -1113,7 +1235,7 @@ function onPointerEnd(e) {
   if (longPressFired) { preventClick = true; activeWrapper = null; activeItem = null; return; }
   if (isSwiping && activeItem) {
     preventClick = true;
-    var m = (activeItem.style.transform || '').match(/-?\d+/);
+    var m = (activeItem.style.transform || '').match(/-?\\d+/);
     var total = m ? parseInt(m[0]) : 0;
     activeItem.classList.remove('swiping');
     if (total <= -40) {
@@ -1229,7 +1351,7 @@ function showRenameModal(name) {
   renameTarget = name;
   document.getElementById('renameModal').classList.add('active');
   const input = document.getElementById('renameName');
-  input.value = name.replace(/\.(smm\.json|xmind)$/, '');
+  input.value = name.replace(/\\.(smm\\.json|xmind)$/, '');
   setTimeout(() => { input.focus(); input.select(); }, 100);
 }
 
@@ -1268,7 +1390,9 @@ async function createNew() {
   hideNewModal();
   try {
     const res = await fetch('/api/new?name=' + encodeURIComponent(name), { method: 'POST' });
-    const d = await res.json();
+    const text = await res.text();
+    let d = {};
+    try { d = text ? JSON.parse(text) : {}; } catch (_) { d = { detail: text || res.statusText }; }
     if (res.ok) { openFile(d.name); }
     else { showToast(_L('创建失败: ', 'Create failed: ') + (d.detail || ''), 3000); }
   } catch(e) { showToast(_L('创建失败: ', 'Create failed: ') + e.message, 3000); }
@@ -1287,7 +1411,7 @@ async function loadList() {
     el.innerHTML = files.map(f => {
       const icon = f.ext === 'xmind' ? '🔶' : '🧠';
       const mt = new Date(f.mtime).toLocaleString(_L('zh-CN', 'en-US'), {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
-      const dn = f.name.replace(/\.(smm\.json|xmind)$/, '');
+      const dn = f.name.replace(/\\.(smm\\.json|xmind)$/, '');
       const sz = (f.size/1024).toFixed(0);
       return `<div class="swipe-wrapper" data-name="${encodeURIComponent(f.name)}" ontouchstart="onPointerStart(event,this)" ontouchmove="onPointerMove(event)" ontouchend="onPointerEnd(event)" ontouchcancel="onPointerCancel()" oncontextmenu="onContextMenu(event,this)"><div class="swipe-action-delete" onclick="deleteFile(this.closest('.swipe-wrapper'))">${_L('删除', 'Delete')}</div><div class="file-item" onclick="onItemClick(event,this.closest('.swipe-wrapper'))"><span class="file-icon">${icon}</span><div class="file-info"><div class="file-name">${dn}</div><div class="file-meta">${mt} · ${sz}KB</div></div><span class="file-ext">${f.ext}</span></div></div>`;
     }).join('');
@@ -1319,4 +1443,6 @@ loadList();
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("SMM_PORT", "8789"))
+    if getattr(sys, "frozen", False) and os.environ.get("SMM_NO_BROWSER") != "1":
+        threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
     uvicorn.run(app, host="0.0.0.0", port=port)

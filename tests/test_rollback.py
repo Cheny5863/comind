@@ -147,7 +147,7 @@ class TestTurnsStore:
             json.dumps({"type": "message", "id": "m1", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}}),
             json.dumps({"type": "message", "id": "m2", "message": {"role": "assistant", "content": []}}),
             json.dumps({"type": "message", "id": "m3", "message": {"role": "user", "content": [{"type": "text", "text": "hi2"}]}}),
-        ]))
+        ]), encoding="utf-8")
         assert _user_message_count(f) == 2
 
 
@@ -217,7 +217,7 @@ class TestParseNodeAssist:
 class TestUserMessagesQuoted:
     def _session(self, tmp_path, lines):
         f = tmp_path / "s.jsonl"
-        f.write_text("\n".join(lines))
+        f.write_text("\n".join(lines), encoding="utf-8")
         return f
 
     def test_pure_quote_strips_prefix_and_note_line(self, tmp_path):
@@ -266,7 +266,7 @@ class TestListTurnsAndRollbackQuoted:
                         "content": "[NODE_ASSIST uid=abc] 用户在节点「多模态融合」上求助\n（引用节点求助）"}}),
             json.dumps({"type": "message", "message": {"role": "user",
                         "content": "[NODE_ASSIST uid=xyz] 用户在节点「损失函数」上求助\n帮我展开"}}),
-        ]))
+        ]), encoding="utf-8")
         be.chat_manager._mapping["test.smm.json"] = sf
         turns = be.chat_manager.list_turns("test.smm.json")
         assert len(turns) == 3
@@ -287,7 +287,7 @@ class TestListTurnsAndRollbackQuoted:
             json.dumps({"type": "message", "message": {"role": "user", "content": "第一轮"}}),
             json.dumps({"type": "message", "message": {"role": "user",
                         "content": "[NODE_ASSIST uid=abc] 用户在节点「节点A」上求助\n（引用节点求助）"}}),
-        ]))
+        ]), encoding="utf-8")
         be.chat_manager._mapping["test.smm.json"] = sf
         # 回滚到第 2 轮（引用轮次）之前 → 截断后只剩第 1 轮
         res = be.chat_manager.rollback("test.smm.json", "", 2)
@@ -306,7 +306,7 @@ class TestListTurnsAndRollbackQuoted:
             json.dumps({"type": "message", "message": {"role": "user", "content": "第一轮"}}),
             json.dumps({"type": "message", "message": {"role": "user",
                         "content": "[NODE_ASSIST uid=a-1] 用户在节点「节点A」上求助\n（引用节点求助）"}}),
-        ]))
+        ]), encoding="utf-8")
         be.chat_manager._mapping["test.smm.json"] = sf
         res = be.chat_manager.rollback("test.smm.json", "", 2)
         assert res["ok"] is True
@@ -324,7 +324,7 @@ class TestListTurnsAndRollbackQuoted:
             json.dumps({"type": "message", "message": {"role": "user", "content": "第一轮"}}),
             json.dumps({"type": "message", "message": {"role": "user",
                         "content": "[NODE_ASSIST uid=a-1] 用户在节点「节点A」上求助\n引用节点（消息中的 [引用N] 占位符指代这里的节点）：\n[引用1] uid=a-1 「节点A」\n[引用2] uid=ghost 「不存在的节点」\n这个 [引用1] 和 [引用2] 对比一下"}}),
-        ]))
+        ]), encoding="utf-8")
         be.chat_manager._mapping["test.smm.json"] = sf
         res = be.chat_manager.rollback("test.smm.json", "", 2)
         assert res["ok"] is True

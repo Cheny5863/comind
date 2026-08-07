@@ -292,7 +292,7 @@ def test_has_history_semantics(env):
     import backend as be
     # 用 mapping 指向一个真实带 user 消息的 session 文件
     fake_sf = str(Path(be.chat_service.SESSION_DIR) / "fake_hist.smm.jsonl")
-    Path(fake_sf).write_text('{"type":"message","message":{"role":"user","content":"hi"}}\n')
+    Path(fake_sf).write_text('{"type":"message","message":{"role":"user","content":"hi"}}\n', encoding="utf-8")
     be.chat_manager._mapping[MAP_KEY + "::a-1-1"] = fake_sf
     ag = [a for a in client.get(f"/api/chat/{MAP_KEY}/agents").json() if a["branch_uid"] == "a-1-1"]
     assert ag and ag[0]["has_history"] is True
@@ -311,10 +311,12 @@ def test_all_sessions_flat_sorted_with_branch_tags(env):
     branch_sf = str(sd / (safe_key_slug(MAP_KEY) + "__a-1-1__new.jsonl"))
     # 消息时间：root 旧（2026-07-01），分支新（2026-07-02）
     Path(root_sf).write_text(
-        '{"type":"message","message":{"role":"user","content":"r"},"timestamp":"2026-07-01T00:00:00.000Z"}\n'
+        '{"type":"message","message":{"role":"user","content":"r"},"timestamp":"2026-07-01T00:00:00.000Z"}\n',
+        encoding="utf-8",
     )
     Path(branch_sf).write_text(
-        '{"type":"message","message":{"role":"user","content":"b"},"timestamp":"2026-07-02T00:00:00.000Z"}\n'
+        '{"type":"message","message":{"role":"user","content":"b"},"timestamp":"2026-07-02T00:00:00.000Z"}\n',
+        encoding="utf-8",
     )
     # 文件 mtime 故意设成相反（root 新、分支旧）——验证排序用的是消息时间而非 mtime
     old_t = 2000.0
@@ -350,7 +352,8 @@ def test_session_modified_is_last_message_ts(env):
     Path(sf).write_text(
         '{"type":"session","timestamp":"2026-07-01T00:00:00.000Z"}\n'
         '{"type":"message","message":{"role":"user","content":"a"},"timestamp":"2026-07-03T12:00:00.000Z"}\n'
-        '{"type":"model_change","timestamp":"2026-07-04T00:00:00.000Z"}\n'
+        '{"type":"model_change","timestamp":"2026-07-04T00:00:00.000Z"}\n',
+        encoding="utf-8",
     )
     # 文件 mtime 设为 2026-07-05（比最后消息晚）——验证不采用 mtime
     later = 1783209600.0  # 2026-07-05
@@ -381,10 +384,13 @@ def test_old_session_branch_slug_fallback(env):
     # 旧分支 session：文件名 slug 来自 safe_key_slug(uid)[:8]，a-1-1 保留 - 仍是 "a-1-1"
     slug = "a-1-1"
     old_sf = str(sd / (prefix + slug + "__old.jsonl"))
-    Path(old_sf).write_text('{"type":"message","message":{"role":"user","content":"old"}}\n')
+    Path(old_sf).write_text('{"type":"message","message":{"role":"user","content":"old"}}\n', encoding="utf-8")
     # mapping 里只有 root 和另一个活跃分支
     be.chat_manager._mapping[MAP_KEY] = str(sd / (prefix + "root.jsonl"))
-    Path(be.chat_manager._mapping[MAP_KEY]).write_text('{"type":"message","message":{"role":"user","content":"r"}}\n')
+    Path(be.chat_manager._mapping[MAP_KEY]).write_text(
+        '{"type":"message","message":{"role":"user","content":"r"}}\n',
+        encoding="utf-8",
+    )
     items = client.get(f"/api/chat/{MAP_KEY}/all_sessions").json()
     old_it = next(i for i in items if i["file"] == old_sf)
     # slug 前缀匹配 a-1-1 节点 → 应标为分支 a-1-1，不是 root

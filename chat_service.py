@@ -152,11 +152,13 @@ def _background_text(map_key: str) -> str:
     return ""
 
 
-def _display_label(label: str, max_len: int = 5) -> str:
+def _display_label(label: str, max_len: int = 20) -> str:
     """给用户 UI 看的分支名：前 max_len 个字符，超出加省略号。
 
     与 _branch_label（给 AI system prompt 的完整名）分开：AI 需要全名
-    理解上下文，用户界面只显示短标签避免撑爆面板。
+    理解上下文，用户界面显示适度短标签。默认 20 字（2026-08-05 从 5 提上来：
+    5 字太短，"ART Hook" 都被砍成 "ART H…"；超长标题由前端 CSS
+    max-width 140px + ellipsis 兜底截断，双保险）。
     """
     if not label:
         return label
@@ -165,14 +167,16 @@ def _display_label(label: str, max_len: int = 5) -> str:
     return label[:max_len] + "…"
 
 
-def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> str:
+def _branch_label(map_key: str, branch_uid: str, state: dict | None = None, lang: str = "zh") -> str:
     """取分支根节点的文本标签，用于注入 system prompt 分支职责说明。
 
     磁盘优先（用户手动编辑/AI 改图最终都落盘，磁盘是权威；_map_state
     快照只在 sync/apply 时更新，会过期），state 兜底（覆盖磁盘上还不存在
-    的新节点——用户在 UI 新建未保存）。都找不到返回 uid 本身。
+    的新节点——用户在 UI 新建未保存）。两处都找不到 = 分支节点已被删除，
+    返回「已删除」标记（按 lang 中英文），不再显示 uid 本身；
+    节点存在但文本为空时仍退回 uid（罕见，保留可追踪性）。
     """
-    label = branch_uid
+    found = False
     try:
         # 磁盘优先
         fpath = Path(PROJECT_CWD) / map_key
@@ -184,6 +188,7 @@ def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> s
                 idx = _index_by_uid(root)
                 node = idx.get(branch_uid)
                 if node and isinstance(node.get("data"), dict):
+                    found = True
                     t = _strip_html(node["data"].get("text", ""))
                     if t:
                         return t[:40]
@@ -194,12 +199,40 @@ def _branch_label(map_key: str, branch_uid: str, state: dict | None = None) -> s
                 idx = _index_by_uid(root)
                 node = idx.get(branch_uid)
                 if node and isinstance(node.get("data"), dict):
+                    found = True
                     t = _strip_html(node["data"].get("text", ""))
                     if t:
                         return t[:40]
     except Exception:
         pass
-    return label
+    if not found:
+        return "Deleted" if (lang or "").startswith("en") else "已删除"
+    return branch_uid
+
+
+def _branch_deleted(map_key: str, branch_uid: str, state: dict | None = None) -> bool:
+    """分支节点是否已被删除（磁盘 + _map_state 都找不到）。
+
+    与 _branch_label 的查找范围一致，但返回布尔标记而不是本地化文本——
+    UI 文案由前端 I18N 字典翻译（项目习惯），后端只负责给标记。
+    """
+    try:
+        # 磁盘优先
+        fpath = Path(PROJECT_CWD) / map_key
+        if map_key.endswith(".smm.json") and fpath.is_file():
+            doc = json.loads(fpath.read_text())
+            md = doc.get("mindMapData") or {}
+            root = _state_root(md)
+            if isinstance(root, dict) and branch_uid in _index_by_uid(root):
+                return False
+        # state 兜底
+        if state:
+            root = _state_root(state)
+            if isinstance(root, dict) and branch_uid in _index_by_uid(root):
+                return False
+    except Exception:
+        pass
+    return True
 
 
 # provider id → 环境变量名（也用作 private/keys.json 的键名）
@@ -397,6 +430,11 @@ class ChatSession:
         # 进行中回合的事件缓冲：页面刷新/SSE 重连时重放，
         # 让前端恢复流式状态和已输出的内容。回合结束清空。
         self._buffer: deque[str] = deque(maxlen=2000)
+        # 最近一次 mindmap_update 事件（AI 改图广播）。与 _buffer 不同：
+        # _buffer 只缓存 pi 回合事件，mindmap_update 不进 _buffer；SSE 重连时
+        # 若只重放 _buffer，重连窗口期的改图广播会永久丢失（前端画布不更新，
+        # 直到手动刷新）。subscribe(replay=True) 时重放它兜底。
+        self.last_map_event: str | None = None
         self.last_active = time.time()
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -436,7 +474,7 @@ class ChatSession:
         # 分支职责：绑定分支的 agent 只能改自己的分支，root agent 管全图
         if self.branch_uid:
             state = (self._map_state or {}).get(self.map_key)
-            branch_label = _branch_label(self.map_key, self.branch_uid, state)
+            branch_label = _branch_label(self.map_key, self.branch_uid, state, self.lang)
             system_prompt += (
                 "\n\n## 你负责的分支（重要）\n\n"
                 f"你绑定在脑图的分支「{branch_label}」（根节点 uid={self.branch_uid}）上工作。\n"
@@ -601,6 +639,13 @@ class ChatSession:
                     q.put_nowait(line)
                 except Exception:
                     break
+            # 重放最近一次 AI 改图广播（重连窗口期的 mindmap_update 兜底，
+            # 否则前端画布停在旧状态直到手动刷新才看到 AI 改动）
+            if self.last_map_event:
+                try:
+                    q.put_nowait(self.last_map_event)
+                except Exception:
+                    pass
         self.listeners.append(q)
         return q
 
@@ -832,7 +877,7 @@ class ChatSessionManager:
         try:
             while True:
                 try:
-                    line = q.get(timeout=30)
+                    line = q.get(timeout=10)
                 except Empty:
                     yield "event: ping\ndata: {}\n\n"
                     continue
@@ -954,6 +999,7 @@ class ChatSessionManager:
         """
         prefix = safe_key_slug(map_key) + "__"
         sessions = []
+        root = _state_root(self._map_state.get(map_key))
         for f in SESSION_DIR.glob(f"{prefix}*.jsonl"):
             try:
                 stem = f.name[len(prefix):]
@@ -966,6 +1012,23 @@ class ChatSessionManager:
                     branch_uid = self._branch_uid_for_file(map_key, str(f))
                 text = f.read_text(encoding="utf-8")
                 user_count = text.count('"role": "user"') + text.count('"role":"user"')
+                # 跟随对焦目标：从最新一轮往回找第一个有实际改动（且节点仍在
+                # 树里）的轮次，取其改动批次的根节点 uid；全部没有则空（前端
+                # 退回 session 绑定分支）。数据源 = turns（持久化，重启不丢）
+                focus_uid = ""
+                focus_uids: list[str] = []
+                uid_index = _index_by_uid(root) if root else {}
+                for turn in reversed(_load_turns(str(f))):
+                    diff = turn.get("diff") or []
+                    uids = [d.get("uid") for d in diff
+                            if d.get("uid") and d.get("uid") in uid_index]
+                    if not uids:
+                        continue
+                    focus_uids = uids
+                    focus_uid = _lca_uid(uids, root)
+                    if focus_uid:
+                        break
+                branch_lang = self._lang_pref.get(session_key(map_key, branch_uid), "zh")
                 sessions.append({
                     "file": str(f),
                     "name": f.stem,
@@ -974,9 +1037,12 @@ class ChatSessionManager:
                     "user_messages": user_count,
                     "streaming": self._session_streaming(map_key, str(f), branch_uid),
                     "branch_uid": branch_uid,
-                    "branch_label": _branch_label(map_key, branch_uid, self._map_state.get(map_key)) if branch_uid else "",
+                    "focus_uid": focus_uid,
+                    "focus_uids": focus_uids,
+                    "deleted": _branch_deleted(map_key, branch_uid, self._map_state.get(map_key)) if branch_uid else False,
+                    "branch_label": _branch_label(map_key, branch_uid, self._map_state.get(map_key), branch_lang) if branch_uid else "",
                     "display_label": _display_label(
-                        _branch_label(map_key, branch_uid, self._map_state.get(map_key))
+                        _branch_label(map_key, branch_uid, self._map_state.get(map_key), branch_lang)
                     ) if branch_uid else "",
                 })
             except Exception:
@@ -1059,6 +1125,7 @@ class ChatSessionManager:
         root_sf = self._mapping.get(map_key)
         agents[""] = {
             "branch_uid": "",
+            "deleted": False,
             "label": "",
             "display_label": "",
             "session_file": root_sf,
@@ -1072,9 +1139,10 @@ class ChatSessionManager:
             if mkey != map_key or not b:
                 continue
             sess = self._sessions.get(skey)
-            full = _branch_label(map_key, b, self._map_state.get(map_key))
+            full = _branch_label(map_key, b, self._map_state.get(map_key), self._lang_pref.get(skey, "zh"))
             agents[b] = {
                 "branch_uid": b,
+                "deleted": _branch_deleted(map_key, b, self._map_state.get(map_key)),
                 "label": full,
                 "display_label": _display_label(full),
                 "session_file": sf,
@@ -1335,6 +1403,7 @@ class ChatSessionManager:
         session_file = sess.session_file if sess and sess.session_file else self._mapping.get(skey)
         if not session_file or not Path(session_file).is_file():
             return {"ok": False, "error": "session 不存在"}
+        before_state = self._map_state.get(map_key)
         turns = _load_turns(session_file)
         # 1. 直接 kill pi（回滚语义 = 回到那轮之前，正在进行的回复本就该丢弃）
         if sess and sess.alive:
@@ -1414,6 +1483,8 @@ class ChatSessionManager:
             # 前端用它直接 setData 刷新画布——SSE 广播在 kill 后靠 EventSource
             # 自动重连不可靠（重连晚于广播，旧 queue 已 unsub），响应带树最稳。
             "tree": new_root if map_restored else None,
+            # 回滚净变化（相对回滚前），前端用来展示 "+N -M" 动画
+            "stats": _map_uid_stats(before_state, self._map_state.get(map_key)),
         }
 
 
@@ -1901,6 +1972,94 @@ def _merge_save_tree(disk_root: dict, front_root: dict) -> dict:
     }
 
 
+def _lca_uid(uids: list[str], root: dict | None) -> str:
+    """给定一批节点 uid，返回它们的最小公共祖先（含自身）的 uid；找不到返回空。
+
+    用于切换 session 时对焦到『最近一次改图那批节点的根节点』：
+    - 单节点 → 它自己
+    - 同一分支内多个节点 → 包含它们的最小子树根
+    - 节点已被删除 / 不在树里 → 跳过（全跳过则返回空）
+    """
+    if not uids or root is None:
+        return ""
+    parent: dict[str, str] = {}
+
+    def walk(n: dict, p: str) -> None:
+        uid = (n.get("data") or {}).get("uid") or ""
+        if uid:
+            parent[uid] = p
+        for c in n.get("children") or []:
+            walk(c, uid)
+
+    walk(root, "")
+    chains: list[list[str]] = []
+    for u in uids:
+        chain, cur = [], u
+        while cur and cur in parent:
+            chain.append(cur)
+            cur = parent[cur]
+        if chain:
+            chains.append(chain)
+    if not chains:
+        return ""
+    base = chains[0]
+    others = [set(c) for c in chains[1:]]
+    for n in base:  # 自身 → 根，第一个同时出现在所有链里的就是最深公共祖先
+        if all(n in s for s in others):
+            return n
+    return ""
+
+
+def _map_uid_stats(old_state, new_state) -> dict:
+    """对比两次 mindMapData 状态的 uid 集合，统计 added/removed/updated 数量。
+
+    前端 mindmap_update 用它显示 "+N -M" 动画提示；updated 按 data.text 变化粗算。
+    """
+    old_root = _state_root(old_state) if old_state else None
+    new_root = _state_root(new_state)
+    old_idx = _index_by_uid(old_root) if old_root else {}
+    new_idx = _index_by_uid(new_root)
+    old_uids = set(old_idx)
+    new_uids = set(new_idx)
+    added = len(new_uids - old_uids)
+    removed = len(old_uids - new_uids)
+    updated = 0
+    for uid in old_uids & new_uids:
+        ot = (old_idx.get(uid) or {}).get("data", {}).get("text")
+        nt = (new_idx.get(uid) or {}).get("data", {}).get("text")
+        if ot != nt:
+            updated += 1
+    return {"added": added, "removed": removed, "updated": updated}
+
+
+def _broadcast_map_update(manager: ChatSessionManager, key: str, new_data: dict, old_state: dict | None, source: str = "ai", branch_uid: str = "") -> None:
+    """广播 mindmap_update 给同脑图的所有 SSE 会话（root + 各分支）。
+
+    当前只由 AI 写盘（_commit_map）调用：让并行工作的其他 agent 前端
+    实时看到结构变化。带 ver 供前端对齐画布版本，带 stats 供前端播放
+    修改提示，带 branch（写者分支）供前端区分「本会话自己的改图」vs
+    「其他分支的改图」——气泡提示只在来源匹配当前选中会话时显示。
+    ⚠️ 不要给前端人类保存广播（v0.1.25 实测：广播回自己会触发 updateData
+    重建画布，折叠弹开/Tab 节点被删）。
+    """
+    stats = _map_uid_stats(old_state, new_data)
+    event = json.dumps(
+        {"type": "mindmap_update", "tree": new_data.get("root"),
+         "ver": manager._map_ver[key], "stats": stats, "source": source,
+         "branch": branch_uid},
+        ensure_ascii=False,
+    )
+    for skey, sess in list(manager._sessions.items()):
+        if skey == key or skey.startswith(key + "::"):
+            # 缓存最近一次改图广播：SSE 重连时 subscribe(replay) 重放兜底
+            sess.last_map_event = event
+            for q in list(sess.listeners):
+                try:
+                    q.put_nowait(event)
+                except Exception:
+                    pass
+
+
 def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict, branch_uid: str = "") -> None:
     """提交新 mindMapData：更新内存、备份、落盘、SSE 广播。
 
@@ -1908,6 +2067,7 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
     （自己改的不会重复出现在自己的 diff 里）；其他 agent 的快照不动，
     这样它们下一次 get_mindmap_diff 能看到本次变化（多 agent 协作关键）。
     """
+    old_state = manager._map_state.get(key)
     manager._map_state[key] = new_data
     manager._map_ver[key] = manager._map_ver.get(key, 0) + 1
     writer_key = session_key(key, branch_uid)
@@ -1926,17 +2086,9 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
             # agent 以为更新了实际丢失——用 error 级别留痕
             logger.error("persist %s failed: %s", key, exc)
     # 广播 mindmap_update 给同脑图的所有 agent 会话（root + 各分支），
-    # 让并行工作的其他 agent 前端实时看到结构变化；带 ver 供前端对齐画布版本
-    event = json.dumps(
-        {"type": "mindmap_update", "tree": new_data.get("root"), "ver": manager._map_ver[key]}, ensure_ascii=False
-    )
-    for skey, sess in list(manager._sessions.items()):
-        if skey == key or skey.startswith(key + "::"):
-            for q in list(sess.listeners):
-                try:
-                    q.put_nowait(event)
-                except Exception:
-                    pass
+    # 让并行工作的其他 agent 前端实时看到结构变化；带 ver 供前端对齐画布版本，
+    # 带 stats 供前端播放 "+N -M" 修改动画（不闪的增量更新提示）
+    _broadcast_map_update(manager, key, new_data, old_state, source="ai", branch_uid=branch_uid)
 
 
 def apply_map(manager: ChatSessionManager, key: str, tree: dict, branch_uid: str = "") -> str | None:

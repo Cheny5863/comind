@@ -317,34 +317,80 @@ def api_save(name: str = Query(...), body: dict = None, version: int = 0):
     os.makedirs(WORKSPACE, exist_ok=True)
     # 与 apply_ops/apply_map 共用 per-map 写锁（写队列串行化）+ 原子写：
     # 防多 session 并发（AI 写盘 vs 前端保存）互相覆盖/截断损坏。
-    # 曾因此丢 AI 改动（前端旧画布保存覆盖）并损坏文件（UnicodeDecodeError）
     lock = chat_manager._write_locks.setdefault(name, threading.Lock())
     with lock:
-        # 锁内读磁盘 → 判断前端画布版本是否落后 → 原子写。
-        # version 一致（前端看到全部 AI 改动）→ 直接覆盖，用户删除/移动/顺序是真实意图；
-        # version 落后（前端未同步 AI 新增）→ merge 保留磁盘独有节点
-        if isinstance(body, dict) and "mindMapData" in body and fpath.is_file():
+        # ⚠️ 版本号只反映 mindMapData 内容变化（2026-08-05 核心修复）：
+        # 前端多条路径都调 /api/save——data_change(用户编辑)、
+        # view_data_change(拖拽/缩放/折叠，300ms debounce)、saveMindMapConfig(主题/布局)。
+        # 若任何保存都 +1，A 拖一下视图 B 没动也"落后"→ 误弹"其他设备修改"。
+        # 正确语义：内容没变（view/config/回声保存）→ 版本不递增，只更新磁盘。
+        cur_ver = chat_manager._map_ver.get(name, 0)
+        disk_doc = None
+        disk_read_failed = False
+        if fpath.is_file():
             try:
                 disk_doc = json.loads(fpath.read_text(encoding="utf-8"))
-                disk_md = (disk_doc or {}).get("mindMapData") or {}
-                front_md = body["mindMapData"]
-                if isinstance(disk_md, dict) and isinstance(front_md, dict):
-                    disk_root = disk_md.get("root", disk_md) if isinstance(disk_md.get("root"), dict) else disk_md
-                    front_root = front_md.get("root", front_md) if isinstance(front_md.get("root"), dict) else front_md
-                    if isinstance(disk_root, dict) and isinstance(front_root, dict):
-                        cur_ver = chat_manager._map_ver.get(name, 0)
-                        if version < cur_ver and not chat_service._front_covers_disk(front_root, disk_root):
-                            merged_md = dict(disk_md)
-                            merged_md["root"] = chat_service._merge_save_tree(disk_root, front_root)
-                            body = dict(body)
-                            body["mindMapData"] = merged_md
             except Exception:
-                pass  # 磁盘读失败（损坏）→ 直接用前端树覆盖重建
+                disk_doc = None
+                disk_read_failed = True  # 磁盘读失败 → 放行覆盖重建（不误判 conflict）
+        body_md = (body or {}).get("mindMapData") if isinstance(body, dict) else None
+        disk_md = (disk_doc or {}).get("mindMapData") if isinstance(disk_doc, dict) else None
+        # ⚠️ 比较时排除纯 UI 状态（2026-08-06 多端 false conflict 根治）：
+        # - 顶层 view：视口滚动/缩放，每台设备不同
+        # - 树节点 data.isActive：当前选中节点，每台设备不同
+        # - 树节点 data.expand：折叠/展开状态，每台设备不同
+        # 这些字段变化不算"内容修改"，不应递增版本号。
+        # 顶层 smmVersion 也排除（copyRenderTree 可能注入）。
+        _UI_TOP_KEYS = {'view'}
+        _UI_DATA_KEYS = {'isActive', 'expand'}
+        _UI_NODE_KEYS = {'smmVersion'}
+        def _strip_ui(md):
+            """深拷贝 mindMapData，剥离纯 UI 状态字段后用于比较"""
+            if not isinstance(md, dict):
+                return md
+            result = {}
+            for k, v in md.items():
+                if k in _UI_TOP_KEYS:
+                    continue
+                if k == 'root' and isinstance(v, dict):
+                    result[k] = _strip_ui_node(v)
+                else:
+                    result[k] = v
+            return result
+        def _strip_ui_node(node):
+            if not isinstance(node, dict):
+                return node
+            out = {}
+            for k, v in node.items():
+                if k in _UI_NODE_KEYS:
+                    continue
+                if k == 'data' and isinstance(v, dict):
+                    out[k] = {dk: dv for dk, dv in v.items() if dk not in _UI_DATA_KEYS}
+                elif k == 'children' and isinstance(v, list):
+                    out[k] = [_strip_ui_node(c) for c in v]
+                else:
+                    out[k] = v
+            return out
+        content_changed = _strip_ui(body_md) != _strip_ui(disk_md)
+
+        if content_changed and version < cur_ver and not disk_read_failed:
+            # 真修改 + 版本落后（另一设备/AI 已写盘更新）→ 拒绝保存，
+            # 返回最新树让前端自动刷新。陈旧端保存永远覆盖不了活跃端成果。
+            disk_root = (disk_md or {}).get("root", disk_md) if isinstance(disk_md, dict) else disk_md
+            return {
+                "status": "conflict",
+                "version": cur_ver,
+                "tree": disk_root,
+            }
+        # 写盘（内容没变时也写：view/config 变化需要落盘，但版本不递增）
         chat_service._atomic_write(fpath, json.dumps(body, ensure_ascii=False, indent=2))
         # 保持内存态与磁盘一致：后续 AI 的 diff/apply 基于保存后的树
         if isinstance(body, dict) and "mindMapData" in body:
             chat_manager._map_state[name] = body["mindMapData"]
-    return {"status": "ok", "name": name}
+        if content_changed:
+            # 只有内容真正变化才递增版本号
+            chat_manager._map_ver[name] = cur_ver + 1
+    return {"status": "ok", "name": name, "version": chat_manager._map_ver.get(name, 0)}
 
 
 @app.post("/api/new")
@@ -869,18 +915,20 @@ const getDataFromBackend = async () => {{
 
 // 画布写版本：AI 写盘时后端版本 +1（SSE mindmap_update 带 ver 更新）；
 // 保存时带版本，后端据此判断画布是否落后（防旧画布覆盖 AI 改动）
-window.__comindMapVer = 0;
-try {{
-  fetch('/api/ver?name=' + encodeURIComponent(window.currentFileName))
-    .then(function(r) {{ return r.json(); }})
-    .then(function(d) {{ window.__comindMapVer = d.version || 0; }})
-    .catch(function() {{}});
-}} catch (e) {{}}
+// ⚠️ 版本号必须同步注入（服务端渲染）——异步 fetch 有竞态：
+// 页面初始化触发 data_change 自动保存时 version 还是 0 → 后端误判冲突 → 覆盖用户数据
+window.__comindMapVer = {chat_manager._map_ver.get(name, 0)};
 
 const setTakeOverAppMethods = (data) => {{
   window.takeOverAppMethods = {{}};
   window.takeOverAppMethods.getMindMapData = () => data.mindMapData;
   window.takeOverAppMethods.saveMindMapData = async (d) => {{
+    // ⚠️ 回声保存抑制（双人协作死循环修复）：updateData 同步画布时会触发
+    // data_change → 自动保存（内容=服务端推来的树，与磁盘一致）。若不抑制，
+    // 每次 conflict/AI 广播后的 updateData 都会回声保存 → 版本无意义 +1 →
+    // 另一设备永远落后 → 每次都 conflict → 疯狂弹"其他设备修改"。
+    // 抑制窗口内（updateData 同步调用链）跳过自动保存，版本只在真实编辑时递增。
+    if (window.__comindSuppressSave) return;
     if (window.currentFileExt === 'xmind') {{
       // 使用原生 ExportXMind 插件导出为 XMind zip
       if (!mindMapInstance) {{ alert(_L('编辑器尚未初始化', 'Editor not initialized')); return; }}
@@ -900,20 +948,53 @@ const setTakeOverAppMethods = (data) => {{
       }}
       const current = await (await fetch('/api/load?name=' + encodeURIComponent(window.currentFileName))).json();
       current.mindMapData = d;
-      await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName) + '&version=' + (window.__comindMapVer || 0), {{
+      const resp = await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName) + '&version=' + (window.__comindMapVer || 0), {{
         method: 'POST', headers: {{'Content-Type':'application/json'}},
         body: JSON.stringify(current)
       }});
+      const j = await resp.json().catch(() => ({{}}));
+      if (j && j.status === 'conflict') {{
+        // 乐观锁冲突：画布是陈旧视图（另一设备/AI 已更新）→ 自动刷新为最新树
+        window.__comindMapVer = j.version || 0;
+        if (j.tree && mindMapInstance) {{
+          // 抑制回声保存：updateData 会触发 data_change → 自动保存，若不禁
+          // 会把刚同步的树再保存一次 → 版本 +1 → 对方设备永远落后（死循环）
+          window.__comindSuppressSave = true;
+          try {{
+            mindMapInstance.updateData(j.tree);
+          }} finally {{
+            window.__comindSuppressSave = false;
+          }}
+        }}
+        try {{
+          const hint = _L('检测到其他设备的修改，画布已刷新为最新版本', 'Detected changes from another device, canvas refreshed to latest');
+          if (window.toast) window.toast(hint); else alert(hint);
+        }} catch (e) {{}}
+        return;
+      }}
+      // 保存成功 → 后端版本已递增，本地对齐（否则下次保存仍带旧版本号，
+      // 被误判"落后"触发冲突；多端并发时也保证本地版本与磁盘一致）
+      if (typeof j.version === 'number') window.__comindMapVer = j.version;
     }}
   }};
   window.takeOverAppMethods.getMindMapConfig = () => data.mindMapConfig;
   window.takeOverAppMethods.saveMindMapConfig = async (c) => {{
-    const current = await (await fetch('/api/load?name=' + encodeURIComponent(window.currentFileName))).json();
-    current.mindMapConfig = c;
-    await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName) + '&version=' + (window.__comindMapVer || 0), {{
-      method: 'POST', headers: {{'Content-Type':'application/json'}},
-      body: JSON.stringify(current)
-    }});
+    // config 是追加修改（主题/布局），乐观锁冲突时重试一次（重新加载最新再保存）
+    for (let attempt = 0; attempt < 3; attempt++) {{
+      const current = await (await fetch('/api/load?name=' + encodeURIComponent(window.currentFileName))).json();
+      current.mindMapConfig = c;
+      const resp = await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName) + '&version=' + (window.__comindMapVer || 0), {{
+        method: 'POST', headers: {{'Content-Type':'application/json'}},
+        body: JSON.stringify(current)
+      }});
+      const j = await resp.json().catch(() => ({{}}));
+      if (j && j.status === 'conflict') {{
+        window.__comindMapVer = j.version || 0;
+        continue;  // 重试：基于最新磁盘再写 config
+      }}
+      if (typeof j.version === 'number') window.__comindMapVer = j.version;
+      return;
+    }}
   }};
   window.takeOverAppMethods.getLanguage = () => {{
     // 语言偏好的唯一来源：localStorage（全局，非 per-file）

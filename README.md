@@ -1,7 +1,7 @@
 <h1 align="center">CoMind · AI 协作脑图</h1>
 
 <p align="center">
-  <b>把握全局，精准地与 AI Agent 协作</b><br>
+  <b>掌控全局，精准沟通</b><br>
   <a href="./README_EN.md">English</a> | 中文
 </p>
 

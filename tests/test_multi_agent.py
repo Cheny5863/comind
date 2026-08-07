@@ -248,15 +248,16 @@ def test_agents_list(env):
     assert any(a["branch_uid"] == "" for a in agents)      # root
     assert any(a["branch_uid"] == "a-1" for a in agents)   # 分支 A
     assert any(a["label"] == "节点A" for a in agents)      # 分支标签从脑图取
-    assert any(a["display_label"] == "节点A" for a in agents)  # 5 字内不截断
+    assert any(a["display_label"] == "节点A" for a in agents)  # 短标签不截断
 
 
 def test_display_label_truncate(env):
-    """display_label：超过 5 字截断加省略号，label 保留完整。"""
+    """display_label：超过 20 字截断加省略号，label 保留完整。"""
     import chat_service as cs
     assert cs._display_label("短") == "短"
     assert cs._display_label("恰好五个字") == "恰好五个字"
-    assert cs._display_label("超过五个字的完整分支名") == "超过五个字…"
+    assert cs._display_label("x" * 20) == "x" * 20  # 20 字内完整
+    assert cs._display_label("x" * 25) == "x" * 20 + "…"  # 超过 20 截断
     assert cs._display_label("") == ""
 
 
@@ -273,7 +274,7 @@ def test_reset_new_branch_appears_in_agents(env):
     agents = client.get(f"/api/chat/{MAP_KEY}/agents").json()
     branch_agent = [a for a in agents if a["branch_uid"] == "a-1-1"]
     assert len(branch_agent) == 1, f"新分支未出现在 agents 列表: {agents}"
-    # label 应为节点可读文本（节点A1），display_label 前 5 字；绝不能是 uid
+    # label 应为节点可读文本（节点A1），display_label 完整；绝不能是 uid
     assert branch_agent[0]["label"] == "节点A1", f"label 错误: {branch_agent[0]['label']!r}"
     assert branch_agent[0]["display_label"] == "节点A1"
     assert not branch_agent[0]["label"].startswith("a-1-1"), "label 是 uid，bug 未修复"

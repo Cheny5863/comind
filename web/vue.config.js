@@ -8,6 +8,7 @@ module.exports = {
   publicPath: isDev ? '' : './dist',
   outputDir: '../dist',
   lintOnSave: false,
+  parallel: false,
   productionSourceMap: false,
   filenameHashing: false,
   transpileDependencies: [

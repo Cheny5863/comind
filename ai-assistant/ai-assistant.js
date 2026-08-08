@@ -485,7 +485,15 @@
     if (_es) { try { _es.close(); } catch (_) {} _es = null; }
     _es = new EventSource(api("events"));
     _es.addEventListener("agent_start", () => setStreaming(true));
-    _es.addEventListener("agent_end", () => setStreaming(false));
+    _es.addEventListener("agent_end", (e) => {
+      try {
+        const ev = JSON.parse(e.data || "{}");
+        const msgs = ev.messages || [];
+        const last = msgs[msgs.length - 1] || {};
+        if (last.errorMessage) addBubble("assistant", "[Error] " + esc(last.errorMessage));
+      } catch (_) {}
+      setStreaming(false);
+    });
     // 上下文压缩（pi 上下文满时自动触发）：给用户可见反馈，
     // 否则压缩会默默占用 5~15s，用户只感觉"这轮怎么这么慢"
     _es.addEventListener("compaction_start", () => {
@@ -514,6 +522,12 @@
       el.textContent = "✅ " + t("compactDone");
       el.classList.add("done");
       setTimeout(() => el.remove(), 4000);
+    });
+    _es.addEventListener("runtime_error", (e) => {
+      try {
+        const ev = JSON.parse(e.data || "{}");
+        if (ev.source === "pi" && ev.message) addBubble("assistant", "[Pi] " + esc(ev.message));
+      } catch (_) {}
     });
     // On SSE reconnect (browser auto-reconnects), recover state
     _es.addEventListener("open", () => recoverStreamState());
@@ -1233,7 +1247,17 @@
       fetch(api("prompt"), {
         method: "POST", headers: { "Content-Type": "application/json", "X-Lang": lang() },
         body: JSON.stringify({ message: msg || t("nodeAssistFallback"), context, branch_uid: _currentBranch }),
-      }).catch(() => {});
+      }).then((r) => {
+        if (!r.ok) {
+          return r.text().then((text) => {
+            addBubble("assistant", "[Error] " + esc(text || r.statusText));
+            setStreaming(false);
+          });
+        }
+      }).catch((err) => {
+        addBubble("assistant", "[Error] " + esc(err && err.message ? err.message : "Request failed"));
+        setStreaming(false);
+      });
     });
   }
   function abortChat() {

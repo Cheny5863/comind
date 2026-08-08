@@ -8,7 +8,7 @@ from conftest import MAP_KEY
 
 def _doc():
     fpath = f"{chat_service.PROJECT_CWD}/{MAP_KEY}"
-    return json.loads(open(fpath).read())
+    return json.loads(open(fpath, encoding="utf-8").read())
 
 
 def test_save_view_only_does_not_bump_version(env):

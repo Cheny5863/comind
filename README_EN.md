@@ -69,11 +69,45 @@ The script will:
 > Update: `bash update.sh` (compare version → download → sha256 → backup → replace → restart)
 > Rollback: `~/.comind/backup/app.prev` keeps the previous version
 
+## Windows source deployment
+
+```powershell
+# Run from the repository root
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+You can also double-click [install.cmd](install.cmd) or run [update.cmd](update.cmd). On Windows, the script will:
+1. Create `.venv` and install backend dependencies
+2. Install or reuse Node.js, then install `pi-coding-agent`
+3. Build the frontend into `dist/` and sync the root `index.html`
+4. Start the backend and write logs to `%LOCALAPPDATA%\CoMind\comind.log`
+
+For daily startup, double-click [start.cmd](start.cmd); to stop the backend, double-click [stop.cmd](stop.cmd). To start CoMind automatically after Windows login, run [service-install.cmd](service-install.cmd); to remove autostart, run [service-uninstall.cmd](service-uninstall.cmd). To inspect the current state, run [status.cmd](status.cmd). To run a local smoke test, run [test.cmd](test.cmd).
+
+The Windows source deployment stores runtime data in `%LOCALAPPDATA%\CoMind`:
+- `private\keys.json`: model API keys
+- `chat-sessions\`: AI sessions
+- `pi-runtime\`: CoMind-managed pi coding agent runtime
+- `comind.log` / `comind.pid`: logs and process id
+
+If `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` points at a disabled placeholder such as `127.0.0.1:9`, the backend does not pass it to pi by default so AI calls do not fail with `Connection error`. Set `SMM_PI_USE_SYSTEM_PROXY=1` before startup if pi should use the system proxy.
+
+For updates, rerun [install.ps1](install.ps1) or [update.ps1](update.ps1); the script stops the previous process, rebuilds, and restarts the app.
+
+## Windows release packaging
+
+Maintainers can run [package-windows.cmd](package-windows.cmd) to create two Windows package types:
+
+- `CoMind-user-<version>-win-x64.zip`: for nontechnical users. Unzip it and double-click `Start CoMind.cmd`. It includes `CoMind.exe`, frontend assets, portable Node.js, and the pi runtime, so users do not need Python / git / Node installed.
+- `CoMind-windows-dev-<version>.zip`: for Windows developers or deployers. It keeps the source tree and one-click scripts; unzip it and run `install.cmd`.
+
+See [WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md) for package usage. See [WINDOWS_PACKAGING.md](WINDOWS_PACKAGING.md) for build prerequisites, commands, and offline Node zip usage.
+
 ## Configure Model Keys
 
 1. Open the page, click ⚙️ in the AI panel header
 2. Paste a DeepSeek / Kimi API key and hit Save
-3. Takes effect immediately (keys are stored locally in `~/.comind/private/keys.json`, mode 600, never uploaded)
+3. Takes effect immediately (keys are stored locally in Windows `%LOCALAPPDATA%\CoMind\private\keys.json` / Linux `~/.comind/private/keys.json`, never uploaded)
 
 ## Development
 
@@ -98,14 +132,14 @@ pytest                      # mind map diff/apply/ops + pi workflow
 | Data | Location | Notes |
 |---|---|---|
 | Mind maps | `~/comind-maps/` | outside the program dir; upgrades never touch it |
-| Model keys | `~/.comind/private/keys.json` | local only, mode 600 |
-| Chat sessions | `~/.comind/chat-sessions/` | local only |
+| Model keys | Windows `%LOCALAPPDATA%\CoMind\private\keys.json` / Linux `~/.comind/private/keys.json` | local only |
+| Chat sessions | Windows `%LOCALAPPDATA%\CoMind\chat-sessions\` / Linux `~/.comind/chat-sessions/` | local only |
 
 ## FAQ
 
 **Q: Do I need a GPU?** No. AI inference uses DeepSeek/Kimi cloud APIs.
 
-**Q: Windows/macOS?** Releases target Linux x64; source runs on Windows/macOS (backend + frontend build).
+**Q: Windows/macOS?** Releases target Linux x64; Windows has a source deployment path via [install.ps1](install.ps1), and macOS can still run from source.
 
 **Q: Is my mind map data safe?** Everything is stored locally; the AI only reads/writes the map you authorize via extension tools.
 

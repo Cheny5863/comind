@@ -14,10 +14,10 @@ from conftest import MAP_KEY, node, find_by_uid
 
 def _write_disk_text(uid, text):
     fpath = Path(chat_service.PROJECT_CWD) / MAP_KEY
-    doc = json.loads(fpath.read_text())
+    doc = json.loads(fpath.read_text(encoding="utf-8"))
     n = find_by_uid(doc["mindMapData"]["root"], uid)
     n["data"]["text"] = f"<p>{text}</p>"
-    fpath.write_text(json.dumps(doc, ensure_ascii=False))
+    fpath.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
 
 
 def test_branch_label_disk_priority(env):
@@ -63,10 +63,10 @@ def test_branch_label_node_exists_empty_text_keeps_uid(env):
 def _delete_node_from_disk_and_state(uid):
     """从磁盘和 _map_state 快照同时删除节点（模拟用户删除分支节点）。"""
     fpath = Path(chat_service.PROJECT_CWD) / MAP_KEY
-    doc = json.loads(fpath.read_text())
+    doc = json.loads(fpath.read_text(encoding="utf-8"))
     root = doc["mindMapData"]["root"]
     root["children"] = [c for c in root["children"] if c["data"]["uid"] != uid]
-    fpath.write_text(json.dumps(doc, ensure_ascii=False))
+    fpath.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
     state = backend.chat_manager._map_state.get(MAP_KEY)
     if state:
         sroot = chat_service._state_root(state)
@@ -124,10 +124,10 @@ def test_rollback_returns_restored_tree(env, tmp_path, monkeypatch):
     monkeypatch.setattr(chat_service, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(chat_service, "MAPPING_PATH", tmp_path / "sessions" / "mapping.json")
     fpath = Path(chat_service.PROJECT_CWD) / MAP_KEY
-    doc = json.loads(fpath.read_text())
+    doc = json.loads(fpath.read_text(encoding="utf-8"))
     ai_node = node("ai-node-1", "AI加的节点")
     doc["mindMapData"]["root"]["children"].append(ai_node)
-    fpath.write_text(json.dumps(doc, ensure_ascii=False))
+    fpath.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
     # session jsonl：2 条 user 消息；turns：第 2 轮加了 ai-node-1
     sdir = tmp_path / "sessions"
     sdir.mkdir(exist_ok=True)
@@ -138,7 +138,7 @@ def test_rollback_returns_restored_tree(env, tmp_path, monkeypatch):
         {"type": "message", "message": {"role": "assistant", "content": "回复"}},
         {"type": "message", "message": {"role": "user", "content": "帮我加个节点"}},
     ]
-    Path(sf).write_text("\n".join(json.dumps(l, ensure_ascii=False) for l in lines))
+    Path(sf).write_text("\n".join(json.dumps(l, ensure_ascii=False) for l in lines), encoding="utf-8")
     turns = [{
         "turn_id": "t1", "user_msg": "帮我加个节点", "user_msg_idx": 2,
         "diff": [{"uid": "ai-node-1", "action": "add", "before": None,
@@ -155,7 +155,7 @@ def test_rollback_returns_restored_tree(env, tmp_path, monkeypatch):
     assert res["tree"] is not None
     assert find_by_uid(res["tree"], "ai-node-1") is None
     # 磁盘同步删除
-    doc2 = json.loads(fpath.read_text())
+    doc2 = json.loads(fpath.read_text(encoding="utf-8"))
     assert find_by_uid(doc2["mindMapData"]["root"], "ai-node-1") is None
 
 

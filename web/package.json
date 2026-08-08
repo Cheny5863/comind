@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "serve": "vue-cli-service serve",
-    "build": "NODE_OPTIONS=--openssl-legacy-provider vue-cli-service build && node ../copy.js",
+    "build": "node --openssl-legacy-provider ./node_modules/@vue/cli-service/bin/vue-cli-service.js build && node ../copy.js",
     "lint": "vue-cli-service lint",
     "buildLibrary": "node ./scripts/updateVersion.js && vue-cli-service build --mode library --target lib --name simpleMindMap ../simple-mind-map/full.js --dest ../simple-mind-map/dist && esbuild ../simple-mind-map/full.js --bundle --external:buffer --format=esm --outfile=../simple-mind-map/dist/simpleMindMap.esm.js && esbuild ../simple-mind-map/full.js --bundle --minify --external:buffer --format=esm --outfile=../simple-mind-map/dist/simpleMindMap.esm.min.js",
     "format": "prettier --write src/* src/*/* src/*/*/* src/*/*/*/*",
@@ -12,20 +12,29 @@
     "ai:serve": "node ./scripts/ai.js"
   },
   "dependencies": {
+    "@svgdotjs/svg.js": "^3.2.8",
     "@toast-ui/editor": "^3.1.5",
     "axios": "^1.7.9",
     "codemirror": "^5.65.16",
     "core-js": "^3.6.5",
     "element-ui": "^2.15.1",
     "highlight.js": "^10.7.3",
+    "jszip": "^3.10.1",
     "katex": "^0.16.9",
+    "mdast-util-from-markdown": "^2.0.3",
+    "parchment": "^3.0.0",
+    "pdf-lib": "^1.17.1",
+    "quill": "^2.0.3",
+    "quill-delta": "^5.1.0",
+    "simple-mind-map": "file:../simple-mind-map",
     "simple-mind-map-plugin-themes": "^1.0.0",
     "v-viewer": "^1.6.4",
     "vue": "^2.6.11",
     "vue-i18n": "^8.27.2",
     "vue-router": "^3.5.1",
     "vuex": "^3.6.2",
-    "xlsx": "^0.18.5"
+    "xlsx": "^0.18.5",
+    "xml-js": "^1.6.11"
   },
   "devDependencies": {
     "@vue/cli-plugin-babel": "^4.5.0",

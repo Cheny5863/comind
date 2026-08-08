@@ -302,12 +302,30 @@ def api_load(name: str = Query(..., description="文件名")):
     return load_from_file(name)
 
 
+def _ensure_map_ver(name: str) -> int:
+    """返回脑图的当前写版本号。内存中没有时从磁盘 _comind_ver 恢复（服务重启场景）。"""
+    ver = chat_manager._map_ver.get(name)
+    if ver is not None:
+        return ver
+    # 服务重启后内存归零，从磁盘文件恢复持久化的版本号
+    fpath = Path(WORKSPACE) / name
+    disk_ver = 0
+    if fpath.is_file():
+        try:
+            doc = json.loads(fpath.read_text())
+            disk_ver = doc.get("_comind_ver", 0)
+        except Exception:
+            pass
+    chat_manager._map_ver[name] = disk_ver
+    return disk_ver
+
+
 @app.get("/api/ver")
 def api_ver(name: str = Query(...)):
     """返回脑图当前写版本（AI 写盘次数）。前端画布 load 时初始化、收到
     mindmap_update 时对齐；保存时带版本，后端据此判断前端是否落后。"""
     name = _normalize_workspace_file_name(name, allowed_exts=(".smm.json",), default_ext=".smm.json")
-    return {"version": chat_manager._map_ver.get(name, 0)}
+    return {"version": _ensure_map_ver(name)}
 
 
 @app.post("/api/save")
@@ -324,7 +342,7 @@ def api_save(name: str = Query(...), body: dict = None, version: int = 0):
         # view_data_change(拖拽/缩放/折叠，300ms debounce)、saveMindMapConfig(主题/布局)。
         # 若任何保存都 +1，A 拖一下视图 B 没动也"落后"→ 误弹"其他设备修改"。
         # 正确语义：内容没变（view/config/回声保存）→ 版本不递增，只更新磁盘。
-        cur_ver = chat_manager._map_ver.get(name, 0)
+        cur_ver = _ensure_map_ver(name)
         disk_doc = None
         disk_read_failed = False
         if fpath.is_file():
@@ -383,13 +401,16 @@ def api_save(name: str = Query(...), body: dict = None, version: int = 0):
                 "tree": disk_root,
             }
         # 写盘（内容没变时也写：view/config 变化需要落盘，但版本不递增）
+        if content_changed:
+            # 只有内容真正变化才递增版本号
+            chat_manager._map_ver[name] = cur_ver + 1
+        # 持久化版本号到文件，服务重启后可恢复
+        if isinstance(body, dict):
+            body["_comind_ver"] = chat_manager._map_ver.get(name, cur_ver)
         chat_service._atomic_write(fpath, json.dumps(body, ensure_ascii=False, indent=2))
         # 保持内存态与磁盘一致：后续 AI 的 diff/apply 基于保存后的树
         if isinstance(body, dict) and "mindMapData" in body:
             chat_manager._map_state[name] = body["mindMapData"]
-        if content_changed:
-            # 只有内容真正变化才递增版本号
-            chat_manager._map_ver[name] = cur_ver + 1
     return {"status": "ok", "name": name, "version": chat_manager._map_ver.get(name, 0)}
 
 
@@ -917,7 +938,7 @@ const getDataFromBackend = async () => {{
 // 保存时带版本，后端据此判断画布是否落后（防旧画布覆盖 AI 改动）
 // ⚠️ 版本号必须同步注入（服务端渲染）——异步 fetch 有竞态：
 // 页面初始化触发 data_change 自动保存时 version 还是 0 → 后端误判冲突 → 覆盖用户数据
-window.__comindMapVer = {chat_manager._map_ver.get(name, 0)};
+window.__comindMapVer = {_ensure_map_ver(name)};
 
 const setTakeOverAppMethods = (data) => {{
   window.takeOverAppMethods = {{}};

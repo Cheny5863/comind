@@ -368,8 +368,15 @@ def _redact_diagnostic(message: str) -> str:
 
 
 def safe_key_slug(map_key: str) -> str:
-    """Filesystem-safe slug for a map key (session file naming)."""
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", map_key)
+    """Filesystem-safe slug for a map key (session file naming).
+
+    ⚠️ 必须保留中文等 Unicode 字符！旧实现 `re.sub(r"[^A-Za-z0-9_.-]+", "_", ...)`
+    把所有中文替换成下划线，导致「comind正式版管理.smm.json」和「comind项目.smm.json」
+    slug 碰撞成同一个 `comind_.smm.json` → list_sessions 的 glob 把不同脑图的
+    session 文件混在一起（跨脑图串台 bug，2026-08-08 修复）。
+    现在只替换路径分隔符、控制字符和 Windows 非法字符，中文原样保留。
+    """
+    return re.sub(r'[/\\:*?"<>|\x00-\x1f]+', "_", map_key)
 
 
 def _new_session_filename(map_key: str, branch_uid: str = "") -> str:
@@ -696,8 +703,11 @@ class ChatSessionManager:
         # Mind-map state: key → current mindMapData / AI-synced snapshot
         self._map_state: dict[str, dict] = {}
         self._map_snapshot: dict[str, dict] = {}
-        # 轮次回滚：skey → {before, user_msg, user_msg_idx, ts}（该轮开始时的脑图快照）
+        # 轮次回滚：skey → {user_msg, user_msg_idx, ts}（该轮的元数据）
         self._turn_before: dict[str, dict] = {}
+        # 轮次 ops 收集器：skey → list[diff_entry]。mutation 现场直接记录，
+        # 天然按 session 隔离，不需要事后快照对比推断 AI 做了什么。
+        self._turn_ops: dict[str, list[dict]] = {}
         # Start reaper
         t = threading.Thread(target=self._reap_loop, daemon=True, name="pi-reaper")
         t.start()
@@ -1000,6 +1010,8 @@ class ChatSessionManager:
         prefix = safe_key_slug(map_key) + "__"
         sessions = []
         root = _state_root(self._map_state.get(map_key))
+        uid_index = _index_by_uid(root) if root else {}
+        parents = _index_with_parent(root) if root else {}
         for f in SESSION_DIR.glob(f"{prefix}*.jsonl"):
             try:
                 stem = f.name[len(prefix):]
@@ -1017,11 +1029,14 @@ class ChatSessionManager:
                 # 退回 session 绑定分支）。数据源 = turns（持久化，重启不丢）
                 focus_uid = ""
                 focus_uids: list[str] = []
-                uid_index = _index_by_uid(root) if root else {}
                 for turn in reversed(_load_turns(str(f))):
                     diff = turn.get("diff") or []
                     uids = [d.get("uid") for d in diff
                             if d.get("uid") and d.get("uid") in uid_index]
+                    if branch_uid:
+                        # 分支 session 只对焦本分支内的改动：防御修复前旧 turns 数据
+                        # （并发时可能混入其他分支节点）+ 并发窗口兜底
+                        uids = [u for u in uids if _belongs_to_branch(u, branch_uid, parents)]
                     if not uids:
                         continue
                     focus_uids = uids
@@ -1300,53 +1315,36 @@ class ChatSessionManager:
     # ─── 轮次回滚（按对话轮次线性回滚：脑图 + pi session 一起回到那一刻）───
 
     def record_turn_start(self, map_key: str, branch_uid: str, message: str) -> None:
-        """prompt 时记录轮次起点：用户消息 + jsonl 中 user 消息序号 + 脑图轮前快照。"""
+        """prompt 时记录轮次起点：用户消息 + jsonl 中 user 消息序号 + 初始化 ops 收集器。
+
+        diff 不再用快照对比推断——改为 mutation 现场直接记录（_turn_ops），
+        天然按 session 隔离，不会混入用户手动编辑或其他分支的改动。
+        """
         skey = session_key(map_key, branch_uid)
         sess = self._sessions.get(skey)
         if not sess or not sess.session_file:
             return
-        before = None
-        state = self._map_state.get(map_key)
-        if not isinstance(state, dict):
-            # 内存无状态（首轮 prompt 前端未 sync）→ 磁盘兜底
-            fpath = Path(PROJECT_CWD) / map_key
-            if fpath.is_file():
-                try:
-                    doc = json.loads(fpath.read_text(encoding="utf-8"))
-                    state = doc.get("mindMapData") or {}
-                except Exception:
-                    state = None
-        if isinstance(state, dict):
-            root = state.get("root", state)
-            if isinstance(root, dict):
-                try:
-                    before = deepcopy(root)
-                except Exception:
-                    before = None
         self._turn_before[skey] = {
-            "before": before,
             "user_msg": message or "",
             "ts": time.time(),
             "user_msg_idx": _user_message_count(Path(sess.session_file)) + 1,
         }
+        self._turn_ops[skey] = []
 
     def finalize_turn(self, map_key: str, branch_uid: str) -> None:
-        """agent_end 时把本轮净 diff 追加进轮次记录（脑图回滚的数据源）。"""
+        """agent_end 时把本轮 diff 追加进轮次记录（脑图回滚的数据源）。
+
+        diff 来自 _turn_ops（mutation 现场记录），不再事后快照对比。
+        """
         skey = session_key(map_key, branch_uid)
         rec = self._turn_before.pop(skey, None)
+        diff = self._turn_ops.pop(skey, [])
         sess = self._sessions.get(skey)
         if not rec or not sess or not sess.session_file:
             return
         sf = Path(sess.session_file)
         if not sf.is_file():
             return
-        after_root = None
-        state = self._map_state.get(map_key)
-        if isinstance(state, dict):
-            r = state.get("root", state)
-            if isinstance(r, dict):
-                after_root = r
-        diff = _compute_net_diff(rec.get("before"), after_root) if after_root else []
         turns = _load_turns(sess.session_file)
         turns.append({
             "turn_id": uuid.uuid4().hex,
@@ -1444,6 +1442,12 @@ class ChatSessionManager:
         #    清掉这些轮次记录（目标轮消息已被截断回输入框，不再存在）
         later_diffs = [d for t in turns if (t.get("user_msg_idx") or 0) >= user_msg_idx
                        for d in (t.get("diff") or [])]
+        # 分支隔离：旧 turns 数据可能混入其他分支的改动（并发污染 bug）——
+        # 回滚只撤销本分支内的改动，避免误删/误改其他分支的节点
+        if branch_uid and later_diffs:
+            cur_root = _state_root(before_state) if before_state else None
+            cur_parents = _index_with_parent(cur_root) if cur_root else {}
+            later_diffs = _filter_diff_to_branch(later_diffs, branch_uid, cur_parents)
         turns = [t for t in turns if (t.get("user_msg_idx") or 0) < user_msg_idx]
         _save_turns(session_file, turns)
         # 4. 脑图反向应用（只撤销该 session 的 AI 改动，冲突节点跳过）
@@ -2060,6 +2064,23 @@ def _broadcast_map_update(manager: ChatSessionManager, key: str, new_data: dict,
                     pass
 
 
+def _ensure_map_ver_cs(manager: ChatSessionManager, key: str) -> int:
+    """返回脑图当前写版本。内存中没有时从磁盘 _comind_ver 恢复（服务重启场景）。"""
+    ver = manager._map_ver.get(key)
+    if ver is not None:
+        return ver
+    fpath = Path(PROJECT_CWD) / key
+    disk_ver = 0
+    if fpath.is_file():
+        try:
+            doc = json.loads(fpath.read_text())
+            disk_ver = doc.get("_comind_ver", 0)
+        except Exception:
+            pass
+    manager._map_ver[key] = disk_ver
+    return disk_ver
+
+
 def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict, branch_uid: str = "") -> None:
     """提交新 mindMapData：更新内存、备份、落盘、SSE 广播。
 
@@ -2069,7 +2090,7 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
     """
     old_state = manager._map_state.get(key)
     manager._map_state[key] = new_data
-    manager._map_ver[key] = manager._map_ver.get(key, 0) + 1
+    manager._map_ver[key] = _ensure_map_ver_cs(manager, key) + 1
     writer_key = session_key(key, branch_uid)
     manager._map_snapshot[writer_key] = json.loads(json.dumps(new_data))
     # 落盘（原子写）
@@ -2080,6 +2101,7 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
                 backup = fpath.with_suffix(fpath.suffix + ".aibak")
                 backup.write_text(fpath.read_text(encoding="utf-8"), encoding="utf-8")
             doc["mindMapData"] = new_data
+            doc["_comind_ver"] = manager._map_ver[key]
             _atomic_write(fpath, json.dumps(doc, ensure_ascii=False, indent=2))
         except Exception as exc:
             # 写盘失败绝不能静默：apply_ops 会返回成功而磁盘没写（假成功），
@@ -2111,9 +2133,15 @@ def apply_map(manager: ChatSessionManager, key: str, tree: dict, branch_uid: str
     lock = manager._write_locks.setdefault(key, threading.Lock())
     with lock:
         doc, file_md, old_by_uid, _ = _load_doc_for_write(manager, key)
+        old_root = file_md.get("root", file_md)
         merged_root = _merge_ai_tree(tree, old_by_uid)
         new_data = dict(file_md)
         new_data["root"] = merged_root
+        # 轮次 ops 记录：整树替换没有逐条 op，用 old/new diff 补充记录
+        skey = session_key(key, branch_uid)
+        turn_ops = manager._turn_ops.get(skey)
+        if turn_ops is not None and old_root and merged_root:
+            turn_ops.extend(_compute_net_diff(old_root, merged_root))
         _commit_map(manager, key, doc, new_data)
     return None
 
@@ -2263,6 +2291,10 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
     skipped_human: list[str] = []     # 被人类编辑锁跳过的 uid
     root_uid = root.get("data", {}).get("uid")
 
+    # 轮次 ops 收集器：mutation 现场直接记录 diff，按 session 隔离
+    skey = session_key(key, branch_uid)
+    turn_ops = manager._turn_ops.get(skey)  # None = 不在 turn 中，不记录
+
     # 人类编辑锁：检查是否有人正在编辑某节点（60 秒超时自动失效）
     human_lock = manager._human_editing.get(key)
     human_locked_uid = ""
@@ -2299,11 +2331,19 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
             if not node:
                 errors.append(f"op[{i}]: uid {uid} 不存在")
                 continue
+            old_text = node["data"].get("text", "")
+            old_note = node["data"].get("note", "")
             t = op.get("text", "")
             if isinstance(t, str) and t and "<" not in t and node["data"].get("richText"):
                 t = f"<p>{t}</p>"
             node["data"]["text"] = t
             applied += 1
+            if turn_ops is not None:
+                turn_ops.append({
+                    "uid": uid, "action": "update_text",
+                    "before": {"text": old_text, "note": old_note},
+                    "after": {"text": t, "note": node["data"].get("note", "")},
+                })
         elif action == "add":
             parent_uid = op.get("parent_uid", "")
             parent = old_by_uid.get(parent_uid)
@@ -2320,11 +2360,18 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
             _register_subtree(node, old_by_uid)
             # 新节点挂在分支内父节点下，天然属于本分支；注册进 parent 链，
             # 同批次后续 op 用 ref 引用它（往新节点下加子节点等）时归属判断自动通过
-            _register_parents(node, parent.get("data", {}).get("uid", ""), parents)
+            actual_parent_uid = parent.get("data", {}).get("uid", "")
+            _register_parents(node, actual_parent_uid, parents)
             if op.get("ref"):
                 refs[op["ref"]] = node["data"]["uid"]
                 created[op["ref"]] = node["data"]["uid"]
             applied += 1
+            if turn_ops is not None:
+                turn_ops.append({
+                    "uid": node["data"]["uid"], "action": "add",
+                    "before": None,
+                    "after": {"node": deepcopy(node), "parent_uid": actual_parent_uid},
+                })
         elif action == "delete":
             if uid == root_uid:
                 errors.append(f"op[{i}]: 不允许删除根节点")
@@ -2335,9 +2382,16 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
             if not node or not _delete_by_uid(root, uid):
                 errors.append(f"op[{i}]: uid {uid} 不存在")
                 continue
+            deleted_parent_uid = parents.get(uid, "")
             _unregister_subtree(node, old_by_uid)
             _unregister_parents(node, parents)
             applied += 1
+            if turn_ops is not None:
+                turn_ops.append({
+                    "uid": uid, "action": "delete",
+                    "before": {"node": deepcopy(node), "parent_uid": deleted_parent_uid},
+                    "after": None,
+                })
         elif action == "move":
             if not check_allowed(uid, i, "目标节点"):
                 continue
@@ -2360,10 +2414,17 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
             if np_uid == uid or _contains_uid(node, np_uid):
                 errors.append(f"op[{i}]: 不能移动到自己或自己的子树下")
                 continue
+            old_parent_uid = parents.get(uid, "")
             _delete_by_uid(root, uid)
             insert_child(new_parent, node, op.get("index"))
             parents[uid] = np_uid  # move 后 parent 链更新（子树内部关系不变）
             applied += 1
+            if turn_ops is not None:
+                turn_ops.append({
+                    "uid": uid, "action": "move",
+                    "before": {"parent_uid": old_parent_uid},
+                    "after": {"parent_uid": np_uid},
+                })
         else:
             errors.append(f"op[{i}]: 未知 action {action!r}")
     if applied:
@@ -2521,6 +2582,37 @@ def _parse_node_assist(text: str) -> tuple[list[dict], str]:
         body_lines.append(ln)
     body = "\n".join(body_lines).strip()
     return quoted_list, body
+
+
+def _diff_uid_in_branch(d: dict, branch_uid: str, parents: dict) -> bool:
+    """单条 diff 的 uid 是否属于该分支（用给定 parent 链判断）。
+
+    uid 不在树里（已被删除）时用 diff 记录的父节点（before.parent_uid）判断；
+    父也不在 / 无法判定 → 保守返回 False（宁可跳过，不误伤其他分支）。
+    """
+    if not branch_uid:
+        return True
+    uid = d.get("uid", "")
+    if not uid:
+        return False
+    if uid in parents:
+        return _belongs_to_branch(uid, branch_uid, parents)
+    p = ((d.get("before") or {}).get("parent_uid") or "")
+    if p and p in parents:
+        return _belongs_to_branch(p, branch_uid, parents)
+    return False
+
+
+def _filter_diff_to_branch(diff: list[dict], branch_uid: str, parents: dict) -> list[dict]:
+    """diff 按分支隔离：只保留属于本分支的改动。
+
+    多 session 并发时，轮前/轮后全图对比会混入其他分支的改动（A 的 turn
+    进行中 B 提交）；分支 agent 被约束只能改自己分支（apply_ops
+    check_allowed / apply_map 拒绝越界），按归属过滤即等价于按 session 隔离。
+    """
+    if not branch_uid or not diff:
+        return diff
+    return [d for d in diff if _diff_uid_in_branch(d, branch_uid, parents)]
 
 
 def _compute_net_diff(before_root: dict, after_root: dict) -> list[dict]:

@@ -12,6 +12,7 @@ from chat_service import (
     ChatSessionManager,
     _compute_net_diff,
     _build_reverse_ops,
+    _filter_diff_to_branch,
     _user_message_count,
     _user_messages_from_jsonl,
     _parse_node_assist,
@@ -126,6 +127,66 @@ class TestReverseOps:
         later = [{"uid": "d", "action": "delete", "before": {"node": _mk("d", "D"), "parent_uid": "r"}}]
         ops, skipped = _build_reverse_ops(later, self._idx(current), self._parents(current))
         assert ops == [] and len(skipped) == 1
+
+
+class TestBranchIsolation:
+    """turn diff 按分支隔离（多 session 并发防污染，chat_service._filter_diff_to_branch）。
+
+    场景：A 的 turn 进行中 B 提交改动 → 全图 before/after 对比会把 B 的节点
+    混进 A 的 diff；分支 agent 被约束只能改自己分支，按归属过滤即等价于隔离。
+    """
+
+    def _parents(self, root, parent=""):
+        out = {}
+        def walk(n, p):
+            out[n["data"]["uid"]] = p
+            for c in n.get("children", []):
+                walk(c, n["data"]["uid"])
+        walk(root, parent)
+        return out
+
+    def test_keep_branch_nodes_filter_others(self):
+        root = _mk("r", "root", [_mk("b1", "B1", [_mk("a", "A")]), _mk("c", "C")])
+        parents = self._parents(root)
+        diff = [
+            {"uid": "a", "action": "update_text", "before": {"text": "旧"}, "after": {"text": "新"}},
+            {"uid": "c", "action": "update_text", "before": {"text": "旧"}, "after": {"text": "新"}},
+        ]
+        out = _filter_diff_to_branch(diff, "b1", parents)
+        assert [d["uid"] for d in out] == ["a"]
+
+    def test_deleted_node_judged_by_parent(self):
+        # 被删节点不在树里 → 用 diff 记录的父节点（before.parent_uid）判断归属
+        root = _mk("r", "root", [_mk("b1", "B1", [_mk("a", "A")]), _mk("c", "C")])
+        parents = self._parents(root)
+        diff = [
+            {"uid": "d", "action": "delete", "before": {"node": _mk("d", "D"), "parent_uid": "b1"}},
+            {"uid": "e", "action": "delete", "before": {"node": _mk("e", "E"), "parent_uid": "r"}},
+        ]
+        out = _filter_diff_to_branch(diff, "b1", parents)
+        assert [d["uid"] for d in out] == ["d"]
+
+    def test_add_in_branch_kept(self):
+        root = _mk("r", "root", [_mk("b1", "B1")])
+        parents = self._parents(root)
+        after_parents = dict(parents)
+        after_parents["new_node"] = "b1"  # 新节点在轮后树里
+        diff = [{"uid": "new_node", "action": "add", "before": None,
+                 "after": {"node": _mk("new_node", "N"), "parent_uid": "b1"}}]
+        # finalize 场景：用轮后 parent 链 → 保留
+        out = _filter_diff_to_branch(diff, "b1", after_parents)
+        assert [d["uid"] for d in out] == ["new_node"]
+        # rollback 场景：节点尚不在树里且无 before 父 → 保守跳过（不误伤）
+        out2 = _filter_diff_to_branch(diff, "b1", parents)
+        assert out2 == []
+
+    def test_root_agent_no_filter(self):
+        diff = [{"uid": "any", "action": "update_text", "before": {"text": "a"}, "after": {"text": "b"}}]
+        assert _filter_diff_to_branch(diff, "", {}) == diff
+
+    def test_unknown_uid_conservative_skip(self):
+        diff = [{"uid": "ghost", "action": "update_text", "before": {"text": "a"}, "after": {"text": "b"}}]
+        assert _filter_diff_to_branch(diff, "b1", {}) == []
 
 
 class TestTurnsStore:

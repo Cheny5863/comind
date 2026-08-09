@@ -875,6 +875,18 @@ function installClipboardFix(mindMap) {{
     var treeText = getNodeTreeText(this.beingCopyData);
     writeClipboard(treeText);
   }};
+  // 剪切同写 localStorage（原版 cut 只写内存+系统剪贴板，跨脑图粘贴会丢）
+  renderer.cut = function() {{
+    this.mindMap.execCommand('CUT_NODE', copyData => {{
+      this.beingCopyData = copyData;
+      if (!copyData) return;
+      try {{
+        localStorage.setItem(CLIP_KEY, JSON.stringify(copyData));
+      }} catch (e) {{}}
+      var treeText = getNodeTreeText(copyData);
+      writeClipboard(treeText);
+    }});
+  }};
   renderer.paste = async function() {{
     if (this.beingCopyData) {{
       this.mindMap.execCommand('PASTE_NODE', this.beingCopyData);

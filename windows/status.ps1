@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Continue'
 
-$Root = Split-Path -Parent $PSCommandPath
+$Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 
 function Get-WritableDirectory([string[]]$Candidates) {
     foreach ($candidate in $Candidates) {

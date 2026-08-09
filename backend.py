@@ -962,52 +962,76 @@ const setTakeOverAppMethods = (data) => {{
     // 另一设备永远落后 → 每次都 conflict → 疯狂弹"其他设备修改"。
     // 抑制窗口内（updateData 同步调用链）跳过自动保存，版本只在真实编辑时递增。
     if (window.__comindSuppressSave) return;
-    if (window.currentFileExt === 'xmind') {{
-      // 使用原生 ExportXMind 插件导出为 XMind zip
-      if (!mindMapInstance) {{ alert(_L('编辑器尚未初始化', 'Editor not initialized')); return; }}
-      try {{
-        const zipBlob = await mindMapInstance.doExport.xmind(d, window.currentFileName);
-        await fetch('/api/save_xmind?name=' + encodeURIComponent(window.currentFileName), {{
-          method: 'POST',
-          body: zipBlob
-        }});
-      }} catch(e) {{ alert(_L('XMind 保存失败: ', 'XMind save failed: ') + e.message); }}
-    }} else {{
-      // copyRenderTree 会把渲染根节点的非 data/children 字段复制进 getData()
-      // 输出（含 root 冗余快照）。保存前剥离，防止磁盘被污染：
-      // root 树里的 root key 会让后端 sync_map 规范化失效，AI 读到旧快照。
-      if (d && d.root && d.root.root && typeof d.root.root === 'object') {{
-        delete d.root.root;
-      }}
-      const current = await (await fetch('/api/load?name=' + encodeURIComponent(window.currentFileName))).json();
-      current.mindMapData = d;
-      const resp = await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName) + '&version=' + (window.__comindMapVer || 0), {{
-        method: 'POST', headers: {{'Content-Type':'application/json'}},
-        body: JSON.stringify(current)
-      }});
-      const j = await resp.json().catch(() => ({{}}));
-      if (j && j.status === 'conflict') {{
-        // 乐观锁冲突：画布是陈旧视图（另一设备/AI 已更新）→ 自动刷新为最新树
-        window.__comindMapVer = j.version || 0;
-        if (j.tree && mindMapInstance) {{
-          // 抑制回声保存：updateData 会触发 data_change → 自动保存，若不禁
-          // 会把刚同步的树再保存一次 → 版本 +1 → 对方设备永远落后（死循环）
-          window.__comindSuppressSave = true;
-          try {{
-            mindMapInstance.updateData(j.tree);
-          }} finally {{
-            window.__comindSuppressSave = false;
-          }}
-        }}
+    // ⚠️ 保存串行化（2026-08-09 慢网络竞态修复）：连续编辑会并发触发多次
+    // saveMindMapData，若不加锁，多个请求携带相同旧 version 同时到达后端，
+    // 后到的会被乐观锁误判 conflict（单端也会弹"其他设备修改"！）。
+    // 保存中再来 → 记下最新待保存数据，当前请求完成后用最新版本重发。
+    if (window.__comindSaving) {{
+      window.__comindPendingSave = d;
+      return;
+    }}
+    window.__comindSaving = true;
+    try {{
+      if (window.currentFileExt === 'xmind') {{
+        // 使用原生 ExportXMind 插件导出为 XMind zip
+        if (!mindMapInstance) {{ alert(_L('编辑器尚未初始化', 'Editor not initialized')); return; }}
         try {{
-          const hint = _L('检测到其他设备的修改，画布已刷新为最新版本', 'Detected changes from another device, canvas refreshed to latest');
-          if (window.toast) window.toast(hint); else alert(hint);
-        }} catch (e) {{}}
-        return;
+          const zipBlob = await mindMapInstance.doExport.xmind(d, window.currentFileName);
+          await fetch('/api/save_xmind?name=' + encodeURIComponent(window.currentFileName), {{
+            method: 'POST',
+            body: zipBlob
+          }});
+        }} catch(e) {{ alert(_L('XMind 保存失败: ', 'XMind save failed: ') + e.message); }}
+      }} else {{
+        // copyRenderTree 会把渲染根节点的非 data/children 字段复制进 getData()
+        // 输出（含 root 冗余快照）。保存前剥离，防止磁盘被污染：
+        // root 树里的 root key 会让后端 sync_map 规范化失效，AI 读到旧快照。
+        if (d && d.root && d.root.root && typeof d.root.root === 'object') {{
+          delete d.root.root;
+        }}
+        const current = await (await fetch('/api/load?name=' + encodeURIComponent(window.currentFileName))).json();
+        current.mindMapData = d;
+        // ⚠️ version 必须用 load 返回的磁盘版本（current._comind_ver），不能只用
+        // 内存 window.__comindMapVer——慢网络下内存可能滞后（上一次保存还没返回），
+        // 提交旧版本 → 后端误判 conflict。load 的版本是磁盘权威，且串行锁保证
+        // 这次 load 到本次保存之间没有其他写。
+        const verForSave = (current && typeof current._comind_ver === 'number') ? current._comind_ver : (window.__comindMapVer || 0);
+        const resp = await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName) + '&version=' + verForSave, {{
+          method: 'POST', headers: {{'Content-Type':'application/json'}},
+          body: JSON.stringify(current)
+        }});
+        const j = await resp.json().catch(() => ({{}}));
+        if (j && j.status === 'conflict') {{
+          // 乐观锁冲突：画布是陈旧视图（另一设备/AI 已更新）→ 自动刷新为最新树
+          window.__comindMapVer = j.version || 0;
+          if (j.tree && mindMapInstance) {{
+            // 抑制回声保存：updateData 会触发 data_change → 自动保存，若不禁
+            // 会把刚同步的树再保存一次 → 版本 +1 → 对方设备永远落后（死循环）
+            window.__comindSuppressSave = true;
+            try {{
+              mindMapInstance.updateData(j.tree);
+            }} finally {{
+              window.__comindSuppressSave = false;
+            }}
+          }}
+          try {{
+            const hint = _L('检测到其他设备的修改，画布已刷新为最新版本', 'Detected changes from another device, canvas refreshed to latest');
+            if (window.toast) window.toast(hint); else alert(hint);
+          }} catch (e) {{}}
+          return;
+        }}
+        // 保存成功 → 后端版本已递增，本地对齐（否则下次保存仍带旧版本号，
+        // 被误判"落后"触发冲突；多端并发时也保证本地版本与磁盘一致）
+        if (typeof j.version === 'number') window.__comindMapVer = j.version;
       }}
-      // 保存成功 → 后端版本已递增，本地对齐（否则下次保存仍带旧版本号，
-      // 被误判"落后"触发冲突；多端并发时也保证本地版本与磁盘一致）
-      if (typeof j.version === 'number') window.__comindMapVer = j.version;
+    }} finally {{
+      window.__comindSaving = false;
+      // 保存期间有新编辑（被锁挡住记在 pending）→ 用最新版本补发一次
+      if (window.__comindPendingSave) {{
+        const pending = window.__comindPendingSave;
+        window.__comindPendingSave = null;
+        window.takeOverAppMethods.saveMindMapData(pending);
+      }}
     }}
   }};
   window.takeOverAppMethods.getMindMapConfig = () => data.mindMapConfig;

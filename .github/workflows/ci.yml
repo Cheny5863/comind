@@ -62,7 +62,7 @@ jobs:
       - name: Smoke test (extract, start, check endpoints)
         run: |
           cd dist-release && rm -rf smoke && mkdir smoke
-          tar xzf comind--linux-x64-*.tar.gz -C smoke --strip-components=1
+          tar xzf comind-*-linux-x86_64.tar.gz -C smoke --strip-components=1
           ./smoke/comind-server/comind-server & sleep 8
           curl -fsS localhost:8789/api/version
           curl -fsS -o /dev/null localhost:8789/
@@ -72,5 +72,44 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          files: dist-release/comind--linux-x64-*.tar.gz
+          files: dist-release/comind-*-linux-x86_64.tar.gz
+          generate_release_notes: true
+
+  release-windows:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: ci
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build frontend assets (web/)
+        shell: pwsh
+        run: |
+          cd web
+          npm ci --no-audit --fund=false
+          npm run build
+
+      - name: Package Windows builds
+        shell: pwsh
+        run: |
+          $env:PI_SKIP_VERSION_CHECK = '1'
+          $env:PI_TELEMETRY = '0'
+          powershell -NoProfile -ExecutionPolicy Bypass -File windows/package-windows.ps1 -SkipWebBuild
+
+      - name: Upload Windows packages to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-release/comind-*-windows-x86_64.zip
+            dist-release/comind-*-windows-x86_64-dev.zip
           generate_release_notes: true

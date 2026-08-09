@@ -7,7 +7,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Root = Split-Path -Parent $PSCommandPath
+$Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 Set-Location $Root
 
 function Write-Info([string]$Message) {
@@ -269,7 +269,7 @@ $BuildRoot = Join-Path $ReleaseRoot '_build'
 $PyDist = Join-Path $BuildRoot 'pyinstaller-dist'
 $PyWork = Join-Path $BuildRoot 'pyinstaller-work'
 $UserRoot = Join-Path $ReleaseRoot "CoMind"
-$DevRoot = Join-Path $ReleaseRoot "CoMind-windows-dev-$Version"
+$DevRoot = Join-Path $ReleaseRoot "comind-$Version-windows-x86_64-dev"
 
 New-Item -ItemType Directory -Force -Path $ReleaseRoot | Out-Null
 if (Test-Path $BuildRoot) {
@@ -504,7 +504,7 @@ foreach ($requiredFile in $requiredUserFiles) {
     }
 }
 
-$UserZip = Join-Path $ReleaseRoot "CoMind-user-$Version-win-x64.zip"
+$UserZip = Join-Path $ReleaseRoot "comind-$Version-windows-x86_64.zip"
 New-ZipArchive $UserRoot $UserZip
 Assert-ZipContainsEntries $UserZip @(
     'CoMind/CoMind.exe',
@@ -526,7 +526,7 @@ if (-not $SkipDevZip) {
     if ($RobocopyCode -ge 8) {
         Fail "robocopy failed with exit code $RobocopyCode"
     }
-    $DevZip = Join-Path $ReleaseRoot "CoMind-windows-dev-$Version.zip"
+    $DevZip = Join-Path $ReleaseRoot "comind-$Version-windows-x86_64-dev.zip"
     New-ZipArchive $DevRoot $DevZip
     Write-Info "Developer package ready: $DevZip"
 }

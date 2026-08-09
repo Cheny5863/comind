@@ -10,7 +10,7 @@ Target: non-technical users.
 
 Output:
 
-- `dist-release/CoMind-user-<version>-win-x64.zip`
+- `dist-release/comind-<version>-windows-x86_64.zip`
 
 The zip contains a short top-level `CoMind` folder. Runtime folders inside the
 user package intentionally use short names (`n` for portable Node.js and `p`
@@ -34,7 +34,7 @@ Target: Windows developers and maintainers.
 
 Output:
 
-- `dist-release/CoMind-windows-dev-<version>.zip`
+- `dist-release/comind-<version>-windows-x86_64-dev.zip`
 
 Contents:
 

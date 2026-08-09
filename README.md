@@ -17,7 +17,7 @@ CoMind 是一个让 AI Agent 直接在思维导图上工作的协作工具。你
 
 ```bash
 # 下载 install.sh 与发布包（见 Releases），然后：
-bash install.sh comind--linux-x64-<版本>.tar.gz
+bash install.sh comind-<版本>-linux-x86_64.tar.gz
 ```
 
 脚本会自动：
@@ -31,7 +31,7 @@ bash install.sh comind--linux-x64-<版本>.tar.gz
 
 ### Windows 发布包
 
-从 Releases 下载对应包，**普通用户选 `CoMind-user-<版本>-win-x64.zip`**，**开发者/部署者选 `CoMind-windows-dev-<版本>.zip`**。
+从 Releases 下载对应包，**普通用户选 `comind-<版本>-windows-x86_64.zip`**，**开发者/部署者选 `comind-<版本>-windows-x86_64-dev.zip`**。
 
 **普通用户（免 Python / Node / git）**：
 
@@ -45,12 +45,12 @@ bash install.sh comind--linux-x64-<版本>.tar.gz
 **开发者 / 部署者**：
 
 ```powershell
-cd CoMind-windows-dev-<版本>
-.\install.cmd        # 首次安装或重建依赖
-.\start.cmd          # 启动
+cd comind-<版本>-windows-x86_64-dev
+.\windows\install.cmd        # 首次安装或重建依赖
+.\windows\start.cmd          # 启动
 ```
 
-日常命令：`start.cmd` / `stop.cmd` / `status.cmd` / `test.cmd`；登录自启动 `service-install.cmd`（取消 `service-uninstall.cmd`）。
+日常命令：`windows\start.cmd` / `windows\stop.cmd` / `windows\status.cmd` / `windows\test.cmd`；登录自启动 `windows\service-install.cmd`（取消 `windows\service-uninstall.cmd`）。
 
 > 详细使用说明见 [WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md)。
 
@@ -115,16 +115,16 @@ pytest                      # 脑图 diff/apply/ops + pi 工作流
 
 ```powershell
 # 在仓库根目录执行
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+powershell -ExecutionPolicy Bypass -File .\windows\install.ps1
 ```
 
-也可以直接双击 [install.cmd](install.cmd) 或运行 [update.cmd](update.cmd)。Windows 方案会自动完成这些事：
+也可以直接双击 [install.cmd](windows/install.cmd) 或运行 [update.cmd](windows/update.cmd)。Windows 方案会自动完成这些事：
 1. 创建 `.venv` 并安装后端依赖
 2. 安装或复用 Node.js，然后安装 `pi-coding-agent`
 3. 构建前端到 `dist/`，并同步根目录 `index.html`
 4. 启动后端并把日志写到 `%LOCALAPPDATA%\CoMind\comind.log`
 
-日常启动可以直接双击 [start.cmd](start.cmd)，停止服务可以双击 [stop.cmd](stop.cmd)。想要登录 Windows 后自动后台启动，可以运行 [service-install.cmd](service-install.cmd)；取消自启动运行 [service-uninstall.cmd](service-uninstall.cmd)。查看运行状态运行 [status.cmd](status.cmd)，做一次本机冒烟测试运行 [test.cmd](test.cmd)。
+日常启动可以直接双击 [start.cmd](windows/start.cmd)，停止服务可以双击 [stop.cmd](windows/stop.cmd)。想要登录 Windows 后自动后台启动，可以运行 [service-install.cmd](windows/service-install.cmd)；取消自启动运行 [service-uninstall.cmd](windows/service-uninstall.cmd)。查看运行状态运行 [status.cmd](windows/status.cmd)，做一次本机冒烟测试运行 [test.cmd](windows/test.cmd)。
 
 Windows 版会把运行数据放在 `%LOCALAPPDATA%\CoMind`：
 - `private\keys.json`：模型 API key
@@ -134,16 +134,16 @@ Windows 版会把运行数据放在 `%LOCALAPPDATA%\CoMind`：
 
 如果环境里有 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 指向 `127.0.0.1:9` 这类失效占位代理，后端会默认不传给 pi，避免 AI 返回 `Connection error`。确实需要让 pi 使用系统代理时，启动前设置 `SMM_PI_USE_SYSTEM_PROXY=1`。
 
-更新时重新执行 [install.ps1](install.ps1) 或 [update.ps1](update.ps1)，脚本会先停掉旧进程再重新构建并启动。
+更新时重新执行 [install.ps1](windows/install.ps1) 或 [update.ps1](windows/update.ps1)，脚本会先停掉旧进程再重新构建并启动。
 
 ### Windows 发布打包
 
-维护者可以运行 [package-windows.cmd](package-windows.cmd) 生成两类 Windows 包：
+维护者可以运行 [package-windows.cmd](windows/package-windows.cmd) 生成两类 Windows 包：
 
-- `CoMind-user-<version>-win-x64.zip`：给普通用户，解压后双击 `Start CoMind.cmd` 即可使用，内置 `CoMind.exe`、前端资源、便携 Node 和 pi runtime，不要求用户安装 Python / git / Node。
-- `CoMind-windows-dev-<version>.zip`：给 Windows 开发者或部署者，保留源码和一键脚本，解压后运行 `install.cmd` 即可部署。
+- `comind-<version>-windows-x86_64.zip`：给普通用户，解压后双击 `Start CoMind.cmd` 即可使用，内置 `CoMind.exe`、前端资源、便携 Node 和 pi runtime，不要求用户安装 Python / git / Node。
+- `comind-<version>-windows-x86_64-dev.zip`：给 Windows 开发者或部署者，保留源码和一键脚本，解压后运行 `windows\install.cmd` 即可部署。
 
-Windows 包的使用入口见 [WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md)。详细构建说明、前置要求和离线 Node 包用法见 [WINDOWS_PACKAGING.md](WINDOWS_PACKAGING.md)。
+Windows 包的使用入口见 [WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md)。详细构建说明、前置要求和离线 Node 包用法见 [WINDOWS_PACKAGING.md](windows/WINDOWS_PACKAGING.md)。
 
 ## 数据与隐私
 

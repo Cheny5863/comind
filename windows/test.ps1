@@ -3,7 +3,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Root = Split-Path -Parent $PSCommandPath
+$Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
 
 function Write-Info([string]$Message) {

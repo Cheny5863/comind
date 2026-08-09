@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $TaskName = 'CoMind'
-$Root = Split-Path -Parent $PSCommandPath
+$Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 
 function Write-Info([string]$Message) {
     Write-Host "[comind-service] $Message" -ForegroundColor Green

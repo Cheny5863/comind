@@ -4,7 +4,7 @@
 #   BASE_URL 可选：内网/HTTP 分发地址（如 http://download.example.com/comind），
 #   不传则 latest.json 里 url 用相对路径（配合本地目录分发）。
 # 产出: dist-release/
-#   comind--linux-x64-<VER>.tar.gz   发布包（含 comind-server 二进制 + 前端资源 + install/update/service）
+#   comind-<VER>-linux-x86_64.tar.gz   发布包（含 comind-server 二进制 + 前端资源 + install/update/service）
 #   latest.json                   版本清单（version/sha256/url）
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -33,8 +33,8 @@ pyinstaller --noconfirm --clean \
 
 echo "==> [3/4] 组发布目录 + 打 tar.gz"
 REL="dist-release"
-STAGE="$REL/comind--linux-x64-$VER"
-rm -rf "$STAGE" "$REL/comind--linux-x64-$VER.tar.gz" "$REL/latest.json"
+STAGE="$REL/comind-$VER-linux-x86_64"
+rm -rf "$STAGE" "$REL/comind-$VER-linux-x86_64.tar.gz" "$REL/latest.json"
 mkdir -p "$STAGE"
 cp -r dist/comind-server "$STAGE/comind-server"
 cp comind.service "$STAGE/comind.service"
@@ -42,23 +42,23 @@ cp install.sh "$STAGE/install.sh"
 cp update.sh "$STAGE/update.sh"
 cp VERSION "$STAGE/VERSION"   # 顶层版本文件，供 install/update 对比
 chmod +x "$STAGE/install.sh" "$STAGE/update.sh"
-(cd "$REL" && tar czf "comind--linux-x64-$VER.tar.gz" "comind--linux-x64-$VER")
-SHA="$(sha256sum "$REL/comind--linux-x64-$VER.tar.gz" | awk '{print $1}')"
+(cd "$REL" && tar czf "comind-$VER-linux-x86_64.tar.gz" "comind-$VER-linux-x86_64")
+SHA="$(sha256sum "$REL/comind-$VER-linux-x86_64.tar.gz" | awk '{print $1}')"
 
 echo "==> [4/4] 生成 latest.json"
 if [ -n "$BASE_URL" ]; then
-    URL="$BASE_URL/comind--linux-x64-$VER.tar.gz"
+    URL="$BASE_URL/comind-$VER-linux-x86_64.tar.gz"
 else
-    URL="comind--linux-x64-$VER.tar.gz"
+    URL="comind-$VER-linux-x86_64.tar.gz"
 fi
 cat > "$REL/latest.json" <<EOF
 {"version":"$VER","url":"$URL","sha256":"$SHA"}
 EOF
 
-SIZE="$(du -h "$REL/comind--linux-x64-$VER.tar.gz" | cut -f1)"
+SIZE="$(du -h "$REL/comind-$VER-linux-x86_64.tar.gz" | cut -f1)"
 echo ""
 echo "完成 ✓  版本 $VER"
-echo "  发布包:  $ROOT/$REL/comind--linux-x64-$VER.tar.gz ($SIZE)"
+echo "  发布包:  $ROOT/$REL/comind-$VER-linux-x86_64.tar.gz ($SIZE)"
 echo "  latest:  $ROOT/$REL/latest.json"
 echo ""
 echo "分发方式:"

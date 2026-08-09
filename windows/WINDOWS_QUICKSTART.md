@@ -9,7 +9,7 @@ This guide is for Windows users who downloaded a CoMind release package.
 Use this if you only want to run CoMind:
 
 ```text
-CoMind-user-<version>-win-x64.zip
+comind-<version>-windows-x86_64.zip
 ```
 
 How to use:
@@ -42,13 +42,13 @@ came from a trusted CoMind release. Click "More info" and then "Run anyway".
 Use this if you want source deployment, testing, service setup, or repackaging:
 
 ```text
-CoMind-windows-dev-<version>.zip
+comind-<version>-windows-x86_64-dev.zip
 ```
 
 Recommended first run:
 
 ```powershell
-cd CoMind-windows-dev-<version>
+cd comind-<version>-windows-x86_64-dev
 .\install.cmd
 ```
 
@@ -101,7 +101,7 @@ Get-Content "$env:LOCALAPPDATA\CoMind\comind-exe.log" -Tail 80
 
 If the AI panel reports `Cannot find module ... dist\cli.js`, the user package
 is incomplete or old. Rebuild with the latest `package-windows.cmd` and send the
-new `CoMind-user-<version>-win-x64.zip`.
+new `comind-<version>-windows-x86_64.zip`.
 
 ## Build Release Packages
 

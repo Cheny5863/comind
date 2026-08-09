@@ -3,7 +3,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Root = Split-Path -Parent $PSCommandPath
+$Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 Set-Location $Root
 
 function Write-Info([string]$Message) {

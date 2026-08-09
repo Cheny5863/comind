@@ -15,7 +15,7 @@ CoMind is an all-in-one tool combining an **AI assistant** with a **mind map**. 
 
 ```bash
 # Get install.sh and the release package (see Releases), then:
-bash install.sh comind--linux-x64-<version>.tar.gz
+bash install.sh comind-<version>-linux-x86_64.tar.gz
 ```
 
 The script will:
@@ -29,7 +29,7 @@ The script will:
 
 ### Windows release package
 
-Download from Releases. **Normal users: `CoMind-user-<version>-win-x64.zip`**; **developers/deployers: `CoMind-windows-dev-<version>.zip`**.
+Download from Releases. **Normal users: `comind-<version>-windows-x86_64.zip`**; **developers/deployers: `comind-<version>-windows-x86_64-dev.zip`**.
 
 **Normal users (no Python / Node / git required)**:
 
@@ -43,14 +43,14 @@ Double-click `Stop CoMind.cmd` to stop. If SmartScreen warns about an unsigned a
 **Developers / deployers**:
 
 ```powershell
-cd CoMind-windows-dev-<version>
-.\install.cmd        # first install or rebuild dependencies
-.\start.cmd          # start CoMind
+cd comind-<version>-windows-x86_64-dev
+.\windows\install.cmd        # first install or rebuild dependencies
+.\windows\start.cmd          # start CoMind
 ```
 
-Daily commands: `start.cmd` / `stop.cmd` / `status.cmd` / `test.cmd`; autostart after login via `service-install.cmd` (remove with `service-uninstall.cmd`).
+Daily commands: `windows\start.cmd` / `windows\stop.cmd` / `windows\status.cmd` / `windows\test.cmd`; autostart after login via `windows\service-install.cmd` (remove with `windows\service-uninstall.cmd`).
 
-> Full usage notes: [WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md).
+> Full usage notes: [WINDOWS_QUICKSTART.md](windows/WINDOWS_QUICKSTART.md).
 
 ## Architecture
 
@@ -113,16 +113,16 @@ pytest                      # mind map diff/apply/ops + pi workflow
 
 ```powershell
 # Run from the repository root
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+powershell -ExecutionPolicy Bypass -File .\windows\install.ps1
 ```
 
-You can also double-click [install.cmd](install.cmd) or run [update.cmd](update.cmd). On Windows, the script will:
+You can also double-click [install.cmd](windows/install.cmd) or run [update.cmd](windows/update.cmd). On Windows, the script will:
 1. Create `.venv` and install backend dependencies
 2. Install or reuse Node.js, then install `pi-coding-agent`
 3. Build the frontend into `dist/` and sync the root `index.html`
 4. Start the backend and write logs to `%LOCALAPPDATA%\CoMind\comind.log`
 
-For daily startup, double-click [start.cmd](start.cmd); to stop the backend, double-click [stop.cmd](stop.cmd). To start CoMind automatically after Windows login, run [service-install.cmd](service-install.cmd); to remove autostart, run [service-uninstall.cmd](service-uninstall.cmd). To inspect the current state, run [status.cmd](status.cmd). To run a local smoke test, run [test.cmd](test.cmd).
+For daily startup, double-click [start.cmd](windows/start.cmd); to stop the backend, double-click [stop.cmd](windows/stop.cmd). To start CoMind automatically after Windows login, run [service-install.cmd](windows/service-install.cmd); to remove autostart, run [service-uninstall.cmd](windows/service-uninstall.cmd). To inspect the current state, run [status.cmd](windows/status.cmd). To run a local smoke test, run [test.cmd](windows/test.cmd).
 
 The Windows source deployment stores runtime data in `%LOCALAPPDATA%\CoMind`:
 - `private\keys.json`: model API keys
@@ -132,16 +132,16 @@ The Windows source deployment stores runtime data in `%LOCALAPPDATA%\CoMind`:
 
 If `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` points at a disabled placeholder such as `127.0.0.1:9`, the backend does not pass it to pi by default so AI calls do not fail with `Connection error`. Set `SMM_PI_USE_SYSTEM_PROXY=1` before startup if pi should use the system proxy.
 
-For updates, rerun [install.ps1](install.ps1) or [update.ps1](update.ps1); the script stops the previous process, rebuilds, and restarts the app.
+For updates, rerun [install.ps1](windows/install.ps1) or [update.ps1](windows/update.ps1); the script stops the previous process, rebuilds, and restarts the app.
 
 ### Windows release packaging
 
-Maintainers can run [package-windows.cmd](package-windows.cmd) to create two Windows package types:
+Maintainers can run [package-windows.cmd](windows/package-windows.cmd) to create two Windows package types:
 
-- `CoMind-user-<version>-win-x64.zip`: for nontechnical users. Unzip it and double-click `Start CoMind.cmd`. It includes `CoMind.exe`, frontend assets, portable Node.js, and the pi runtime, so users do not need Python / git / Node installed.
-- `CoMind-windows-dev-<version>.zip`: for Windows developers or deployers. It keeps the source tree and one-click scripts; unzip it and run `install.cmd`.
+- `comind-<version>-windows-x86_64.zip`: for nontechnical users. Unzip it and double-click `Start CoMind.cmd`. It includes `CoMind.exe`, frontend assets, portable Node.js, and the pi runtime, so users do not need Python / git / Node installed.
+- `comind-<version>-windows-x86_64-dev.zip`: for Windows developers or deployers. It keeps the source tree and one-click scripts; unzip it and run `windows\install.cmd`.
 
-See [WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md) for package usage. See [WINDOWS_PACKAGING.md](WINDOWS_PACKAGING.md) for build prerequisites, commands, and offline Node zip usage.
+See [WINDOWS_QUICKSTART.md](WINDOWS_QUICKSTART.md) for package usage. See [WINDOWS_PACKAGING.md](windows/WINDOWS_PACKAGING.md) for build prerequisites, commands, and offline Node zip usage.
 
 ## Data & Privacy
 

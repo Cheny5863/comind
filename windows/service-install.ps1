@@ -3,7 +3,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Root = Split-Path -Parent $PSCommandPath
+$Root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $TaskName = 'CoMind'
 $StartScript = Join-Path $Root 'start.ps1'
 $ServiceRunner = Join-Path $Root 'service-run.cmd'

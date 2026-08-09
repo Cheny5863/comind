@@ -20,8 +20,8 @@ PKG="${1:-}"
 if [ -z "$PKG" ] && [ -f ./latest.json ]; then
     PKG="$(grep -o '"url":"[^"]*"' ./latest.json | head -1 | cut -d'"' -f4)"
 fi
-if [ -z "$PKG" ] && ls ./comind--linux-x64-*.tar.gz >/dev/null 2>&1; then
-    PKG="$(ls ./comind--linux-x64-*.tar.gz | head -1)"
+if [ -z "$PKG" ] && ls ./comind-*-linux-x86_64.tar.gz >/dev/null 2>&1; then
+    PKG="$(ls ./comind-*-linux-x86_64.tar.gz | head -1)"
 fi
 [ -n "$PKG" ] || die "$(L "找不到发布包：请传包路径/URL，或把 tar.gz + latest.json 放在本目录" "Package not found: pass a path/URL, or put tar.gz + latest.json in this directory")"
 

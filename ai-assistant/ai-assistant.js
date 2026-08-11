@@ -30,6 +30,7 @@
       mapUpdated: "🗺️ <em>脑图已更新</em>",
       noHistory: "暂无历史会话",
       noNodeSelected: "请先选中一个节点，再新建分支 Agent",
+      nodeAssistNoSelection: "请先在画布中选中一个节点，再点「AI 助理」引用它",
       nMessages: " 条",
       switchingModel: "切换模型…",
       switchFailed: "切换失败",
@@ -99,6 +100,7 @@
       mapUpdated: "🗺️ <em>Mind map updated</em>",
       noHistory: "No sessions yet",
       noNodeSelected: "Select a node first to create a branch agent",
+      nodeAssistNoSelection: "Select a node on the canvas first, then click AI Assistant to quote it",
       nMessages: " msgs",
       switchingModel: "Switching model…",
       switchFailed: "Switch failed",
@@ -1382,9 +1384,11 @@
   function nodeAssist() {
     const node = activeNode();
     if (!node) {
-      // 无选中节点：打开面板并直接聚焦输入框（双向导航：随时按 Ctrl+J 回到输入框）
+      // 无选中节点：打开面板并直接聚焦输入框（双向导航：随时按 Ctrl+J 回到输入框），
+      // 同时明确提示——否则用户以为"引用"没生效（实际是选中状态丢了/没选中）
       openPanelFlash();
       document.getElementById("ai-input").focus();
+      toast(t("nodeAssistNoSelection"));
       return;
     }
     const uid = node.nodeData.data.uid || "";

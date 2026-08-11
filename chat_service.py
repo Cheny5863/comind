@@ -758,7 +758,8 @@ class ChatSessionManager:
     def get_or_spawn(self, map_key: str, branch_uid: str = "") -> ChatSession:
         skey = session_key(map_key, branch_uid)
         with self._lock:
-            sess = self._sessions.get(skey)
+            session_file = self._mapping.get(skey)
+            sess = self._sessions.get(session_file) if session_file else None
             if sess and sess.alive:
                 return sess
             # Evict the longest-idle session if at max
@@ -768,8 +769,7 @@ class ChatSessionManager:
                 if evictable:
                     oldest = min(evictable, key=lambda s: s.last_active)
                     oldest.kill()
-                    self._sessions.pop(session_key(oldest.map_key, oldest.branch_uid), None)
-            session_file = self._mapping.get(skey)
+                    self._sessions.pop(oldest.session_file, None)
             if session_file and not _is_valid_pi_session_file(Path(session_file)):
                 logger.warning("discarding invalid pi session mapping for %s: %s", skey, session_file)
                 self._mapping.pop(skey, None)
@@ -777,7 +777,7 @@ class ChatSessionManager:
                 session_file = None
             sess = ChatSession(map_key, branch_uid, session_file, self._lang_pref.get(skey, "zh"), self._map_state)
             sess.spawn()
-            self._sessions[skey] = sess
+            self._sessions[sess.session_file or ""] = sess
             # Re-apply the user's model choice to the fresh pi process
             pref = self._model_pref.get(map_key)
             if pref:
@@ -829,7 +829,8 @@ class ChatSessionManager:
         sess.send({"type": "prompt", "message": full_msg})
 
     def abort(self, map_key: str, branch_uid: str = "") -> bool:
-        sess = self._sessions.get(session_key(map_key, branch_uid))
+        skey = session_key(map_key, branch_uid)
+        sess = self._sessions.get(self._mapping.get(skey, "")) if self._mapping.get(skey) else None
         if sess and sess.alive:
             # 立即标记 abort —— _read_stdout 会吞掉后续内容事件，前端不再收到残留流
             sess._abort_requested = True
@@ -872,7 +873,8 @@ class ChatSessionManager:
         """
         skey = session_key(map_key, branch_uid)
         with self._lock:
-            sess = self._sessions.pop(skey, None)
+            sf = self._mapping.get(skey)
+            sess = self._sessions.pop(sf, None) if sf else None
             if sess:
                 sess.kill()
             self._mapping.pop(skey, None)
@@ -994,7 +996,7 @@ class ChatSessionManager:
         sess.session_file 可能被 pi 返回的 sessionFile 覆盖且无 SSE 连接时未同步回 mapping。
         """
         skey = session_key(map_key, branch_uid)
-        sess = self._sessions.get(skey)
+        sess = self._sessions.get(session_file) if session_file else None
         if sess is None or not sess._in_turn:
             return False
         active = self._mapping.get(skey) or str(sess.session_file or "")
@@ -1138,6 +1140,7 @@ class ChatSessionManager:
         agents: dict[str, dict] = {}
         # root agent
         root_sf = self._mapping.get(map_key)
+        root_sess = self._sessions.get(root_sf) if root_sf else None
         agents[""] = {
             "branch_uid": "",
             "deleted": False,
@@ -1145,15 +1148,14 @@ class ChatSessionManager:
             "display_label": "",
             "session_file": root_sf,
             "has_history": self._session_has_history(root_sf),
-            "streaming": self._sessions.get(map_key, None) is not None
-            and self._sessions[map_key]._in_turn,
+            "streaming": root_sess is not None and root_sess._in_turn,
         }
         # 各分支 agent（来自 mapping 键 map_key::branch_uid）
         for skey, sf in self._mapping.items():
             mkey, b = split_session_key(skey)
             if mkey != map_key or not b:
                 continue
-            sess = self._sessions.get(skey)
+            sess = self._sessions.get(sf) if sf else None
             full = _branch_label(map_key, b, self._map_state.get(map_key), self._lang_pref.get(skey, "zh"))
             agents[b] = {
                 "branch_uid": b,
@@ -1167,7 +1169,12 @@ class ChatSessionManager:
         return sorted(agents.values(), key=lambda a: (a["branch_uid"] != "", a["label"]))
 
     def switch_session(self, map_key: str, session_file: str, branch_uid: str = "") -> bool:
-        """Switch to a different session file for a (map, branch)."""
+        """Switch to a different session file for a (map, branch).
+
+        切换只更新 mapping（前端查看的活跃文件），**不 kill 任何进程**——
+        切走的 session 的 pi 进程继续在后台跑完当前回合，切回来时
+        get_or_spawn 按 session_file 找到原进程直接复用（SSE replay 接上进度）。
+        """
         path = Path(session_file)
         if not path.is_file():
             return False
@@ -1179,15 +1186,7 @@ class ChatSessionManager:
             return False
         skey = session_key(map_key, branch_uid)
         with self._lock:
-            # 幂等：目标就是当前活跃会话且进程还活着 → 不 kill（保留进行中回合，
-            # 前端 SSE replay 自然接上进度，避免"只是想查看却中断了 agent 工作"）
-            if str(self._mapping.get(skey, "")) == session_file:
-                sess = self._sessions.get(skey)
-                if sess is not None and sess.alive:
-                    return True
-            sess = self._sessions.pop(skey, None)
-            if sess:
-                sess.kill()
+            # 幂等：目标就是当前活跃会话 → 只更新 mapping 即可
             self._mapping[skey] = session_file
             self._save_mapping()
         return True
@@ -1273,7 +1272,8 @@ class ChatSessionManager:
 
     def get_status(self, map_key: str, branch_uid: str = "") -> dict:
         """Return session streaming status for frontend state recovery."""
-        sess = self._sessions.get(session_key(map_key, branch_uid))
+        skey = session_key(map_key, branch_uid)
+        sess = self._sessions.get(self._mapping.get(skey, "")) if self._mapping.get(skey) else None
         if sess and sess.alive:
             return {"alive": True, "streaming": sess._in_turn}
         return {"alive": False, "streaming": False}
@@ -1321,7 +1321,7 @@ class ChatSessionManager:
         天然按 session 隔离，不会混入用户手动编辑或其他分支的改动。
         """
         skey = session_key(map_key, branch_uid)
-        sess = self._sessions.get(skey)
+        sess = self._sessions.get(self._mapping.get(skey, "")) if self._mapping.get(skey) else None
         if not sess or not sess.session_file:
             return
         self._turn_before[skey] = {
@@ -1339,7 +1339,7 @@ class ChatSessionManager:
         skey = session_key(map_key, branch_uid)
         rec = self._turn_before.pop(skey, None)
         diff = self._turn_ops.pop(skey, [])
-        sess = self._sessions.get(skey)
+        sess = self._sessions.get(self._mapping.get(skey, "")) if self._mapping.get(skey) else None
         if not rec or not sess or not sess.session_file:
             return
         sf = Path(sess.session_file)
@@ -1362,7 +1362,7 @@ class ChatSessionManager:
         turns.json 的 diff 按 user_msg_idx 附加（有 diff 的轮次脑图可精确回滚）。
         """
         skey = session_key(map_key, branch_uid)
-        sess = self._sessions.get(skey)
+        sess = self._sessions.get(self._mapping.get(skey, "")) if self._mapping.get(skey) else None
         session_file = sess.session_file if sess and sess.session_file else self._mapping.get(skey)
         if not session_file or not Path(session_file).is_file():
             return []
@@ -1397,7 +1397,7 @@ class ChatSessionManager:
         返回 {"ok", "skipped", "user_msg", "map_restored"}。
         """
         skey = session_key(map_key, branch_uid)
-        sess = self._sessions.get(skey)
+        sess = self._sessions.get(self._mapping.get(skey, "")) if self._mapping.get(skey) else None
         session_file = sess.session_file if sess and sess.session_file else self._mapping.get(skey)
         if not session_file or not Path(session_file).is_file():
             return {"ok": False, "error": "session 不存在"}
@@ -1455,7 +1455,7 @@ class ChatSessionManager:
         skipped = _apply_reverse(self, map_key, later_diffs, branch_uid) if later_diffs else []
         # 4.5 广播完成（_commit_map 已发 mindmap_update 给本 session 的 SSE 订阅者），
         #     现在才把 session 移出活跃池——旧 SSE 连接由前端 connectSSE() 重连替换
-        self._sessions.pop(skey, None)
+        self._sessions.pop(session_file, None)
         # 5. mapping 指向同一 session 文件——前端 SSE 重连时 get_or_spawn 加载截断文件
         self._mapping[skey] = session_file
         self._save_mapping()
@@ -2053,8 +2053,8 @@ def _broadcast_map_update(manager: ChatSessionManager, key: str, new_data: dict,
          "branch": branch_uid},
         ensure_ascii=False,
     )
-    for skey, sess in list(manager._sessions.items()):
-        if skey == key or skey.startswith(key + "::"):
+    for sess in list(manager._sessions.values()):
+        if sess.map_key == key:
             # 缓存最近一次改图广播：SSE 重连时 subscribe(replay) 重放兜底
             sess.last_map_event = event
             for q in list(sess.listeners):

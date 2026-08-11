@@ -800,15 +800,45 @@ window.initCapture = () => {{
             body: JSON.stringify({{uid: node.uid}})
           }}).catch(() => {{}});
         }}
+        avoidPanelForEdit(node);
       }});
       mindMap.on('hide_text_edit', () => {{
         fetch('/api/editing/' + encodeURIComponent(window.currentFileName) + '/unlock', {{
           method: 'POST'
         }}).catch(() => {{}});
+        restorePanelAfterEdit();
       }});
     }});
   }}
 }};
+
+// ===== 聊天面板自动避让 =====
+// 节点文本编辑时，若聊天面板与编辑框重叠，临时将面板平移到左侧；编辑结束恢复。
+function avoidPanelForEdit(node) {{
+  const panel = document.getElementById('ai-panel');
+  if (!panel || panel.classList.contains('hidden')) return; // 面板未开，无需避让
+  if (window.innerWidth <= 640) return; // 移动端全屏，无避让意义
+  // 编辑时节点文本组被 hide（rect 全 0），用节点整体 group 的 rect
+  const el = (node && node.group && node.group.node) ||
+             (node && node._textData && node._textData.node && node._textData.node.node);
+  if (!el) return;
+  const nr = el.getBoundingClientRect();
+  const pr = panel.getBoundingClientRect();
+  const overlap = !(nr.right <= pr.left || nr.left >= pr.right ||
+                    nr.bottom <= pr.top || nr.top >= pr.bottom);
+  if (!overlap) return; // 不重叠不动，避免打扰
+  panel.dataset.avoiding = '1';
+  panel.style.transition = 'transform .2s ease';
+  panel.style.transform = 'translateX(calc(-100% - 48px))';
+}}
+function restorePanelAfterEdit() {{
+  const panel = document.getElementById('ai-panel');
+  if (!panel || panel.dataset.avoiding !== '1') return;
+  delete panel.dataset.avoiding;
+  panel.style.transition = 'transform .2s ease';
+  panel.style.transform = '';
+  setTimeout(() => {{ panel.style.transition = ''; }}, 250);
+}}
 
 // ===== 剪贴板修复 =====
 // 生成节点树的文本表示（用于粘到微信等外部应用）

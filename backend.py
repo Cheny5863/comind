@@ -813,7 +813,8 @@ window.initCapture = () => {{
 }};
 
 // ===== 聊天面板自动避让 =====
-// 节点文本编辑时，若聊天面板与编辑框重叠，临时将面板平移到左侧；编辑结束恢复。
+// 节点文本编辑时，若聊天面板与编辑框重叠，临时把面板平移到屏幕另一侧；编辑结束恢复。
+// 方向自适应：面板在右半屏 → 左移；在左半屏 → 右移（用户拖拽面板后固定左移会把它推出屏幕）。
 function avoidPanelForEdit(node) {{
   const panel = document.getElementById('ai-panel');
   if (!panel || panel.classList.contains('hidden')) return; // 面板未开，无需避让
@@ -827,9 +828,12 @@ function avoidPanelForEdit(node) {{
   const overlap = !(nr.right <= pr.left || nr.left >= pr.right ||
                     nr.bottom <= pr.top || nr.top >= pr.bottom);
   if (!overlap) return; // 不重叠不动，避免打扰
+  const shift = (pr.left + pr.width / 2) > window.innerWidth / 2
+    ? 'calc(-100% - 48px)'   // 面板在右半屏 → 左移
+    : 'calc(100% + 48px)';   // 面板在左半屏 → 右移
   panel.dataset.avoiding = '1';
   panel.style.transition = 'transform .2s ease';
-  panel.style.transform = 'translateX(calc(-100% - 48px))';
+  panel.style.transform = 'translateX(' + shift + ')';
 }}
 function restorePanelAfterEdit() {{
   const panel = document.getElementById('ai-panel');

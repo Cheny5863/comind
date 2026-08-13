@@ -958,7 +958,11 @@
       connectSSE();
       recoverStreamState();
     };
-    if (hasHistory) {
+    if (hasHistory && ag && ag.streaming) {
+      // 该分支正在跑：不 reset——后端 reset 会 kill pi 进程，直接打断当前回合。
+      // 只切换过去等它跑完，下次再按才真正新开一轮。
+      doSwitch();
+    } else if (hasHistory) {
       // 已交流过：reset 新开一轮（旧会话文件保留在历史列表）
       fetch(api("reset", branch), { method: "POST" }).then(doSwitch).catch(() => {});
     } else {
@@ -1666,7 +1670,10 @@
     // 不用 Ctrl+N：Chrome 保留快捷键（新建窗口）页面 JS 无法拦截，必须用非保留组合
     // 不走 togglePanel（其"恢复上次 session"逻辑会异步覆盖新建意图），直接打开面板 + newAgent
     document.addEventListener("keydown", (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.altKey && (e.key === "n" || e.key === "N")) {
+      // key 匹配加 keyCode/code 兜底：中文输入法（IME）激活时 e.key 可能是
+      // "Process"/"Unidentified"（keyCode 229），只用 e.key 会静默失效
+      const isN = e.key === "n" || e.key === "N" || e.keyCode === 78 || e.code === "KeyN";
+      if ((e.ctrlKey || e.metaKey) && e.altKey && isN) {
         e.preventDefault();
         const panel = document.getElementById("ai-panel");
         if (panel.classList.contains("hidden")) {
@@ -1682,12 +1689,12 @@
         newAgent();
       }
       // Ctrl+Alt+PageUp / PageDown：按更新时间切换上一个/下一个会话
-      if ((e.ctrlKey || e.metaKey) && e.altKey && e.key === "PageUp") {
+      if ((e.ctrlKey || e.metaKey) && e.altKey && (e.key === "PageUp" || e.code === "PageUp")) {
         e.preventDefault();
         stepSession(-1);
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.altKey && e.key === "PageDown") {
+      if ((e.ctrlKey || e.metaKey) && e.altKey && (e.key === "PageDown" || e.code === "PageDown")) {
         e.preventDefault();
         stepSession(1);
         return;

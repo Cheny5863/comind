@@ -1,7 +1,6 @@
 /* AI 助理聊天面板
  * 布局：header（精简）→ body（会话列表/消息/抽屉）→ 工具条（模型/背景/Keys）→ 输入区
- * PC：可拖拽移动 + 右下角 resize 调大小（尺寸记忆 localStorage）
- * 移动端（max-width:640px）：全屏沉浸式聊天界面，触控目标 ≥44px，safe-area 适配
+ * PC/移动端统一逻辑（2026-08-13 起移除移动端全屏适配）：可拖拽移动 + 右下角 resize 调大小（尺寸记忆 localStorage）
  */
 .ai-fab {
   position: fixed; right: 24px; bottom: 24px; z-index: 9999;
@@ -392,77 +391,4 @@
 .ai-session-count { flex: none; font-size: 11px; color: #909399; }
 .ai-session-branch.root {
   color: #909399; background: #f4f4f5;
-}
-
-/* ══════════════════════════════════════════════
- * 移动端适配（≤640px）：全屏沉浸式聊天界面
- * 差异点：全屏布局 / 底部输入区固定 / 触控目标≥44px / safe-area / 无拖拽 resize
- * ══════════════════════════════════════════════ */
-@media (max-width: 640px) {
-  .ai-fab {
-    width: 56px; height: 56px; font-size: 26px;
-    right: 16px; bottom: calc(20px + env(safe-area-inset-bottom));
-  }
-  .ai-panel {
-    left: 0 !important; top: 0 !important; right: 0; bottom: 0;
-    width: 100% !important; height: 100% !important;
-    max-width: none; max-height: none; min-width: 0; min-height: 0;
-    border-radius: 0; border: none;
-  }
-  .ai-panel:not(.hidden) { animation: aiPanelUp .25s ease; }
-  @keyframes aiPanelUp {
-    from { transform: translateY(40px); opacity: .4; }
-    to   { transform: none; opacity: 1; }
-  }
-  /* header：更高触控目标 */
-  .ai-header { padding: 10px 12px; gap: 8px; }
-  .ai-title { font-size: 15px; }
-  .ai-btn-sm { width: 36px; height: 36px; font-size: 17px; border-radius: 8px; }
-  .ai-status { font-size: 12px; }
-  /* ⚠️ v0.1.25 回退：移动端适配整体放弃（bug 多，用 PC 端模式访问），
-     label-group 恢复 v0.1.21 原样（绝对居中悬浮，窄屏可能与按钮重叠，
-     但移动端已不在维护范围） */
-  .ai-agent-label { max-width: 110px; }
-  /* 工具条：按钮只留图标，模型选择撑满 */
-  .ai-toolbar { padding: 8px 12px; gap: 8px; }
-  .ai-model-select { padding: 8px 8px; font-size: 14px; }
-  .ai-thinking-select { width: 80px; padding: 8px 8px; font-size: 14px; }
-  .ai-tool-btn { padding: 9px 11px; font-size: 15px; }
-  .ai-tool-btn span { display: none; }
-  /* 消息区 */
-  .ai-messages { padding: 14px 12px; }
-  .ai-bubble { max-width: 92%; font-size: 15px; padding: 10px 13px; }
-  .ai-tool-call { font-size: 12px; }
-  .ai-thinking { font-size: 13px; }
-  .ai-thinking-body { max-height: 200px; }
-  .ai-code { font-size: 13px; padding: 10px; }
-  /* 输入区：底部固定 + 键盘 safe-area，输入字号 16px 防 iOS 聚焦缩放 */
-  .ai-input-area { padding-bottom: env(safe-area-inset-bottom); }
-  .ai-input-wrap { padding: 10px 12px 6px; }
-  .ai-input { min-height: 44px; font-size: 16px; }
-  .ai-input-buttons { padding: 6px 12px 12px; }
-  .ai-send, .ai-abort { padding: 10px 22px; font-size: 15px; border-radius: 8px; min-width: 84px; }
-  /* 会话列表：更高条目 */
-  .ai-session-list { max-height: 42vh; }
-  .ai-session-item { padding: 12px 14px; font-size: 14px; }
-  .ai-session-branch { font-size: 12px; }
-  .ai-session-count { font-size: 12px; }
-  /* 抽屉 */
-  .ai-bg-drawer { padding: 14px 12px; }
-  .ai-bg-drawer textarea { font-size: 15px; }
-  .ai-bg-drawer .bar button { padding: 10px 20px; font-size: 15px; }
-  .ai-settings-group summary { font-size: 15px; }
-  .ai-shortcut-keys { font-size: 12px; padding: 3px 8px; }
-  .ai-key-row { padding: 12px; }
-  .ai-key-input { font-size: 15px; padding: 9px 10px; }
-  .ai-key-btn { padding: 9px 16px; font-size: 14px; }
-  .ai-key-eye { width: 38px; }
-  .ai-toast { bottom: calc(110px + env(safe-area-inset-bottom)); font-size: 14px; padding: 10px 18px; }
-  /* 全屏模式隐藏 resize handle */
-  .ai-resize { display: none !important; }
-  /* 防移动端点击高亮闪烁 */
-  .ai-panel, .ai-fab, .ai-btn-sm, .ai-tool-btn, .ai-send, .ai-abort,
-  .ai-session-item, .ai-quote-chip, .ai-key-btn, .ai-key-eye {
-    -webkit-tap-highlight-color: transparent;
-  }
 }

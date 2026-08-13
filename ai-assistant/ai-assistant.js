@@ -358,13 +358,8 @@
     initResize(panel);
   }
 
-  /* ── 移动端检测：≤640px 视为触屏设备，走全屏沉浸式布局（无拖拽/无 resize）── */
-  function isMobile() {
-    return window.matchMedia("(max-width: 640px)").matches;
-  }
-
+  /* ── 拖拽：header 拖动面板位置（PC/移动端统一逻辑，无移动端分支）── */
   function initDrag(panel, handle) {
-    if (isMobile()) return; // 移动端全屏，无需拖动
     let dragging = false, sx, sy, sl, st;
     handle.style.cursor = "grab";
     handle.addEventListener("mousedown", (e) => {
@@ -386,9 +381,8 @@
     document.addEventListener("mouseup", () => { dragging = false; });
   }
 
-  /* ── 拖拽调整大小：右下角 handle，尺寸记忆 localStorage ── */
+  /* ── 拖拽调整大小：右下角 handle，尺寸记忆 localStorage（PC/移动端统一逻辑）── */
   function initResize(panel) {
-    if (isMobile()) return; // 移动端全屏，无需调整
     // 恢复上次调整的尺寸
     try {
       const s = JSON.parse(localStorage.getItem("comind_panel_size") || "null");

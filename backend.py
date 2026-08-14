@@ -800,25 +800,25 @@ window.initCapture = () => {{
             body: JSON.stringify({{uid: node.uid}})
           }}).catch(() => {{}});
         }}
-        avoidPanelForEdit(node);
+        avoidMapForEdit(node);
       }});
       mindMap.on('hide_text_edit', () => {{
         fetch('/api/editing/' + encodeURIComponent(window.currentFileName) + '/unlock', {{
           method: 'POST'
         }}).catch(() => {{}});
-        restorePanelAfterEdit();
+        // 编辑完成不处理画布——避让 fire-and-forget，画布位置归用户控制
       }});
     }});
   }}
 }};
 
-// ===== 聊天面板自动避让 =====
-// 节点文本编辑时，若聊天面板与编辑框重叠，临时把面板平移到屏幕另一侧；编辑结束恢复。
-// 方向自适应：面板在右半屏 → 左移；在左半屏 → 右移（用户拖拽面板后固定左移会把它推出屏幕）。
-function avoidPanelForEdit(node) {{
+// ===== 画布避让（编辑节点时动画布，聊天面板不动）=====
+// 节点文本编辑时，若节点与聊天面板重叠，平移画布让被编辑节点离开面板遮挡。
+// Fire-and-forget：平移后不恢复、不接管、无状态——画布位置从此归用户自己控制。
+// 下次编辑若节点仍被挡（用户拖动画布后可能重新被挡），overlap 判断会再次让开。
+function avoidMapForEdit(node) {{
   const panel = document.getElementById('ai-panel');
   if (!panel || panel.classList.contains('hidden')) return; // 面板未开，无需避让
-  if (window.innerWidth <= 640) return; // 移动端全屏，无避让意义
   // 编辑时节点文本组被 hide（rect 全 0），用节点整体 group 的 rect
   const el = (node && node.group && node.group.node) ||
              (node && node._textData && node._textData.node && node._textData.node.node);
@@ -828,20 +828,42 @@ function avoidPanelForEdit(node) {{
   const overlap = !(nr.right <= pr.left || nr.left >= pr.right ||
                     nr.bottom <= pr.top || nr.top >= pr.bottom);
   if (!overlap) return; // 不重叠不动，避免打扰
-  const shift = (pr.left + pr.width / 2) > window.innerWidth / 2
-    ? 'calc(-100% - 48px)'   // 面板在右半屏 → 左移
-    : 'calc(100% + 48px)';   // 面板在左半屏 → 右移
-  panel.dataset.avoiding = '1';
-  panel.style.transition = 'transform .2s ease';
-  panel.style.transform = 'translateX(' + shift + ')';
+  const v = mindMapInstance && mindMapInstance.view;
+  if (!v) return;
+  // 屏幕位移量：让节点整体移出面板区域，留 24px 边距
+  const margin = 24;
+  let dx;
+  if ((pr.left + pr.width / 2) > window.innerWidth / 2) {{
+    // 面板在右半屏 → 节点左移（节点右边缘让到面板左边缘之外）
+    dx = pr.left - nr.right - margin;
+  }} else {{
+    // 面板在左半屏 → 节点右移（节点左边缘让到面板右边缘之外）
+    dx = pr.right - nr.left + margin;
+  }}
+  v.translateXY(dx, 0);
+  // 编辑框是独立 fixed DOM，平移画布后必须重定位。
+  // before_show_text_edit 在库的 showEditText 中间 emit：emit 后库会用平移前的旧 rect 设置 left/top，
+  // 所以这里不能同步重定位，要等库设置完成（下一帧）再覆盖成节点新位置。
+  requestAnimationFrame(repositionEditBox);
+  setTimeout(repositionEditBox, 0); // 双保险（个别浏览器 rAF 在样式提交前）
 }}
-function restorePanelAfterEdit() {{
-  const panel = document.getElementById('ai-panel');
-  if (!panel || panel.dataset.avoiding !== '1') return;
-  delete panel.dataset.avoiding;
-  panel.style.transition = 'transform .2s ease';
-  panel.style.transform = '';
-  setTimeout(() => {{ panel.style.transition = ''; }}, 250);
+// 画布平移后，编辑框（position:fixed 独立 DOM）不会自动跟随，需要手动重定位到节点新位置。
+// 库自带 updateTextEditNode 读 _textData.node.node（编辑时被 hide，rect 全 0），不能用；用 group rect 定位。
+function repositionEditBox() {{
+  const mm = mindMapInstance;
+  if (!mm) return;
+  const richText = mm.richText;
+  const textEdit = mm.renderer && mm.renderer.textEdit;
+  const editBox = (richText && richText.textEditNode) || (textEdit && textEdit.textEditNode);
+  const node = (richText && richText.node) || (textEdit && textEdit.currentNode);
+  if (!editBox || !node) return;
+  const el = (node.group && node.group.node) ||
+             (node._textData && node._textData.node && node._textData.node.node);
+  if (!el) return;
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0) return; // 节点不可见，放弃（保持原位置）
+  editBox.style.left = rect.left + 'px';
+  editBox.style.top = rect.top + 'px';
 }}
 
 // ===== 剪贴板修复 =====

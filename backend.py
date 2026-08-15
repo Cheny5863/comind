@@ -1039,6 +1039,16 @@ const setTakeOverAppMethods = (data) => {{
           }});
         }} catch(e) {{ alert(_L('XMind 保存失败: ', 'XMind save failed: ') + e.message); }}
       }} else {{
+        // ⚠️ 保存树必须用画布实时数据：AI 广播（mindmap_update）和 conflict 刷新
+        // 只更新画布（updateData），不会更新 storeData 用的模块缓存树。若用陈旧
+        // 缓存树保存，即使版本号匹配也会静默覆盖 AI 修改（life 脑图节点第二次
+        // 丢失即此路径：SSE 到达对齐版本后，旧缓存树 version==cur_ver 保存成功）。
+        // 画布 getData() 返回裸节点树 {{data, children}}，包成 {{root: live}} 替换
+        // d.root；theme/layout/config/view 等字段 AI 不动，继续用 d 的。
+        const liveTree = mindMapInstance && mindMapInstance.getData ? mindMapInstance.getData() : null;
+        if (liveTree && liveTree.data && liveTree.data.uid) {{
+          d = Object.assign({{}}, d, {{ root: liveTree }});
+        }}
         // copyRenderTree 会把渲染根节点的非 data/children 字段复制进 getData()
         // 输出（含 root 冗余快照）。保存前剥离，防止磁盘被污染：
         // root 树里的 root key 会让后端 sync_map 规范化失效，AI 读到旧快照。
@@ -1047,11 +1057,16 @@ const setTakeOverAppMethods = (data) => {{
         }}
         const current = await (await fetch('/api/load?name=' + encodeURIComponent(window.currentFileName))).json();
         current.mindMapData = d;
-        // ⚠️ version 必须用 load 返回的磁盘版本（current._comind_ver），不能只用
-        // 内存 window.__comindMapVer——慢网络下内存可能滞后（上一次保存还没返回），
-        // 提交旧版本 → 后端误判 conflict。load 的版本是磁盘权威，且串行锁保证
-        // 这次 load 到本次保存之间没有其他写。
-        const verForSave = (current && typeof current._comind_ver === 'number') ? current._comind_ver : (window.__comindMapVer || 0);
+        // ⚠️ 保存版本号必须用内存 window.__comindMapVer（前端画布所基于的版本），
+        // 不能拿 load 返回的磁盘权威版本：AI 写盘后磁盘 ver 已递增，但前端画布
+        // 可能还没应用 AI 更新（SSE 未达/广播丢失/apply 失败）——用新 ver 提交
+        // 旧画布，后端 version==cur_ver 判定匹配 → 旧画布静默覆盖 AI 修改，
+        // 乐观锁被 load-then-save 完全绕过（life 脑图 AI 添加的 11 节点被删即此 bug）。
+        // 用内存 ver：AI 更新后内存 ver 落后 → 后端判 conflict → 前端刷新画布，数据不丢。
+        // （v0.1.28 曾为修慢网络连续保存误报 conflict 改成 load 权威版本；串行锁
+        //   已保证同刻只有一个保存、返回后内存 ver 即对齐，误报场景由锁解决，无需
+        //   牺牲数据保护。saveMindMapConfig 一直用内存 ver 也无此问题。）
+        const verForSave = (window.__comindMapVer || 0);
         const resp = await fetch('/api/save?name=' + encodeURIComponent(window.currentFileName) + '&version=' + verForSave, {{
           method: 'POST', headers: {{'Content-Type':'application/json'}},
           body: JSON.stringify(current)

@@ -83,6 +83,8 @@ def _mount_static(prefix: str, name: str, directory: str) -> None:
 _mount_static("/dist", "dist", os.path.join(BASE_DIR, "dist"))
 # AI 助理前端资源
 _mount_static("/ai-assistant", "ai-assistant", os.path.join(BASE_DIR, "ai-assistant"))
+# Markdown 渲染器（markdown-it + katex + DOMPurify 的 UMD 产物，本地自包含，零 CDN）
+_mount_static("/vendor", "vendor", os.path.join(BASE_DIR, "vendor"))
 
 
 def _resource_path(*parts: str) -> str:
@@ -1178,11 +1180,25 @@ window.onload = async () => {{
     ai_ver = int(os.path.getmtime(ai_js)) if os.path.exists(ai_js) else 0
     switcher_js = _resource_path("map-switcher.js")
     switcher_ver = int(os.path.getmtime(switcher_js)) if os.path.exists(switcher_js) else 0
+    # Markdown 渲染器依赖（markdown-it / katex / DOMPurify，本地 vendor，零 CDN）
+    vendor_dir = os.path.join(BASE_DIR, "vendor")
+    def _vendor_ver(name: str) -> int:
+        p = os.path.join(vendor_dir, name)
+        return int(os.path.getmtime(p)) if os.path.exists(p) else 0
+    vendor_scripts = (
+        f'<script src="/vendor/markdown-it.min.js?v={_vendor_ver("markdown-it.min.js")}"></script>'
+        f'<script src="/vendor/katex.min.js?v={_vendor_ver("katex.min.js")}"></script>'
+        f'<script src="/vendor/purify.min.js?v={_vendor_ver("purify.min.js")}"></script>'
+    )
+    katex_css = f'<link rel="stylesheet" href="/vendor/katex.min.css?v={_vendor_ver("katex.min.css")}">'
     extra_inject = (
         f'<script src="/map-switcher.js?v={switcher_ver}"></script>'
+        f'{vendor_scripts}'
         f'<script src="/ai-assistant/ai-assistant.js?v={ai_ver}"></script>'
     )
     html = html.replace('</body>', extra_inject + '</body>')
+    # katex 样式注入 head（渲染公式字体）
+    html = html.replace('</head>', katex_css + '</head>')
 
     # 注入中文字体优化 CSS（解决导出图片乱码问题）
     font_css = """

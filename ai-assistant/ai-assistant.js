@@ -686,10 +686,92 @@
     setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 6300);
   }
 
-  /* ── 消息渲染（流式安全）──
-   * 支持：```代码块（未闭合时按纯文本，避免流式中途闪烁）、###~###### 标题、
-   *      引用、无序/有序列表、行内 code / **加粗** / *斜体* / [链接](http)
-   * 注意：行级块渲染，空行留白；所有内容先 esc 再加工，XSS 安全 */
+  /* ── 消息渲染 ──
+   * 主渲染：markdown-it（vendor 本地包，支持表格/删除线/列表/代码块等 GFM）
+   *          + katex（数学公式 \(...\) / $$...$$ / \[...\]）+ DOMPurify（XSS 兜底）
+   * 流式安全：``` 围栏未闭合时按纯文本渲染（避免流式中途闪烁）。
+   * vendor 脚本未加载（离线/旧包）时退回 renderMdFallback（旧正则渲染器）。 */
+  let _mdInst = null;
+  function getMd() {
+    if (_mdInst || !window.markdownit) return _mdInst;
+    _mdInst = window.markdownit({
+      html: false, // 原始 HTML 转义为文本（XSS 安全）
+      linkify: true,
+      breaks: true // 聊天换行友好
+    });
+    return _mdInst;
+  }
+  // 数学公式预处理：把 \(...\) / $$...$$ / \[...\] 替换成占位符，markdown-it 渲染完再还原 katex HTML
+  function extractMath(part, math) {
+    let s = part;
+    s = s.replace(/\\\(([\s\S]*?)\\\)/g, function (_, body) {
+      try {
+        const idx = math.length;
+        math.push('<span class="ai-math">' + window.katex.renderToString(body, { throwOnError: false, displayMode: false }) + "</span>");
+        return "@@COMIND_MATH_" + idx + "@@";
+      } catch (e) { return "\\(" + body + "\\)"; }
+    });
+    s = s.replace(/\$\$([\s\S]*?)\$\$/g, function (_, body) {
+      try {
+        const idx = math.length;
+        math.push('<div class="ai-math-block">' + window.katex.renderToString(body, { throwOnError: false, displayMode: true }) + "</div>");
+        return "@@COMIND_MATH_" + idx + "@@";
+      } catch (e) { return "$$" + body + "$$"; }
+    });
+    s = s.replace(/\\\[([\s\S]*?)\\\]/g, function (_, body) {
+      try {
+        const idx = math.length;
+        math.push('<div class="ai-math-block">' + window.katex.renderToString(body, { throwOnError: false, displayMode: true }) + "</div>");
+        return "@@COMIND_MATH_" + idx + "@@";
+      } catch (e) { return "\\[" + body + "\\]"; }
+    });
+    return s;
+  }
+  // GFM 兼容：表格可打断段落（GitHub 行为）。markdown-it 默认表格不打断段落，
+  // 文本行紧跟表格头会被吞成表格第一行——在表格头前补空行。
+  function fixTablesBefore(part) {
+    const lines = part.split("\n");
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const next = lines[i + 1];
+      // 表格头：| 开头且下一行是分隔行（| --- | ... |）
+      const isSep = next && /^\s*\|?[\s:|-]+\|?\s*$/.test(next) && next.indexOf("-") >= 0;
+      const prev = out.length ? out[out.length - 1].trim() : "";
+      if (line.trim().indexOf("|") === 0 && isSep && prev !== "" && prev.indexOf("|") !== 0) {
+        out.push(""); // 补空行，让表格独立成块
+      }
+      out.push(line);
+    }
+    return out.join("\n");
+  }
+  function renderMd(text) {
+    const s = String(text || "");
+    // 流式安全：``` 围栏未闭合（流式中间态）→ 按纯文本渲染，避免整个块消失闪烁
+    if ((s.match(/```/g) || []).length % 2 === 1) {
+      return esc(s).replace(/\n/g, "<br>");
+    }
+    const m = getMd();
+    if (!m) return renderMdFallback(s); // vendor 未加载兜底
+    let html;
+    // 代码块内容不处理数学/表格：按 ``` 切分，偶数段是普通文本、奇数段是代码
+    const math = [];
+    const parts = s.split("```");
+    let out = "";
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 1) out += "```" + parts[i] + "```";
+      else out += extractMath(fixTablesBefore(parts[i]), math);
+    }
+    html = m.render(out);
+    if (math.length) {
+      math.forEach(function (k, i) {
+        html = html.split("@@COMIND_MATH_" + i + "@@").join(k);
+      });
+    }
+    if (window.DOMPurify) html = window.DOMPurify.sanitize(html);
+    return html;
+  }
+  /* ── 旧正则渲染器（vendor 未加载时的兜底；行级块渲染，不支持表格）── */
   function renderInline(s) {
     s = esc(s);
     s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
@@ -699,7 +781,7 @@
       '<a href="$2" target="_blank" rel="noopener">$1</a>');
     return s;
   }
-  function renderMd(text) {
+  function renderMdFallback(text) {
     const lines = String(text || "").split("\n");
     const out = [];
     let inCode = false, codeBuf = [];

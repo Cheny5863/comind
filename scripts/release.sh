@@ -26,6 +26,7 @@ pyinstaller --noconfirm --clean \
     --add-data "dist:dist" \
     --add-data "ai-assistant:ai-assistant" \
     --add-data "pi-ext:pi-ext" \
+    --add-data "vendor:vendor" \
     --add-data "index.html:." \
     --add-data "map-switcher.js:." \
     --add-data "VERSION:." \

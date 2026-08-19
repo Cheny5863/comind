@@ -864,24 +864,34 @@ class ChatSessionManager:
             return True
         return False
 
-    def reset(self, map_key: str, branch_uid: str = "") -> None:
+    def reset(self, map_key: str, branch_uid: str = "") -> dict:
         """Start a new conversation for a (map, branch) pair. The old session
         file is KEPT on disk so it stays available in the history list.
 
         新分支（mapping 无条目）：创建空占位条目，让 agents 列表能列出它；
         已存在分支：杀掉 pi、删条目，下次访问 spawn 新 session 文件。
+
+        正在跑的回合（_in_turn=True）不 kill：硬杀会打断进行中的回复，返回
+        {"status": "busy"}，前端切过去等它跑完，下次再按才真正新开一轮。
+        （前端轮询 streaming 有 3s 滞后，reset 前无法 100% 确认空闲状态。）
         """
         skey = session_key(map_key, branch_uid)
         with self._lock:
             sf = self._mapping.get(skey)
             sess = self._sessions.pop(sf, None) if sf else None
             if sess:
+                if sess._in_turn:
+                    # 正在跑：不 kill 不删 mapping，放回池子
+                    assert sf is not None
+                    self._sessions[sf] = sess
+                    return {"status": "busy", "streaming": True}
                 sess.kill()
             self._mapping.pop(skey, None)
             if branch_uid:
                 # 占位：分支 agent 已创建但尚无会话文件（label 从 _map_state 取）
                 self._mapping[skey] = ""
             self._save_mapping()
+        return {"status": "ok"}
 
     def events(self, map_key: str, branch_uid: str = "") -> Iterator[str]:
         sess = self.get_or_spawn(map_key, branch_uid)

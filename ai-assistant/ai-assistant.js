@@ -1039,8 +1039,13 @@
       // 只切换过去等它跑完，下次再按才真正新开一轮。
       doSwitch();
     } else if (hasHistory) {
-      // 已交流过：reset 新开一轮（旧会话文件保留在历史列表）
-      fetch(api("reset", branch), { method: "POST" }).then(doSwitch).catch(() => {});
+      // 已交流过：reset 新开一轮（旧会话文件保留在历史列表）。
+      // 轮询 streaming 有 3s 滞后——若该 session 其实正在跑，后端 reset
+      // 返回 busy 不杀进程，这里同样 doSwitch（切过去等它跑完，下次再按才新开）。
+      fetch(api("reset", branch), { method: "POST" })
+        .then((r) => r.json())
+        .then(() => { doSwitch(); })
+        .catch(() => {});
     } else {
       // 未交流/新分支：幂等切换，不产生新会话
       doSwitch();

@@ -535,8 +535,7 @@ def api_chat_status(map_key: str, branch: str = ""):
 @app.post("/api/chat/{map_key}/reset")
 def api_chat_reset(map_key: str, branch: str = ""):
     _check_map_key(map_key)
-    chat_manager.reset(map_key, branch)
-    return {"status": "ok"}
+    return chat_manager.reset(map_key, branch)
 
 @app.post("/api/chat/{map_key}/switch")
 def api_chat_switch(map_key: str, body: SwitchBody, branch: str = ""):

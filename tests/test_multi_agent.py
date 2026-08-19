@@ -397,3 +397,57 @@ def test_old_session_branch_slug_fallback(env):
     # slug 前缀匹配 a-1-1 节点 → 应标为分支 a-1-1，不是 root
     assert old_it["branch_uid"] == "a-1-1", f"旧 session 分支归属错误: {old_it['branch_uid']!r}"
     assert old_it["display_label"] == "节点A1"
+
+
+def test_reset_busy_when_in_turn(env):
+    """bug 回归：未选中节点（root）按 Ctrl+Alt+N 触发 reset(root) 时，若 root
+    正在跑（_in_turn=True，前端轮询 streaming 有 3s 滞后可能误判空闲），reset
+    必须不 kill——返回 busy，进程与 mapping 都保持，正在进行的回合不被硬断。
+    """
+    import backend as be
+    from chat_service import ChatSession, session_key
+    mgr = be.chat_manager
+    client = env
+    skey = session_key(MAP_KEY, "")
+    fake_sf = str(be.chat_service.SESSION_DIR / "fake_busy.smm.jsonl")
+    sess = ChatSession(MAP_KEY, "", session_file=None, lang="zh", map_state=mgr._map_state)
+    sess._alive = True
+    sess._in_turn = True  # 模拟正在跑
+    mgr._mapping[skey] = fake_sf
+    mgr._sessions[fake_sf] = sess
+    try:
+        r = client.post(f"/api/chat/{MAP_KEY}/reset")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "busy" and body["streaming"] is True, body
+        # 进程没被杀、mapping 没被清
+        assert mgr._sessions.get(fake_sf) is sess, "正在跑的 session 被 reset 杀了"
+        assert mgr._mapping.get(skey) == fake_sf, "mapping 被 reset 清了"
+    finally:
+        mgr._sessions.pop(fake_sf, None)
+        mgr._mapping.pop(skey, None)
+
+
+def test_reset_kills_idle_session(env):
+    """空闲（未在跑）session reset：正常 kill + 清 mapping（原有语义不回退）。"""
+    import backend as be
+    from chat_service import ChatSession, session_key
+    mgr = be.chat_manager
+    client = env
+    skey = session_key(MAP_KEY, "")
+    fake_sf = str(be.chat_service.SESSION_DIR / "fake_idle.smm.jsonl")
+    sess = ChatSession(MAP_KEY, "", session_file=None, lang="zh", map_state=mgr._map_state)
+    sess._alive = True
+    sess._in_turn = False
+    mgr._mapping[skey] = fake_sf
+    mgr._sessions[fake_sf] = sess
+    try:
+        r = client.post(f"/api/chat/{MAP_KEY}/reset")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "ok", body
+        assert mgr._sessions.get(fake_sf) is None, "空闲 session 未被 reset 清理"
+        assert mgr._mapping.get(skey) is None, "mapping 未被 reset 清理"
+    finally:
+        mgr._sessions.pop(fake_sf, None)
+        mgr._mapping.pop(skey, None)

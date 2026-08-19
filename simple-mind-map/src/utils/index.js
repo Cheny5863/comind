@@ -397,7 +397,7 @@ export const nextTick = function (fn, ctx) {
   }
 }
 
-// 检查节点是否超出画布
+// 检查节点是否超出画布（含预留区域，如浮动面板遮挡区）
 export const checkNodeOuter = (mindMap, node, offsetX = 0, offsetY = 0) => {
   let elRect = mindMap.elRect
   let { scaleX, scaleY, translateX, translateY } = mindMap.draw.transform()
@@ -408,17 +408,24 @@ export const checkNodeOuter = (mindMap, node, offsetX = 0, offsetY = 0) => {
   top = top * scaleY + translateY
   let offsetLeft = 0
   let offsetTop = 0
-  if (left < 0 + offsetX) {
-    offsetLeft = -left + offsetX
+  // reservedPadding: { left, top, right, bottom } 或返回该对象的函数 — 外部设置的不可用区域（如浮动面板）
+  const rpRaw = mindMap.opt.reservedPadding
+  const rp = typeof rpRaw === 'function' ? rpRaw() : rpRaw
+  const rpLeft = (rp && rp.left) || 0
+  const rpTop = (rp && rp.top) || 0
+  const rpRight = (rp && rp.right) || 0
+  const rpBottom = (rp && rp.bottom) || 0
+  if (left < rpLeft + offsetX) {
+    offsetLeft = -left + rpLeft + offsetX
   }
-  if (right > elRect.width - offsetX) {
-    offsetLeft = -(right - elRect.width) - offsetX
+  if (right > elRect.width - rpRight - offsetX) {
+    offsetLeft = -(right - elRect.width) - rpRight - offsetX
   }
-  if (top < 0 + offsetY) {
-    offsetTop = -top + offsetY
+  if (top < rpTop + offsetY) {
+    offsetTop = -top + rpTop + offsetY
   }
-  if (bottom > elRect.height - offsetY) {
-    offsetTop = -(bottom - elRect.height) - offsetY
+  if (bottom > elRect.height - rpBottom - offsetY) {
+    offsetTop = -(bottom - elRect.height) - rpBottom - offsetY
   }
   return {
     isOuter: offsetLeft !== 0 || offsetTop !== 0,

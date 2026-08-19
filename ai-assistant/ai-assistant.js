@@ -1714,6 +1714,33 @@
     };
   }
 
+  /* ── 节点编辑避让 AI 面板 ──
+   * 设置 reservedPadding 回调：每次节点进入编辑状态时，
+   * checkNodeOuter 调用此函数获取面板遮挡区域，自动平移画布让编辑框不被面板挡住。
+   * 函数形式（非静态值）：面板可拖拽/缩放，位置运行时变化。
+   */
+  function installReservedPadding(mindMap) {
+    if (!mindMap || !mindMap.opt) return;
+    const MARGIN = 16;  // 编辑框与面板之间的最小间距
+    mindMap.opt.reservedPadding = function () {
+      const panel = document.getElementById("ai-panel");
+      if (!panel || panel.classList.contains("hidden")) return null;
+      const pr = panel.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      // 面板在右侧：右边预留 = vw - panel.left + margin
+      // 面板在左侧：左边预留 = panel.right + margin
+      // 面板在下方：底部预留 = vh - panel.top + margin
+      // 只对实际遮挡方向设值，避免误判
+      return {
+        right: (pr.right > vw / 2) ? Math.max(0, vw - pr.left + MARGIN) : 0,
+        left: (pr.left < vw / 2 && pr.right < vw / 2) ? Math.max(0, pr.right + MARGIN) : 0,
+        bottom: (pr.bottom > vh / 2) ? Math.max(0, vh - pr.top + MARGIN) : 0,
+        top: 0,
+      };
+    };
+  }
+
   /* ── 语言切换：收到 lang_change 事件后重建面板 DOM ── */
   function rebuildForLang() {
     _lang = null; // 清缓存，下次 lang() 重新从 localStorage 读
@@ -1734,6 +1761,7 @@
   function init(mindMap) {
     _mindMap = mindMap;
     installShortcutGuard(mindMap);
+    installReservedPadding(mindMap);
     if (document.getElementById("ai-fab")) return;
     createDOM();
     // 暴露给顶栏 AI 按钮（ToolbarNodeBtnList.vue aiAssist）

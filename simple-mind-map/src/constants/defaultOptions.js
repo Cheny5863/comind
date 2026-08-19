@@ -89,6 +89,9 @@ export const defaultOpt = {
   initRootNodePosition: null,
   // 节点文本编辑框的z-index
   nodeTextEditZIndex: 3000,
+  // 画布预留不可用区域（如浮动面板），编辑时节点会自动避让
+  // 值：{ left, top, right, bottom } 或返回该对象的函数（每次检测时调用，适配拖拽/缩放面板）
+  reservedPadding: null,
   // 节点备注浮层的z-index
   nodeNoteTooltipZIndex: 3000,
   // 是否在点击了画布外的区域时结束节点文本的编辑状态

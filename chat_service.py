@@ -448,6 +448,7 @@ class ChatSession:
         self._alive = False
         self._in_turn = False  # True between agent_start and agent_end
         self._abort_requested = False  # True after abort() until agent_end/kill
+        self._detached = False  # detach 后为 True：events 不再回写 mapping
         self._abort_gen = 0  # incremented on each abort; _force_kill only acts if unchanged
         self._shell_launch = False  # Windows 下经 cmd.exe 启动时 True（kill 需杀进程树）
 
@@ -871,21 +872,26 @@ class ChatSessionManager:
         新分支（mapping 无条目）：创建空占位条目，让 agents 列表能列出它；
         已存在分支：杀掉 pi、删条目，下次访问 spawn 新 session 文件。
 
-        正在跑的回合（_in_turn=True）不 kill：硬杀会打断进行中的回复，返回
-        {"status": "busy"}，前端切过去等它跑完，下次再按才真正新开一轮。
-        （前端轮询 streaming 有 3s 滞后，reset 前无法 100% 确认空闲状态。）
+        正在跑的回合（_in_turn=True）不 kill——脱钩（detach）：清 mapping 让
+        get_or_spawn 创建新 session，旧 pi 进程留在 _sessions 里后台跑完
+        当前回合，之后被 reaper 清理。这样 Ctrl+Alt+N 始终能立刻新建 session，
+        不会打断正在进行的回复。
         """
         skey = session_key(map_key, branch_uid)
         with self._lock:
             sf = self._mapping.get(skey)
-            sess = self._sessions.pop(sf, None) if sf else None
-            if sess:
+            sess = self._sessions.get(sf) if sf else None
+            if sess and sf:
                 if sess._in_turn:
-                    # 正在跑：不 kill 不删 mapping，放回池子
-                    assert sf is not None
-                    self._sessions[sf] = sess
-                    return {"status": "busy", "streaming": True}
-                sess.kill()
+                    # 正在跑：不 kill，保留在 _sessions 让 reaper 善后。
+                    # 只清 mapping，get_or_spawn 找不到旧 session 会创建新的。
+                    sess._detached = True
+                else:
+                    self._sessions.pop(sf, None)
+                    sess.kill()
+            # 清掉旧 turn 跟踪数据（属于旧 session，不应留给新 session）
+            self._turn_before.pop(skey, None)
+            self._turn_ops.pop(skey, None)
             self._mapping.pop(skey, None)
             if branch_uid:
                 # 占位：分支 agent 已创建但尚无会话文件（label 从 _map_state 取）
@@ -914,7 +920,8 @@ class ChatSessionManager:
                         self.finalize_turn(map_key, branch_uid)
                     yield f"event: {ev_type}\ndata: {line}\n\n"
                     # Persist mapping on session file discovery / conversation end
-                    if ev_type in ("agent_start", "agent_end") and sess.session_file:
+                    # 已 detach 的 session 不能回写 mapping，否则会覆盖新 session 的条目
+                    if ev_type in ("agent_start", "agent_end") and sess.session_file and not sess._detached:
                         skey = session_key(map_key, branch_uid)
                         if self._mapping.get(skey) != sess.session_file:
                             self._mapping[skey] = sess.session_file

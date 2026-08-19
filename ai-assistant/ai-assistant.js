@@ -1013,8 +1013,9 @@
     newAgentFor(node ? (node.nodeData.data.uid || "") : "");
   }
   function newAgentFor(branch) {
-    // 「+」语义（上下文敏感）：
+    // 「+」/ Ctrl+Alt+N 语义（上下文敏感）：
     // - 该分支已交流过（has_history）→ 新开一轮（reset 清会话，旧文件保留在历史）
+    //   后端 reset 在 pi 正忙时只 detach（不 kill），旧进程后台跑完不被打断。
     // - 该分支未交流/无 session（幂等）→ 只切换，不重复创建/reset
     const ag = _agents.find((a) => (a.branch_uid || "") === (branch || ""));
     const hasHistory = ag && ag.has_history;
@@ -1034,14 +1035,10 @@
       connectSSE();
       recoverStreamState();
     };
-    if (hasHistory && ag && ag.streaming) {
-      // 该分支正在跑：不 reset——后端 reset 会 kill pi 进程，直接打断当前回合。
-      // 只切换过去等它跑完，下次再按才真正新开一轮。
-      doSwitch();
-    } else if (hasHistory) {
+    if (hasHistory) {
       // 已交流过：reset 新开一轮（旧会话文件保留在历史列表）。
-      // 轮询 streaming 有 3s 滞后——若该 session 其实正在跑，后端 reset
-      // 返回 busy 不杀进程，这里同样 doSwitch（切过去等它跑完，下次再按才新开）。
+      // 后端对忙碌 session 做 detach（不 kill），始终返回 ok，新 SSE 连接
+      // 触发 get_or_spawn 创建新 session。旧 pi 进程后台跑完由 reaper 清理。
       fetch(api("reset", branch), { method: "POST" })
         .then((r) => r.json())
         .then(() => { doSwitch(); })

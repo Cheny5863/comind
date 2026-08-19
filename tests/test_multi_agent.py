@@ -400,9 +400,9 @@ def test_old_session_branch_slug_fallback(env):
 
 
 def test_reset_busy_when_in_turn(env):
-    """bug 回归：未选中节点（root）按 Ctrl+Alt+N 触发 reset(root) 时，若 root
-    正在跑（_in_turn=True，前端轮询 streaming 有 3s 滞后可能误判空闲），reset
-    必须不 kill——返回 busy，进程与 mapping 都保持，正在进行的回合不被硬断。
+    """Ctrl+Alt+N 触发 reset(root) 时，若 root 正在跑（_in_turn=True），
+    reset 应 detach（清 mapping）但不 kill——旧 pi 进程留在 _sessions 后台跑完，
+    reaper 会在它空闲后清理。返回 ok，前端 connectSSE 触发 get_or_spawn 创建新 session。
     """
     import backend as be
     from chat_service import ChatSession, session_key
@@ -419,10 +419,11 @@ def test_reset_busy_when_in_turn(env):
         r = client.post(f"/api/chat/{MAP_KEY}/reset")
         assert r.status_code == 200
         body = r.json()
-        assert body["status"] == "busy" and body["streaming"] is True, body
-        # 进程没被杀、mapping 没被清
-        assert mgr._sessions.get(fake_sf) is sess, "正在跑的 session 被 reset 杀了"
-        assert mgr._mapping.get(skey) == fake_sf, "mapping 被 reset 清了"
+        assert body["status"] == "ok", body
+        # mapping 已清，但 session 仍活着（detach，不 kill）
+        assert mgr._sessions.get(fake_sf) is sess, "正在跑的 session 被 kill 了"
+        assert mgr._mapping.get(skey) is None, "mapping 未被 reset 清理"
+        assert sess._alive, "detach 后 session 不应被 kill"
     finally:
         mgr._sessions.pop(fake_sf, None)
         mgr._mapping.pop(skey, None)

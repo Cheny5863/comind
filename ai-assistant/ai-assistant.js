@@ -934,13 +934,17 @@
     fetch(api("agents")).then((r) => r.json()).then((list) => {
       _agents = list || [];
       loadAgentLabel();
-      // 同步当前查看的 session：当前分支的活跃会话文件
+      // 同步当前查看的 session：仅在用户没有明确查看某个 session 时填充活跃会话
+      // （防止 3s 轮询把 _currentSessionFile 覆盖成"当前分支活跃 session"，导致
+      //  Ctrl+Alt+PageUp/PageDown 翻历史会话时基于错误状态短路/跳错——F5 才恢复）
       const cur = _agents.find((a) => (a.branch_uid || "") === _currentBranch);
       if (cur && cur.session_file) {
-        _currentSessionFile = cur.session_file;
-        markRead(_currentSessionFile);  // 正在查看 = 已读，历史列表不显示红点
-        recordLastView(_currentSessionFile, _currentBranch);  // 记住"上次查看"，刷新后恢复
-      } else if (cur && _currentBranch) {
+        if (!_currentSessionFile) {
+          _currentSessionFile = cur.session_file;
+          markRead(_currentSessionFile);  // 正在查看 = 已读，历史列表不显示红点
+          recordLastView(_currentSessionFile, _currentBranch);  // 记住"上次查看"，刷新后恢复
+        }
+      } else if (cur && _currentBranch && !_currentSessionFile) {
         // 分支已绑定但还没发消息（无 session 文件）——记住分支本身，
         // 否则关面板重开会丢新分支、恢复旧 session
         _currentSessionFile = "";
@@ -1115,6 +1119,8 @@
     }).then(() => {
       _currentBranch = branch || "";  // 切 session 时同步分支上下文
       _currentSessionFile = file;     // 前端维护当前查看的 session
+      markRead(file);                 // 正在查看 = 已读
+      recordLastView(file, branch || "");  // 记住"上次查看"，刷新后恢复
       // 跟随偏好（默认开）：优先对焦最近一次改图批次的根节点（focusUid），
       // 没有则退回 session 绑定分支根；root session 两者皆空则不动
       if (prefFollowBranch() && _mindMap) {

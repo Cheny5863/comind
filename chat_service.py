@@ -250,6 +250,7 @@ PROVIDER_ENV = {
     "fireworks": "FIREWORKS_API_KEY",
     "together": "TOGETHER_API_KEY",
     "kimi-coding": "KIMI_API_KEY",
+    "awsomeai": "AWSOMEAI_API_KEY",
 }
 
 

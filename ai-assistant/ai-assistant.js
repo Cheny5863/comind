@@ -1515,6 +1515,7 @@
     { id: "fireworks", name: "🔥 Fireworks", placeholder: t("pasteKey") },
     { id: "together", name: "🤝 Together AI", placeholder: t("pasteKey") },
     { id: "kimi-coding", name: "🌙 Kimi for Coding", placeholder: t("pasteKey") },
+    { id: "awsomeai", name: "🚀 AwesomeAI (Claude)", placeholder: "sk-…" },
   ];
   /* ── 交互偏好 ── */
   const PREF_FOLLOW_BRANCH = "comind_pref_follow_branch";

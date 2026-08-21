@@ -11,6 +11,9 @@
       modelSettings: "模型设置",
       modelTitle: "切换模型",
       providerTitle: "Provider",
+      noKey: "未配置",
+      noKeyTip: "⚠️ {name} 未配置 API Key，请在下方面板粘贴 key",
+      configKeyHint: "去模型设置配置 Key",
       background: "背景信息",
       close: "关闭",
       agents: "Agents",
@@ -82,6 +85,9 @@
       modelSettings: "Model Settings",
       modelTitle: "Switch model",
       providerTitle: "Provider",
+      noKey: "no key",
+      noKeyTip: "⚠️ {name} has no API key configured, paste one in the panel below",
+      configKeyHint: "Go to Model Settings to configure a Key",
       background: "Background",
       close: "Close",
       agents: "Agents",
@@ -1548,7 +1554,7 @@
     });
   }
 
-  function openSettings() {
+  function openSettings(focusProvider) {
     const drawer = document.getElementById("ai-settings-drawer");
     drawer.classList.remove("hidden");
     restoreSettingsGroupStates();
@@ -1575,6 +1581,14 @@
           '</div></div>';
         list.appendChild(row);
       });
+      // 从 Provider 下拉引导进入时，滚动到对应 provider 的 key 输入框并聚焦
+      if (focusProvider) {
+        const inp = list.querySelector('.ai-key-input[data-provider="' + focusProvider + '"]');
+        if (inp) {
+          inp.scrollIntoView({ block: "center" });
+          inp.focus();
+        }
+      }
     }).catch(() => {
       list.innerHTML = '<div class="ai-keys-loading">' + t("loadFailed") + '</div>';
     });
@@ -1627,10 +1641,12 @@
 
   /* ── 模型切换 ── */
   let _modelGroups = {};
+  let _providerConfigured = {};
   function loadModels() {
     const psel = document.getElementById("ai-provider");
     const sel = document.getElementById("ai-model");
-    // 与「模型设置」key 配置联动：只显示已配置 key 的 provider
+    // 与「模型设置」key 配置联动：已配置的 provider 在前，未配置的带 ⚠️ 标记
+    // （点击未配置项会引导去「模型设置」填 key）
     Promise.all([
       fetch(api("models")).then((r) => r.json()),
       fetch("/api/keys").then((r) => r.json()).catch(() => ({})),
@@ -1641,20 +1657,26 @@
       });
       _modelGroups = groups;
       const configured = (keys && keys.configured) || {};
-      let provs = Object.keys(groups).sort().filter((p) => configured[p]);
+      _providerConfigured = configured;
+      const allProvs = Object.keys(groups).sort();
+      const provs = allProvs.filter((p) => configured[p]).concat(allProvs.filter((p) => !configured[p]));
       const curProv = (d.current && d.current.provider) || "";
-      // 兜底1：当前 provider 未配 key（历史遗留）也保留，防模型下拉空
-      if (curProv && provs.indexOf(curProv) < 0) provs.push(curProv);
-      // 兜底2：全部未配置时回退显示全部（防御）
-      if (!provs.length) provs = Object.keys(groups).sort();
       psel.innerHTML = "";
       provs.forEach((prov) => {
         const opt = document.createElement("option");
         opt.value = prov;
-        opt.textContent = prov;
+        opt.textContent = configured[prov] ? prov : prov + " ⚠️" + t("noKey");
         psel.appendChild(opt);
       });
       psel.value = (curProv && provs.indexOf(curProv) >= 0) ? curProv : (provs[0] || "");
+      // 全部未配置（pi 无模型可返回）时：下拉显示引导项，点击去「模型设置」填 key
+      if (!provs.length) {
+        const opt = document.createElement("option");
+        opt.value = "__config__";
+        opt.textContent = "⚠️ " + t("configKeyHint");
+        psel.appendChild(opt);
+        psel.value = "__config__";
+      }
       renderModelOptions(psel.value);
       if (d.current && d.current.id) {
         sel.value = d.current.provider + "|" + d.current.id;
@@ -1676,7 +1698,21 @@
   }
   function onProviderChange() {
     const psel = document.getElementById("ai-provider");
-    renderModelOptions(psel.value);
+    const prov = psel.value;
+    if (!prov) return;
+    // 引导项：去「模型设置」配置 key
+    if (prov === "__config__") {
+      openSettings();
+      return;
+    }
+    // 未配置 key 的 provider：引导去「模型设置」填 key，不切换模型
+    if (!_providerConfigured[prov]) {
+      const meta = KEY_PROVIDERS.find((p) => p.id === prov) || {};
+      toast(t("noKeyTip", { name: meta.name || prov }));
+      openSettings(prov);
+      return;
+    }
+    renderModelOptions(prov);
     const sel = document.getElementById("ai-model");
     // 切 Provider 即提交该 Provider 的默认（第一个）模型，用户可在模型下拉微调
     if (sel.options.length > 0) {

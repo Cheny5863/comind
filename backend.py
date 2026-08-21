@@ -584,14 +584,14 @@ class ModelBody(BaseModel):
     model_id: str
 
 @app.get("/api/chat/{map_key}/models")
-def api_chat_models(map_key: str):
+def api_chat_models(map_key: str, branch: str = ""):
     _check_map_key(map_key)
-    return chat_manager.get_models(map_key)
+    return chat_manager.get_models(map_key, branch)
 
 @app.post("/api/chat/{map_key}/model")
-def api_chat_model(map_key: str, body: ModelBody):
+def api_chat_model(map_key: str, body: ModelBody, branch: str = ""):
     _check_map_key(map_key)
-    if not chat_manager.set_model(map_key, body.provider, body.model_id):
+    if not chat_manager.set_model(map_key, body.provider, body.model_id, branch):
         raise HTTPException(400, "切换模型失败 / Model switch failed")
     return {"status": "ok"}
 
@@ -599,14 +599,14 @@ class ThinkingBody(BaseModel):
     level: str
 
 @app.get("/api/chat/{map_key}/thinking_levels")
-def api_chat_thinking_levels(map_key: str):
+def api_chat_thinking_levels(map_key: str, branch: str = ""):
     _check_map_key(map_key)
-    return chat_manager.get_thinking_levels(map_key)
+    return chat_manager.get_thinking_levels(map_key, branch)
 
 @app.post("/api/chat/{map_key}/thinking_level")
-def api_chat_thinking_level(map_key: str, body: ThinkingBody):
+def api_chat_thinking_level(map_key: str, body: ThinkingBody, branch: str = ""):
     _check_map_key(map_key)
-    if not chat_manager.set_thinking_level(map_key, body.level):
+    if not chat_manager.set_thinking_level(map_key, body.level, branch):
         raise HTTPException(400, "切换思考等级失败 / Thinking level switch failed")
     return {"status": "ok"}
 

@@ -1236,9 +1236,9 @@ class ChatSessionManager:
         finally:
             sess.unsubscribe(q)
 
-    def get_models(self, map_key: str) -> dict:
+    def get_models(self, map_key: str, branch_uid: str = "") -> dict:
         """Available models + current model + thinking level for this map's session."""
-        sess = self.get_or_spawn(map_key)
+        sess = self.get_or_spawn(map_key, branch_uid)
         ev = self._rpc_request(sess, {"type": "get_available_models"})
         models = []
         if ev and ev.get("success"):
@@ -1251,8 +1251,8 @@ class ChatSessionManager:
             thinking_level = (st.get("data") or {}).get("thinkingLevel", "max")
         return {"models": models, "current": current, "thinkingLevel": thinking_level}
 
-    def set_model(self, map_key: str, provider: str, model_id: str) -> bool:
-        sess = self.get_or_spawn(map_key)
+    def set_model(self, map_key: str, provider: str, model_id: str, branch_uid: str = "") -> bool:
+        sess = self.get_or_spawn(map_key, branch_uid)
         ev = self._rpc_request(sess, {
             "type": "set_model", "provider": provider, "modelId": model_id,
         })
@@ -1262,17 +1262,17 @@ class ChatSessionManager:
             self._save_json(MODELS_PATH, self._model_pref)
         return ok
 
-    def get_thinking_levels(self, map_key: str) -> dict:
+    def get_thinking_levels(self, map_key: str, branch_uid: str = "") -> dict:
         """Get available thinking levels for the current model."""
-        sess = self.get_or_spawn(map_key)
+        sess = self.get_or_spawn(map_key, branch_uid)
         ev = self._rpc_request(sess, {"type": "get_available_thinking_levels"})
         levels = []
         if ev and ev.get("success"):
             levels = (ev.get("data") or {}).get("levels", [])
         return {"levels": levels}
 
-    def set_thinking_level(self, map_key: str, level: str) -> bool:
-        sess = self.get_or_spawn(map_key)
+    def set_thinking_level(self, map_key: str, level: str, branch_uid: str = "") -> bool:
+        sess = self.get_or_spawn(map_key, branch_uid)
         ev = self._rpc_request(sess, {"type": "set_thinking_level", "level": level})
         return bool(ev and ev.get("success"))
 

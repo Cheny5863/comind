@@ -1630,13 +1630,23 @@
   function loadModels() {
     const psel = document.getElementById("ai-provider");
     const sel = document.getElementById("ai-model");
-    fetch(api("models")).then((r) => r.json()).then((d) => {
+    // 与「模型设置」key 配置联动：只显示已配置 key 的 provider
+    Promise.all([
+      fetch(api("models")).then((r) => r.json()),
+      fetch("/api/keys").then((r) => r.json()).catch(() => ({})),
+    ]).then(([d, keys]) => {
       const groups = {};
       (d.models || []).forEach((m) => {
         (groups[m.provider] = groups[m.provider] || []).push(m);
       });
       _modelGroups = groups;
-      const provs = Object.keys(groups).sort();
+      const configured = (keys && keys.configured) || {};
+      let provs = Object.keys(groups).sort().filter((p) => configured[p]);
+      const curProv = (d.current && d.current.provider) || "";
+      // 兜底1：当前 provider 未配 key（历史遗留）也保留，防模型下拉空
+      if (curProv && provs.indexOf(curProv) < 0) provs.push(curProv);
+      // 兜底2：全部未配置时回退显示全部（防御）
+      if (!provs.length) provs = Object.keys(groups).sort();
       psel.innerHTML = "";
       provs.forEach((prov) => {
         const opt = document.createElement("option");
@@ -1644,9 +1654,8 @@
         opt.textContent = prov;
         psel.appendChild(opt);
       });
-      const curProv = (d.current && d.current.provider) || provs[0] || "";
-      psel.value = curProv;
-      renderModelOptions(curProv);
+      psel.value = (curProv && provs.indexOf(curProv) >= 0) ? curProv : (provs[0] || "");
+      renderModelOptions(psel.value);
       if (d.current && d.current.id) {
         sel.value = d.current.provider + "|" + d.current.id;
       }

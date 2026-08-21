@@ -55,6 +55,10 @@
   flex: 1; min-width: 0; font-size: 12px; border: 1px solid #dcdfe6; border-radius: 5px;
   background: #fff; color: #333; padding: 5px 6px; cursor: pointer; outline: none;
 }
+.ai-provider-select {
+  flex: none; width: 92px; font-size: 12px; border: 1px solid #dcdfe6; border-radius: 5px;
+  background: #fff; color: #333; padding: 5px 6px; cursor: pointer; outline: none;
+}
 .ai-model-select option, .ai-model-select optgroup { color: #333; }
 .ai-thinking-select {
   flex: none; width: 70px; font-size: 12px; border: 1px solid #dcdfe6; border-radius: 5px;

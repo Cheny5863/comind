@@ -10,6 +10,7 @@
       history: "Agent / 历史会话",
       modelSettings: "模型设置",
       modelTitle: "切换模型",
+      providerTitle: "Provider",
       background: "背景信息",
       close: "关闭",
       agents: "Agents",
@@ -80,6 +81,7 @@
       history: "Agents / History",
       modelSettings: "Model Settings",
       modelTitle: "Switch model",
+      providerTitle: "Provider",
       background: "Background",
       close: "Close",
       agents: "Agents",
@@ -304,6 +306,7 @@
         </div>
       </div>
       <div class="ai-toolbar">
+        <select class="ai-provider-select" id="ai-provider" title="${t("providerTitle")}"></select>
         <select class="ai-model-select" id="ai-model" title="${t("modelTitle")}"></select>
         <select class="ai-thinking-select" id="ai-thinking" title="${t("thinkingLevel")}"></select>
         <button class="ai-tool-btn" id="ai-bg" title="${t("background")}">📝 <span>${t("background")}</span></button>
@@ -342,6 +345,7 @@
     document.getElementById("ai-settings-drawer").addEventListener("toggle", (e) => {
       if (e.target && e.target.tagName === "DETAILS") saveSettingsGroupStates();
     });
+    document.getElementById("ai-provider").addEventListener("change", onProviderChange);
     document.getElementById("ai-model").addEventListener("change", onModelChange);
     document.getElementById("ai-thinking").addEventListener("change", onThinkingChange);
     // 点击左上角分支标签 → 脑图聚焦到该分支根节点
@@ -1622,31 +1626,54 @@
   }
 
   /* ── 模型切换 ── */
+  let _modelGroups = {};
   function loadModels() {
+    const psel = document.getElementById("ai-provider");
     const sel = document.getElementById("ai-model");
     fetch(api("models")).then((r) => r.json()).then((d) => {
       const groups = {};
       (d.models || []).forEach((m) => {
         (groups[m.provider] = groups[m.provider] || []).push(m);
       });
-      sel.innerHTML = "";
-      Object.keys(groups).sort().forEach((prov) => {
-        const og = document.createElement("optgroup");
-        og.label = prov;
-        groups[prov].forEach((m) => {
-          const opt = document.createElement("option");
-          opt.value = m.provider + "|" + m.id;
-          opt.textContent = m.id;
-          og.appendChild(opt);
-        });
-        sel.appendChild(og);
+      _modelGroups = groups;
+      const provs = Object.keys(groups).sort();
+      psel.innerHTML = "";
+      provs.forEach((prov) => {
+        const opt = document.createElement("option");
+        opt.value = prov;
+        opt.textContent = prov;
+        psel.appendChild(opt);
       });
-      if (d.current) {
+      const curProv = (d.current && d.current.provider) || provs[0] || "";
+      psel.value = curProv;
+      renderModelOptions(curProv);
+      if (d.current && d.current.id) {
         sel.value = d.current.provider + "|" + d.current.id;
       }
       // 加载思考等级
       loadThinkingLevels(d.thinkingLevel || "max");
     }).catch(() => {});
+  }
+  function renderModelOptions(prov) {
+    const sel = document.getElementById("ai-model");
+    const models = _modelGroups[prov] || [];
+    sel.innerHTML = "";
+    models.forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m.provider + "|" + m.id;
+      opt.textContent = m.id;
+      sel.appendChild(opt);
+    });
+  }
+  function onProviderChange() {
+    const psel = document.getElementById("ai-provider");
+    renderModelOptions(psel.value);
+    const sel = document.getElementById("ai-model");
+    // 切 Provider 即提交该 Provider 的默认（第一个）模型，用户可在模型下拉微调
+    if (sel.options.length > 0) {
+      sel.selectedIndex = 0;
+      onModelChange();
+    }
   }
   function loadThinkingLevels(currentLevel) {
     const sel = document.getElementById("ai-thinking");

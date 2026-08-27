@@ -44,6 +44,8 @@
       loadFailed: "加载失败",
       configured: "已配置 ✓",
       notConfigured: "未配置",
+      runtimeError: "AI 运行时异常",
+      runtimeErrorHint: "⚠️ AI 运行时不可用：{err}。请查看服务日志：journalctl --user -u comind -n 50",
       clear: "清除",
       showHide: "显示/隐藏",
       keyRequired: "请输入 key",
@@ -118,6 +120,8 @@
       loadFailed: "Load failed",
       configured: "Configured ✓",
       notConfigured: "Not configured",
+      runtimeError: "AI runtime error",
+      runtimeErrorHint: "⚠️ AI runtime unavailable: {err}. Check service logs: journalctl --user -u comind -n 50",
       clear: "Clear",
       showHide: "Show/Hide",
       keyRequired: "Please enter a key",
@@ -197,6 +201,8 @@
   let _agents = [];          // 该脑图的所有 agent 列表（root + 各分支）
   let _pendingBranchLabel = "";  // 新建分支 agent 时的节点文本（agents 刷新前临时显示）
   let _currentSessionFile = "";  // 当前正在查看的 session 文件（前端维护，历史列表高亮用）
+  let _sessionPage = 0;          // 历史列表当前页（从 0 开始）
+  const _sessionPageSize = 20;   // 历史列表每页 session 数（防卡顿：session 多时不整页渲染）
   let _pollTimer = null;         // 后台 agent 状态轮询（面板打开期间每 3s）
   let _agentsSnapshot = {};      // 上次轮询的 branch_uid → streaming，用于检测开始/完成
 
@@ -441,7 +447,8 @@
       // 恢复上次查看的 session（刷新后不固定回 root）；无记录/记录失效则默认流程
       const rec = readLastView();
       if (rec && rec.file) {
-        fetch(api("all_sessions")).then((r) => r.json()).then((items) => {
+        fetch(api("all_sessions") + "?limit=0").then((r) => r.json()).then((res) => {
+          const items = res.items || [];
           if (items.some((it) => it.file === rec.file)) {
             switchSession(rec.file, rec.branch || "");
             loadModels(); startPolling();
@@ -1068,15 +1075,41 @@
     const list = document.getElementById("ai-session-list");
     if (!list.classList.contains("hidden")) { list.classList.add("hidden"); return; }
     list.classList.remove("hidden");
+    _sessionPage = 0;  // 每次打开回到最新一页
     refreshSessionList();
+  }
+  // 分页条：‹ 1/3 ›，disabled 态随页码更新。放列表底部。
+  function renderSessionPager(list, total) {
+    const pages = Math.max(1, Math.ceil(total / _sessionPageSize));
+    const pager = document.createElement("div");
+    pager.className = "ai-session-pager";
+    const prev = document.createElement("button");
+    prev.textContent = "‹";
+    prev.disabled = _sessionPage <= 0;
+    prev.addEventListener("click", () => { if (_sessionPage > 0) { _sessionPage--; refreshSessionList(); } });
+    const info = document.createElement("span");
+    info.textContent = (_sessionPage + 1) + " / " + pages;
+    const next = document.createElement("button");
+    next.textContent = "›";
+    next.disabled = _sessionPage >= pages - 1;
+    next.addEventListener("click", () => { if (_sessionPage < pages - 1) { _sessionPage++; refreshSessionList(); } });
+    pager.appendChild(prev);
+    pager.appendChild(info);
+    pager.appendChild(next);
+    list.appendChild(pager);
   }
   function refreshSessionList() {
     const list = document.getElementById("ai-session-list");
     if (!list || list.classList.contains("hidden")) return;
-    fetch(api("all_sessions"))
-      .then((r) => r.json()).then((items) => {
+    fetch(api("all_sessions") + "?offset=" + (_sessionPage * _sessionPageSize) + "&limit=" + _sessionPageSize)
+      .then((r) => r.json()).then((res) => {
+        const items = res.items || [];
+        const total = res.total || items.length;
+        const pages = Math.max(1, Math.ceil(total / _sessionPageSize));
+        // session 被删后页码可能越界：回退到最后一页重取
+        if (_sessionPage >= pages) { _sessionPage = pages - 1; refreshSessionList(); return; }
         list.innerHTML = "";
-        if (!items.length) {
+        if (!total) {
           list.innerHTML = '<div class="ai-session-item">' + t("noHistory") + '</div>';
           return;
         }
@@ -1104,6 +1137,7 @@
           div.addEventListener("click", () => switchSession(it.file, it.branch_uid || "", it.focus_uid || "", it.focus_uids || []));
           list.appendChild(div);
         });
+        renderSessionPager(list, total);
       }).catch(() => {});
   }
   function switchSession(file, branch, focusUid, focusUids) {
@@ -1147,7 +1181,8 @@
   // dir=-1 上一个（更新的，历史列表更靠前）；dir=1 下一个（更旧的）
   // 历史列表 = /api/all_sessions，按最后对话时间倒序
   function stepSession(dir) {
-    fetch(api("all_sessions")).then((r) => r.json()).then((items) => {
+    fetch(api("all_sessions") + "?limit=0").then((r) => r.json()).then((res) => {
+      const items = res.items || [];
       if (!items || !items.length) return;
       let idx = items.findIndex((it) => it.file === _currentSessionFile);
       if (idx === -1) idx = dir === -1 ? 0 : -1; // 当前不在列表（异常）：上一个=最新一条
@@ -1648,6 +1683,7 @@
   /* ── 模型切换 ── */
   let _modelGroups = {};
   let _providerConfigured = {};
+  let _runtimeHealth = null;
   function loadModels() {
     const psel = document.getElementById("ai-provider");
     const sel = document.getElementById("ai-model");
@@ -1656,12 +1692,14 @@
     Promise.all([
       fetch(api("models")).then((r) => r.json()),
       fetch("/api/keys").then((r) => r.json()).catch(() => ({})),
-    ]).then(([d, keys]) => {
+      fetch("/api/health").then((r) => r.json()).catch(() => ({})),
+    ]).then(([d, keys, health]) => {
       const groups = {};
       (d.models || []).forEach((m) => {
         (groups[m.provider] = groups[m.provider] || []).push(m);
       });
       _modelGroups = groups;
+      _runtimeHealth = health || null;
       const configured = (keys && keys.configured) || {};
       _providerConfigured = configured;
       const allProvs = Object.keys(groups).sort();
@@ -1675,13 +1713,19 @@
         psel.appendChild(opt);
       });
       psel.value = (curProv && provs.indexOf(curProv) >= 0) ? curProv : (provs[0] || "");
-      // 全部未配置（pi 无模型可返回）时：下拉显示引导项，点击去「模型设置」填 key
+      // 全部未配置（pi 无模型可返回）时：区分「key 未配置」vs「AI 运行时异常」
       if (!provs.length) {
         const opt = document.createElement("option");
-        opt.value = "__config__";
-        opt.textContent = "⚠️ " + t("configKeyHint");
+        if (health && health.ok === false) {
+          // AI 运行时不可用（node 过旧 / pi 崩溃等）——不能引导用户去填 key，会误导
+          opt.value = "__runtime__";
+          opt.textContent = "⚠️ " + t("runtimeError");
+        } else {
+          opt.value = "__config__";
+          opt.textContent = "⚠️ " + t("configKeyHint");
+        }
         psel.appendChild(opt);
-        psel.value = "__config__";
+        psel.value = opt.value;
       }
       renderModelOptions(psel.value);
       if (d.current && d.current.id) {
@@ -1709,6 +1753,12 @@
     // 引导项：去「模型设置」配置 key
     if (prov === "__config__") {
       openSettings();
+      return;
+    }
+    // 运行时异常引导：显示具体错误 + 日志命令，不引导填 key
+    if (prov === "__runtime__") {
+      const err = (_runtimeHealth && _runtimeHealth.error) || "pi 不可用";
+      toast(t("runtimeErrorHint", { err }));
       return;
     }
     // 未配置 key 的 provider：引导去「模型设置」填 key，不切换模型

@@ -136,6 +136,59 @@ IDLE_TIMEOUT = 1800  # 30 min
 PROJECT_CWD = os.environ.get("SMM_MAP_DIR") or os.path.expanduser("~/comind-maps")
 
 
+def check_runtime() -> dict:
+    """部署自检：pi 运行时是否可用（node 版本 / pi 二进制 / 能否 --version）。
+
+    用于 install.sh 部署后冒烟 + 前端区分「key 未配置」vs「AI 运行时异常」。
+    返回：
+      {ok: bool, pi: str, node: str, error: str}
+    - ok=False 时 error 含可读原因（node 缺失 / pi 崩溃 stderr / 超时）
+    """
+    result = {"ok": True, "pi": "", "node": "", "error": ""}
+    pi_bin = PI_LAUNCH[0] if PI_LAUNCH else ""
+    result["pi"] = pi_bin
+    # node 版本（PATH 里的，pi 实际用它跑）
+    node_ver = ""
+    try:
+        r = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=5)
+        node_ver = (r.stdout or r.stderr or "").strip()
+    except Exception:
+        node_ver = ""
+    result["node"] = node_ver
+    # pi --version 冒烟（node <20.10 时 import attributes 直接 SyntaxError，这里能抓到）
+    if not pi_bin:
+        result["ok"] = False
+        result["error"] = "未找到 pi 二进制（PI_LAUNCH 为空）"
+        return result
+    try:
+        r = subprocess.run(
+            [pi_bin, "--version"],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, **PROVIDER_KEYS},
+        )
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        if r.returncode == 0 and out:
+            result["pi"] = pi_bin + " " + out
+            return result
+        result["ok"] = False
+        detail = err or out or f"exit code {r.returncode}"
+        # node 太旧时的典型错误：SyntaxError: Unexpected token 'with'
+        if node_ver and ("SyntaxError" in detail or "Unexpected token" in detail):
+            result["error"] = f"pi 无法运行：{detail[:300]}（当前 node {node_ver}，pi 需要 Node ≥ 20.10）"
+        else:
+            result["error"] = f"pi 无法运行：{detail[:300]}"
+        return result
+    except subprocess.TimeoutExpired:
+        result["ok"] = False
+        result["error"] = "pi --version 超时（10s），运行时疑似卡死"
+        return result
+    except Exception as exc:
+        result["ok"] = False
+        result["error"] = f"pi 启动检查异常：{exc}"
+        return result
+
+
 def _background_text(map_key: str) -> str:
     """读取该脑图的背景文件内容（不存在返回空串）。
 
@@ -710,6 +763,9 @@ class ChatSessionManager:
         # 轮次 ops 收集器：skey → list[diff_entry]。mutation 现场直接记录，
         # 天然按 session 隔离，不需要事后快照对比推断 AI 做了什么。
         self._turn_ops: dict[str, list[dict]] = {}
+        # session 列表元数据缓存：path → (mtime, size, meta)。文件未变则复用，
+        # 避免每次打开历史列表全量读 jsonl/turns（session 多时是卡顿主因）。
+        self._session_meta_cache: dict[str, tuple[float, int, dict]] = {}
         # Start reaper
         t = threading.Thread(target=self._reap_loop, daemon=True, name="pi-reaper")
         t.start()
@@ -980,10 +1036,20 @@ class ChatSessionManager:
         不依赖文件 mtime——选中/读取 session 不会改文件，但 pi 可能
         在加载时写 session 元数据导致 mtime 变化。真正的"最后对话时间"
         应来自 jsonl 里最后一条 message 记录的 timestamp。
+
+        反向扫描：只读文件尾部 16KB（jsonl 追加写，最后一条消息必在尾部），
+        大文件不必全量读入。最后一行可能是不完整的流式半行，json.loads
+        失败跳过即可。返回 0.0 兜底时调用方仍能工作（排序靠后）。
         """
         try:
-            last = 0.0
-            for line in Path(session_file).read_text(encoding="utf-8").splitlines():
+            size = os.path.getsize(session_file)
+            if size <= 0:
+                return 0.0
+            tail_size = min(size, 16384)
+            with open(session_file, "rb") as fh:
+                fh.seek(size - tail_size)
+                tail = fh.read().decode("utf-8", errors="replace")
+            for line in reversed(tail.splitlines()):
                 line = line.strip()
                 if not line:
                     continue
@@ -997,12 +1063,10 @@ class ChatSessionManager:
                 if isinstance(ts, str):
                     try:
                         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        v = dt.timestamp()
-                        if v > last:
-                            last = v
+                        return dt.timestamp()
                     except Exception:
                         pass
-            return last
+            return 0.0
         except Exception:
             return 0.0
 
@@ -1020,12 +1084,53 @@ class ChatSessionManager:
         active = self._mapping.get(skey) or str(sess.session_file or "")
         return str(active) == str(session_file)
 
-    def all_sessions(self, map_key: str) -> list[dict]:
+    def _compute_session_meta(self, map_key: str, f: Path, root: dict | None,
+                              uid_index: dict, parents: dict, branch_uid: str) -> dict:
+        """单个 session 的文件级元数据（user 数 / 最后消息时间 / 对焦目标）。
+
+        读 jsonl（user_count）+ turns.json（focus）——打开历史列表时每个
+        session 都做，session 多时是卡顿主因。结果由 all_sessions 按
+        (mtime, size) 缓存，文件未变则整块复用。
+        """
+        text = f.read_text(encoding="utf-8")
+        user_count = text.count('"role": "user"') + text.count('"role":"user"')
+        # 跟随对焦目标：从最新一轮往回找第一个有实际改动（且节点仍在
+        # 树里）的轮次，取其改动批次的根节点 uid；全部没有则空（前端
+        # 退回 session 绑定分支）。数据源 = turns（持久化，重启不丢）
+        focus_uid = ""
+        focus_uids: list[str] = []
+        for turn in reversed(_load_turns(str(f))):
+            diff = turn.get("diff") or []
+            uids = [d.get("uid") for d in diff
+                    if d.get("uid") and d.get("uid") in uid_index]
+            if branch_uid:
+                # 分支 session 只对焦本分支内的改动：防御修复前旧 turns 数据
+                # （并发时可能混入其他分支节点）+ 并发窗口兜底
+                uids = [u for u in uids if _belongs_to_branch(u, branch_uid, parents)]
+            if not uids:
+                continue
+            focus_uids = uids
+            focus_uid = _lca_uid(uids, root)
+            if focus_uid:
+                break
+        return {
+            "user_count": user_count,
+            "modified": self._last_message_ts(str(f)),
+            "focus_uid": focus_uid,
+            "focus_uids": focus_uids,
+        }
+
+    def all_sessions(self, map_key: str, offset: int = 0, limit: int | None = None):
         """该脑图全部 session（root + 各分支）按最后对话时间倒序混排，每条带分支标签。
 
         前端历史记录不再按 agent/分支分组：人的思维链是顺序的，多个分支
         session 协作解决同一件事，按时间线看最符合直觉。分支降级为每行的
         标签（branch_uid + display_label），点击即切换（自动带上分支约束）。
+
+        分页（防卡顿，session 多时）：limit 显式传入时返回
+        `{"items": [...], "total": N}`，limit=0 表示全量；limit 为 None
+        时保持旧行为返回纯 list（向后兼容旧前端/测试）。文件级元数据
+        （user 数/最后消息时间/对焦）按 (mtime, size) 缓存复用。
         """
         prefix = safe_key_slug(map_key) + "__"
         sessions = []
@@ -1042,38 +1147,24 @@ class ChatSessionManager:
                 if is_branch:
                     # 文件名里 slug 不是完整 uid，用 mapping 反查该文件属于哪个分支
                     branch_uid = self._branch_uid_for_file(map_key, str(f))
-                text = f.read_text(encoding="utf-8")
-                user_count = text.count('"role": "user"') + text.count('"role":"user"')
-                # 跟随对焦目标：从最新一轮往回找第一个有实际改动（且节点仍在
-                # 树里）的轮次，取其改动批次的根节点 uid；全部没有则空（前端
-                # 退回 session 绑定分支）。数据源 = turns（持久化，重启不丢）
-                focus_uid = ""
-                focus_uids: list[str] = []
-                for turn in reversed(_load_turns(str(f))):
-                    diff = turn.get("diff") or []
-                    uids = [d.get("uid") for d in diff
-                            if d.get("uid") and d.get("uid") in uid_index]
-                    if branch_uid:
-                        # 分支 session 只对焦本分支内的改动：防御修复前旧 turns 数据
-                        # （并发时可能混入其他分支节点）+ 并发窗口兜底
-                        uids = [u for u in uids if _belongs_to_branch(u, branch_uid, parents)]
-                    if not uids:
-                        continue
-                    focus_uids = uids
-                    focus_uid = _lca_uid(uids, root)
-                    if focus_uid:
-                        break
+                st = f.stat()
+                cached = self._session_meta_cache.get(str(f))
+                if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                    meta = cached[2]
+                else:
+                    meta = self._compute_session_meta(map_key, f, root, uid_index, parents, branch_uid)
+                    self._session_meta_cache[str(f)] = (st.st_mtime, st.st_size, meta)
                 branch_lang = self._lang_pref.get(session_key(map_key, branch_uid), "zh")
                 sessions.append({
                     "file": str(f),
                     "name": f.stem,
-                    "modified": self._last_message_ts(str(f)),
-                    "size": f.stat().st_size,
-                    "user_messages": user_count,
+                    "modified": meta["modified"],
+                    "size": st.st_size,
+                    "user_messages": meta["user_count"],
                     "streaming": self._session_streaming(map_key, str(f), branch_uid),
                     "branch_uid": branch_uid,
-                    "focus_uid": focus_uid,
-                    "focus_uids": focus_uids,
+                    "focus_uid": meta["focus_uid"],
+                    "focus_uids": meta["focus_uids"],
                     "deleted": _branch_deleted(map_key, branch_uid, self._map_state.get(map_key)) if branch_uid else False,
                     "branch_label": _branch_label(map_key, branch_uid, self._map_state.get(map_key), branch_lang) if branch_uid else "",
                     "display_label": _display_label(
@@ -1084,6 +1175,9 @@ class ChatSessionManager:
                 continue
         # 按最后对话时间倒序（不是文件 mtime / 创建时间）
         sessions.sort(key=lambda s: s["modified"], reverse=True)
+        if limit is not None:
+            return {"items": sessions[offset:offset + limit] if limit else sessions,
+                    "total": len(sessions)}
         return sessions
 
     def _branch_uid_for_file(self, map_key: str, session_file: str) -> str:

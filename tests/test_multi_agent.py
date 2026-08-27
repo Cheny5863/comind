@@ -452,3 +452,79 @@ def test_reset_kills_idle_session(env):
     finally:
         mgr._sessions.pop(fake_sf, None)
         mgr._mapping.pop(skey, None)
+
+
+def test_all_sessions_pagination(env):
+    """all_sessions 分页：limit 显式传入返回 {items,total}，切片正确且无重叠。
+
+    前端历史列表一页 20 条（防卡顿），快捷键/恢复仍走 limit=0 全量。
+    """
+    import backend as be
+    client = env
+    sd = be.chat_service.SESSION_DIR
+    prefix = safe_key_slug(MAP_KEY) + "__"
+    # 造 25 个 session，消息时间从旧到新递增
+    for i in range(25):
+        sf = str(sd / (prefix + f"p{i:02d}.jsonl"))
+        ts = f"2026-07-{(i % 27) + 1:02d}T00:00:00.000Z"
+        Path(sf).write_text(
+            '{"type":"message","message":{"role":"user","content":"x"},"timestamp":"' + ts + '"}\n',
+            encoding="utf-8",
+        )
+    # 不带 limit：旧行为，纯 list（旧前端/现有测试兼容）
+    all_items = client.get(f"/api/chat/{MAP_KEY}/all_sessions").json()
+    assert isinstance(all_items, list)
+    # 第一页：20 条（最新在前）
+    r1 = client.get(f"/api/chat/{MAP_KEY}/all_sessions?limit=20&offset=0").json()
+    assert r1["total"] == len(all_items)
+    assert len(r1["items"]) == 20
+    # 第二页：剩余
+    r2 = client.get(f"/api/chat/{MAP_KEY}/all_sessions?limit=20&offset=20").json()
+    assert r2["total"] == len(all_items)
+    assert len(r2["items"]) == len(all_items) - 20
+    # 两页无重叠、合计等于全量；第一页的 modified 都不早于第二页（倒序）
+    files1 = [it["file"] for it in r1["items"]]
+    files2 = [it["file"] for it in r2["items"]]
+    assert not set(files1) & set(files2)
+    assert len(set(files1) | set(files2)) == len(all_items)
+    assert min(it["modified"] for it in r1["items"]) >= max(it["modified"] for it in r2["items"])
+    # limit=0：全量
+    r0 = client.get(f"/api/chat/{MAP_KEY}/all_sessions?limit=0").json()
+    assert r0["total"] == len(all_items) and len(r0["items"]) == len(all_items)
+
+
+def test_all_sessions_meta_cache(env, monkeypatch):
+    """元数据缓存：session 文件 (mtime,size) 未变时第二次调用不重读/重算。
+
+    session 多时打开历史列表卡顿的主因是每个文件全量读 jsonl+turns——
+    缓存命中后整块复用，只有文件真实变化才重算。
+    """
+    import backend as be
+    client = env
+    sd = be.chat_service.SESSION_DIR
+    prefix = safe_key_slug(MAP_KEY) + "__"
+    sf = str(sd / (prefix + "cache.jsonl"))
+    Path(sf).write_text(
+        '{"type":"message","message":{"role":"user","content":"c"},"timestamp":"2026-07-01T00:00:00.000Z"}\n',
+        encoding="utf-8",
+    )
+    mgr = be.chat_manager
+    calls = {"n": 0}
+    orig = mgr._compute_session_meta
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(mgr, "_compute_session_meta", counting)
+    client.get(f"/api/chat/{MAP_KEY}/all_sessions?limit=0")
+    first = calls["n"]
+    assert first >= 1
+    # 文件未变 → 缓存命中，不再重算
+    client.get(f"/api/chat/{MAP_KEY}/all_sessions?limit=0")
+    assert calls["n"] == first, "文件未变却重算了元数据"
+    # 文件变化（追加消息）→ 缓存失效，重算一次
+    with open(sf, "a", encoding="utf-8") as fh:
+        fh.write('{"type":"message","message":{"role":"user","content":"c2"},"timestamp":"2026-07-02T00:00:00.000Z"}\n')
+    client.get(f"/api/chat/{MAP_KEY}/all_sessions?limit=0")
+    assert calls["n"] == first + 1, "文件变化后缓存未失效"

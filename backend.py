@@ -570,9 +570,10 @@ def api_chat_sessions(map_key: str, branch: str = ""):
     return chat_manager.list_sessions(map_key, branch)
 
 @app.get("/api/chat/{map_key}/all_sessions")
-def api_chat_all_sessions(map_key: str):
+def api_chat_all_sessions(map_key: str, offset: int = 0, limit: int | None = None):
     _check_map_key(map_key)
-    return chat_manager.all_sessions(map_key)
+    # limit 显式传入（含 0=全量）→ {items,total}；不传 → 纯 list（旧前端兼容）
+    return chat_manager.all_sessions(map_key, offset=offset, limit=limit)
 
 @app.get("/api/chat/{map_key}/agents")
 def api_chat_agents(map_key: str):
@@ -636,6 +637,15 @@ def api_keys_get():
     for prov_id, env_var in chat_service.PROVIDER_ENV.items():
         configured[prov_id] = bool(keys.get(env_var))
     return {"configured": configured}
+
+
+@app.get("/api/health")
+def api_health():
+    """部署自检：pi 运行时是否可用（node 版本 / pi 二进制 / --version 冒烟）。
+
+    用于 install.sh 部署后冒烟，以及前端区分「key 未配置」vs「AI 运行时异常」。
+    """
+    return chat_service.check_runtime()
 
 @app.post("/api/keys")
 def api_keys_post(body: KeysBody):

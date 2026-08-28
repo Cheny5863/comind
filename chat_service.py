@@ -220,31 +220,60 @@ def _display_label(label: str, max_len: int = 20) -> str:
     return label[:max_len] + "…"
 
 
+# 磁盘脑图文件的 uid→label 索引缓存：map_key → (mtime, size, {uid: label})。
+# _branch_label/_branch_deleted 磁盘优先都要全量读脑图文件建索引——session 多时
+# 每个分支 session 各读一遍 = 平方级开销（问题汇总 152 session，all_sessions
+# 实测 3.4s，420 次全量读 836KB 文件）。文件未变则 O(1) 复用，一次读取服务所有分支。
+_BRANCH_LABEL_CACHE: dict[str, tuple[float, int, dict[str, str]]] = {}
+
+
+def _branch_index(map_key: str) -> dict[str, str]:
+    """读取磁盘脑图文件的 uid→label 索引（按 mtime/size 缓存）。
+
+    磁盘权威优先：用户手动编辑/AI 改图最终都落盘。文件 mtime/size 变化
+    才重读重解析；未变直接返回缓存。文件不存在/解析失败返回空 dict。
+    """
+    fpath = Path(PROJECT_CWD) / map_key
+    if not (map_key.endswith(".smm.json") and fpath.is_file()):
+        return {}
+    try:
+        st = fpath.stat()
+        cached = _BRANCH_LABEL_CACHE.get(map_key)
+        if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            return cached[2]
+        doc = json.loads(fpath.read_text(encoding="utf-8"))
+        md = doc.get("mindMapData") or {}
+        root = _state_root(md)
+        idx = _index_by_uid(root) if isinstance(root, dict) else {}
+        labels = {}
+        for uid, node in idx.items():
+            if isinstance(node, dict) and isinstance(node.get("data"), dict):
+                labels[uid] = _strip_html(node["data"].get("text", ""))
+        _BRANCH_LABEL_CACHE[map_key] = (st.st_mtime, st.st_size, labels)
+        return labels
+    except Exception:
+        return {}
+
+
 def _branch_label(map_key: str, branch_uid: str, state: dict | None = None, lang: str = "zh") -> str:
     """取分支根节点的文本标签，用于注入 system prompt 分支职责说明。
 
     磁盘优先（用户手动编辑/AI 改图最终都落盘，磁盘是权威；_map_state
-    快照只在 sync/apply 时更新，会过期），state 兜底（覆盖磁盘上还不存在
+    快照只在 sync/apply 时更新，会过期；磁盘读取走 _branch_index mtime
+    缓存，session 多时不重复全量读），state 兜底（覆盖磁盘上还不存在
     的新节点——用户在 UI 新建未保存）。两处都找不到 = 分支节点已被删除，
     返回「已删除」标记（按 lang 中英文），不再显示 uid 本身；
     节点存在但文本为空时仍退回 uid（罕见，保留可追踪性）。
     """
     found = False
     try:
-        # 磁盘优先
-        fpath = Path(PROJECT_CWD) / map_key
-        if map_key.endswith(".smm.json") and fpath.is_file():
-            doc = json.loads(fpath.read_text(encoding="utf-8"))
-            md = doc.get("mindMapData") or {}
-            root = _state_root(md)
-            if isinstance(root, dict):
-                idx = _index_by_uid(root)
-                node = idx.get(branch_uid)
-                if node and isinstance(node.get("data"), dict):
-                    found = True
-                    t = _strip_html(node["data"].get("text", ""))
-                    if t:
-                        return t[:40]
+        # 磁盘优先（mtime 缓存索引，不重复全量读）
+        labels = _branch_index(map_key)
+        if branch_uid in labels:
+            found = True
+            t = labels.get(branch_uid, "")
+            if t:
+                return t[:40]
         # state 兜底
         if state:
             root = _state_root(state)
@@ -270,14 +299,9 @@ def _branch_deleted(map_key: str, branch_uid: str, state: dict | None = None) ->
     UI 文案由前端 I18N 字典翻译（项目习惯），后端只负责给标记。
     """
     try:
-        # 磁盘优先
-        fpath = Path(PROJECT_CWD) / map_key
-        if map_key.endswith(".smm.json") and fpath.is_file():
-            doc = json.loads(fpath.read_text())
-            md = doc.get("mindMapData") or {}
-            root = _state_root(md)
-            if isinstance(root, dict) and branch_uid in _index_by_uid(root):
-                return False
+        # 磁盘优先（mtime 缓存索引，不重复全量读）
+        if branch_uid in _branch_index(map_key):
+            return False
         # state 兜底
         if state:
             root = _state_root(state)
@@ -1155,6 +1179,9 @@ class ChatSessionManager:
                     meta = self._compute_session_meta(map_key, f, root, uid_index, parents, branch_uid)
                     self._session_meta_cache[str(f)] = (st.st_mtime, st.st_size, meta)
                 branch_lang = self._lang_pref.get(session_key(map_key, branch_uid), "zh")
+                # label 只算一次：display_label 复用（_branch_label 磁盘优先带 mtime 缓存，
+                # 但对每个分支重复调用仍浪费，合并成一次）
+                branch_label = _branch_label(map_key, branch_uid, self._map_state.get(map_key), branch_lang) if branch_uid else ""
                 sessions.append({
                     "file": str(f),
                     "name": f.stem,
@@ -1166,10 +1193,8 @@ class ChatSessionManager:
                     "focus_uid": meta["focus_uid"],
                     "focus_uids": meta["focus_uids"],
                     "deleted": _branch_deleted(map_key, branch_uid, self._map_state.get(map_key)) if branch_uid else False,
-                    "branch_label": _branch_label(map_key, branch_uid, self._map_state.get(map_key), branch_lang) if branch_uid else "",
-                    "display_label": _display_label(
-                        _branch_label(map_key, branch_uid, self._map_state.get(map_key), branch_lang)
-                    ) if branch_uid else "",
+                    "branch_label": branch_label,
+                    "display_label": _display_label(branch_label) if branch_uid else "",
                 })
             except Exception:
                 continue

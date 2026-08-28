@@ -68,21 +68,38 @@ NODE_DIR="$HOME/.node"
 NPM_GLOBAL="$HOME/.npm-global"
 PI_PATH="$NPM_GLOBAL/bin/pi"
 NODE_VER="v24.15.0"
+NODE_MIN="20.10"   # pi 需要 Node ≥ 20.10（import attributes 语法）
+
+# 校验 node 版本 ≥ $NODE_MIN（返回 0 通过）。$1 = node 可执行路径
+node_version_ok() {
+    [ -x "$1" ] || return 1
+    local ver maj min
+    ver="$("$1" --version 2>/dev/null | sed 's/^v//')" || return 1
+    maj="${ver%%.*}"
+    min="${ver#*.}"; min="${min%%.*}"
+    [ "${maj:-0}" -gt 20 ] || { [ "${maj:-0}" -eq 20 ] && [ "${min:-0}" -ge 10 ]; }
+}
 
 if [ -x "$PI_PATH" ]; then
     say "$(L "AI 助理运行时已就绪:" "AI assistant runtime ready:") $PI_PATH"
 elif [ -x "$APP_DIR/smm-pi" ]; then
     say "$(L "使用发布包内置 smm-pi 二进制（免 node）" "Using bundled smm-pi binary (no node needed)")"
 else
-    # 定位 node：系统 → ~/.node → 在线下载
+    # 定位 node：系统（≥20.10） → ~/.node（≥20.10） → 在线下载 v24.15.0
     NODE_BIN=""
-    if command -v node >/dev/null 2>&1; then
+    if command -v node >/dev/null 2>&1 && node_version_ok "$(command -v node)"; then
         NODE_BIN="$(dirname "$(command -v node)")"
         say "$(L "使用系统 node" "Using system node") $(node --version)"
-    elif [ -x "$NODE_DIR/bin/node" ]; then
+    elif command -v node >/dev/null 2>&1; then
+        warn "$(L "系统 node $(node --version) 过旧（pi 需要 ≥ $NODE_MIN），忽略，改用下载版 node $NODE_VER" "System node $(node --version) too old (pi needs >= $NODE_MIN); ignoring, will download node $NODE_VER")"
+    fi
+    if [ -z "$NODE_BIN" ] && [ -x "$NODE_DIR/bin/node" ] && node_version_ok "$NODE_DIR/bin/node"; then
         NODE_BIN="$NODE_DIR/bin"
-        say "$(L "使用 ~/.node 已安装的 node" "Using node from ~/.node")"
-    else
+        say "$(L "使用 ~/.node 已安装的 node" "Using node from ~/.node") $("$NODE_DIR/bin/node" --version)"
+    elif [ -z "$NODE_BIN" ] && [ -x "$NODE_DIR/bin/node" ]; then
+        warn "$(L "~/.node 的 node 过旧，重新下载 $NODE_VER" "node in ~/.node too old; re-downloading $NODE_VER")"
+    fi
+    if [ -z "$NODE_BIN" ]; then
         say "$(L "下载 node $NODE_VER（nodejs.org 公开源）..." "Downloading node $NODE_VER (from nodejs.org)...")"
         curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-linux-x64.tar.xz" || die "$(L "node 下载失败：目标机需能访问 nodejs.org" "node download failed: host needs access to nodejs.org")"
         mkdir -p "$NODE_DIR"
@@ -98,7 +115,10 @@ else
     "$NODE_BIN/npm" install -g --prefix "$NPM_GLOBAL" @earendil-works/pi-coding-agent || die "$(L "pi 安装失败：npm registry 需可达" "pi install failed: npm registry must be reachable")"
 fi
 [ -x "$PI_PATH" ] || die "$(L "AI 助理运行时（pi）未就绪——这是必要功能，请检查网络后重跑本脚本" "AI assistant runtime (pi) not ready — required feature, check network and rerun")"
-say "$(L "AI 助理运行时就绪: pi" "AI assistant runtime ready: pi") $("$PI_PATH" --version 2>/dev/null || echo '?')（node: $("$NODE_DIR/bin/node" --version 2>/dev/null || node --version 2>/dev/null || echo '?')）"
+
+# pi 冒烟验证：--version 失败（node 过旧 SyntaxError 等）→ 明确报错退出非 0
+PI_VER="$("$PI_PATH" --version 2>&1)" || die "$(L "pi 安装后无法运行（$PI_VER）。请检查 Node ≥ $NODE_MIN（当前 $("$NODE_DIR/bin/node" --version 2>/dev/null || node --version 2>/dev/null || echo '?')）。可用: bash install.sh 重跑（脚本会下载新 node 并重装 pi）" "pi installed but cannot run ($PI_VER). Check Node >= $NODE_MIN (current $("$NODE_DIR/bin/node" --version 2>/dev/null || node --version 2>/dev/null || echo '?')). Rerun: bash install.sh (will download new node and reinstall pi)")"
+say "$(L "AI 助理运行时就绪: pi" "AI assistant runtime ready: pi") $PI_VER（node: $("$NODE_DIR/bin/node" --version 2>/dev/null || node --version 2>/dev/null || echo '?')）"
 
 # ── 4. 安装 systemd 守护 ──
 SERVICE_TEMPLATE="$APP_DIR/comind.service"
@@ -121,3 +141,21 @@ fi
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 say "$(L "部署完成 ✓  访问地址:" "Deployment complete ✓  Visit:") http://${IP:-localhost}:8789"
 say "$(L "查看状态: systemctl status comind （用户级: systemctl --user status comind）" "Status: systemctl status comind (user-level: systemctl --user status comind)")"
+
+# ── 5. 部署后自检：服务健康 + pi 运行时可用 ──
+say "$(L "部署后自检（/api/keys + /api/health）..." "Post-deploy self-check (/api/keys + /api/health)...")"
+UP=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if curl -fsS --max-time 2 http://127.0.0.1:8789/api/keys >/dev/null 2>&1; then
+        UP=1
+        break
+    fi
+    sleep 1
+done
+[ "$UP" = "1" ] || die "$(L "服务未就绪：curl http://127.0.0.1:8789/api/keys 不通。查看日志: journalctl --user -u comind -n 50（系统级: journalctl -u comind -n 50）" "Service not ready: curl http://127.0.0.1:8789/api/keys failed. Logs: journalctl --user -u comind -n 50 (system-level: journalctl -u comind -n 50)")"
+HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8789/api/health 2>/dev/null || echo '{}')"
+HEALTH_OK="$(echo "$HEALTH" | grep -o '"ok": *[a-z]*' | head -1 | grep -o 'true' || true)"
+if [ -z "$HEALTH_OK" ]; then
+    die "$(L "AI 运行时自检失败：pi 不可用（$HEALTH）。查看日志: journalctl --user -u comind -n 50（系统级: journalctl -u comind -n 50）。常见原因: Node 版本过旧（需 ≥ $NODE_MIN）" "AI runtime self-check failed: pi unavailable ($HEALTH). Logs: journalctl --user -u comind -n 50 (system-level: journalctl -u comind -n 50). Common cause: Node too old (needs >= $NODE_MIN)")"
+fi
+say "$(L "自检通过 ✓ 服务健康 + AI 运行时（pi）可用" "Self-check passed ✓ service healthy + AI runtime (pi) available")"

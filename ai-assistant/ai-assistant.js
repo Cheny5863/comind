@@ -240,6 +240,16 @@
     if (b) url += (url.indexOf("?") >= 0 ? "&" : "?") + "branch=" + encodeURIComponent(b);
     return url;
   }
+  // 给 api() URL 追加 query 参数。api() 可能已带 ?branch=xxx（_currentBranch 非空），
+  // 再拼 "?xx" 会变双问号 → 后端解析丢参数（如 limit 丢失返回纯 list，res.items 为空
+  // → 快捷键/恢复/分页静默失效）。统一走这里按已有 query 决定 & 或 ?。
+  function apiQuery(suffix, params) {
+    const base = api(suffix);
+    const qs = Object.keys(params || {})
+      .map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(params[k]))
+      .join("&");
+    return qs ? base + (base.indexOf("?") >= 0 ? "&" : "?") + qs : base;
+  }
   function esc(s) {
     const d = document.createElement("div");
     d.textContent = s;
@@ -447,7 +457,7 @@
       // 恢复上次查看的 session（刷新后不固定回 root）；无记录/记录失效则默认流程
       const rec = readLastView();
       if (rec && rec.file) {
-        fetch(api("all_sessions") + "?limit=0").then((r) => r.json()).then((res) => {
+        fetch(apiQuery("all_sessions", { limit: 0 })).then((r) => r.json()).then((res) => {
           const items = res.items || [];
           if (items.some((it) => it.file === rec.file)) {
             switchSession(rec.file, rec.branch || "");
@@ -1101,7 +1111,7 @@
   function refreshSessionList() {
     const list = document.getElementById("ai-session-list");
     if (!list || list.classList.contains("hidden")) return;
-    fetch(api("all_sessions") + "?offset=" + (_sessionPage * _sessionPageSize) + "&limit=" + _sessionPageSize)
+    fetch(apiQuery("all_sessions", { offset: _sessionPage * _sessionPageSize, limit: _sessionPageSize }))
       .then((r) => r.json()).then((res) => {
         const items = res.items || [];
         const total = res.total || items.length;
@@ -1181,7 +1191,7 @@
   // dir=-1 上一个（更新的，历史列表更靠前）；dir=1 下一个（更旧的）
   // 历史列表 = /api/all_sessions，按最后对话时间倒序
   function stepSession(dir) {
-    fetch(api("all_sessions") + "?limit=0").then((r) => r.json()).then((res) => {
+    fetch(apiQuery("all_sessions", { limit: 0 })).then((r) => r.json()).then((res) => {
       const items = res.items || [];
       if (!items || !items.length) return;
       let idx = items.findIndex((it) => it.file === _currentSessionFile);

@@ -690,26 +690,31 @@ def api_background_post(body: BackgroundBody, name: str = Query(...)):
     return {"status": "ok"}
 
 @app.get("/api/mindmap/full")
-def api_mindmap_full(key: str = Query(...)):
+def api_mindmap_full(key: str = Query(...), branch: str = ""):
     _check_map_key(key)
     state = chat_manager._map_state.get(key)
     if state is None:
         raise HTTPException(400, "前端尚未同步脑图状态（POST /api/chat/{key}/sync） / Frontend has not synced map state (POST /api/chat/{key}/sync)")
     root = chat_service._state_root(state)
+    if branch:
+        scope = chat_service._extract_branch_root(root, branch)
+        if scope is None:
+            raise HTTPException(400, "分支不存在或已被删除 / Branch not found or deleted")
+        return {"tree": chat_service.slim_tree(scope)}
     return {"tree": chat_service.slim_tree(root)}
 
 @app.get("/api/mindmap/outline")
-def api_mindmap_outline(key: str = Query(...)):
+def api_mindmap_outline(key: str = Query(...), branch: str = ""):
     _check_map_key(key)
-    result = chat_service.outline_tree(chat_manager, key)
+    result = chat_service.outline_tree(chat_manager, key, branch)
     if "error" in result:
         raise HTTPException(400, result["error"])
     return result
 
 @app.get("/api/mindmap/subtree")
-def api_mindmap_subtree(key: str = Query(...), uid: str = Query(...)):
+def api_mindmap_subtree(key: str = Query(...), uid: str = Query(...), branch: str = ""):
     _check_map_key(key)
-    result = chat_service.subtree_slim(chat_manager, key, uid)
+    result = chat_service.subtree_slim(chat_manager, key, uid, branch)
     if "error" in result:
         raise HTTPException(400, result["error"])
     return result

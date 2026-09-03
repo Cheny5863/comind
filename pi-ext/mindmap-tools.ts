@@ -41,10 +41,10 @@ export default function (pi: ExtensionAPI) {
     name: "get_mindmap",
     label: "Get Mindmap Outline",
     description:
-      "获取当前脑图的骨架结构：全部节点（含 #uid），文本截断到 60 字符、备注只显示〔含备注〕标记。定位目标分支用；需要某分支完整文本/备注时调 get_subtree(uid)。修改脑图前先调本工具拿最新 uid。",
+      "获取脑图的骨架结构：全部节点（含 #uid），文本截断到 60 字符、备注只显示〔含备注〕标记。修改脑图前先调本工具拿最新 uid。若你绑定分支，返回的只是你分支（分支根及其子孙）的骨架；需要分支内某节点完整文本/备注时调 get_subtree(uid)。",
     parameters: Type.Object({}),
     async execute() {
-      const raw = await apiFetch(`/api/mindmap/outline?key=${K}`);
+      const raw = await apiFetch(`/api/mindmap/outline?key=${K}&branch=${B}`);
       return { content: [{ type: "text" as const, text: truncate(raw, 16000) }], details: {} };
     },
   });
@@ -54,12 +54,12 @@ export default function (pi: ExtensionAPI) {
     name: "get_subtree",
     label: "Get Subtree Detail",
     description:
-      "获取指定节点（uid）的完整子树：面包屑路径 + 完整文本和备注（不截断）。脑图很大时先用 get_mindmap 拿骨架定位，再调本工具展开目标分支细节。",
+      "获取指定节点（uid）的完整子树：面包屑路径 + 完整文本和备注（不截断）。若你绑定分支，uid 必须是你分支内的节点（分支根或其后代），分支外的 uid 会被拒绝。脑图很大时先用 get_mindmap 拿骨架定位，再调本工具展开目标分支细节。",
     parameters: Type.Object({
-      uid: Type.String({ description: "目标节点 uid（来自 get_mindmap / get_mindmap_diff 的 #uid）" }),
+      uid: Type.String({ description: "目标节点 uid（来自 get_mindmap / get_mindmap_diff 的 #uid，须在你的分支内）" }),
     }),
     async execute(_toolCallId: string, params: { uid: string }) {
-      const raw = await apiFetch(`/api/mindmap/subtree?key=${K}&uid=${encodeURIComponent(params.uid)}`);
+      const raw = await apiFetch(`/api/mindmap/subtree?key=${K}&uid=${encodeURIComponent(params.uid)}&branch=${B}`);
       return { content: [{ type: "text" as const, text: truncate(raw, 16000) }], details: {} };
     },
   });
@@ -99,7 +99,7 @@ export default function (pi: ExtensionAPI) {
       "{action:'add',parent_uid|parent_ref,text,children?,index?,ref?} 新增子节点/子树，ref 给新节点起临时名供同批次后续 op 引用；" +
       "{action:'delete',uid} 删除节点；" +
       "{action:'move',uid,new_parent_uid|new_parent_ref,index?} 移动节点。" +
-      "小改动只发对应 op，不要给整棵树。",
+      "小改动只发对应 op，不要给整棵树。⚠️ 若你绑定分支，只能操作你分支内的节点（分支根及其子孙），涉及分支外节点会被后端拒绝；且不能删除/移动你的分支根节点。",
     parameters: Type.Object({
       ops: Type.Array(Type.Object({
         action: Type.String({ description: "update_text / add / delete / move" }),
@@ -138,7 +138,7 @@ export default function (pi: ExtensionAPI) {
     name: "replace_mindmap",
     label: "Replace Mindmap",
     description:
-      "整树替换脑图（仅在大范围重构时使用，小改动请用 update_mindmap）。root 必须是完整新树根节点；未改动节点的 uid 必须原样保留，其余字段系统会自动保留。",
+      "整树替换脑图（仅在大范围重构时使用，小改动请用 update_mindmap）。root 必须是完整新树根节点；未改动节点的 uid 必须原样保留，其余字段系统会自动保留。⚠️ 若你绑定分支，此工具不可用（后端会拒绝整树替换）；大范围重构请分多次 update_mindmap 增量完成。",
     parameters: Type.Object({
       root: Type.Object({}, { additionalProperties: true, description: "完整的新树根节点 {data:{text,...}, children:[...]}" }),
     }),

@@ -64,14 +64,14 @@
 
 其他硬规则：节点的样式/备注等字段系统自动保留，你不用管也不许编；节点文本用纯文本；再强调一遍：小改动用 update_mindmap 增量 op。
 
-**分支边界（如果你绑定了分支）**：system prompt 注入的「你负责的分支」说明你只能改自己分支内的节点。改图前先用 get_mindmap 骨架确认目标 uid 是否在自己分支内（分支根及其子孙）；分支外的改动会被后端拒绝。
+**分支边界（如果你绑定了分支）**：system prompt 注入的「你负责的分支」说明你**只能读写自己分支内的脑图节点**（分支根及其子孙）。改图前先用 get_mindmap 骨架确认目标 uid 是否在自己分支内；分支外的改动会被后端拒绝。
 
-**但是——你能看全图**：get_mindmap / get_subtree / get_mindmap_diff 返回**整张脑图**，不受分支限制。遇到涉及其他分支的请求时，先真正去读那个分支的内容，在回复里体现你的理解（简述现状+基于它的分析建议），再说明无法直接修改、建议找对应 agent 或 root agent 落地。不要只说"改不了"——全图视野是你帮助用户的优势。
+**分支隔离（只约束脑图数据）**：绑定了分支时，get_mindmap / get_subtree / get_mindmap_diff **只返回你分支子树的内容**，其他分支的脑图节点对你不可见——get_subtree 分支外的 uid 会被拒绝。这是权限设计而非缺陷：每个分支由各自 agent 负责。**注意隔离边界是脑图数据**（经脑图工具访问），不影响你的文件工具：read / bash / write / edit 照常可用，需要读代码文件、查资料、跑命令时正常使用。遇到涉及其他分支的脑图请求：**不要猜测或编造其他分支的节点**（你看不到），在你自己分支内给出分析和建议，明确告知用户其他分支需找对应的分支 agent 或 root agent 处理。root agent（未绑定分支）不受此限，可以查看整张脑图。
 
 **改脑图 vs 改文件**：
 - 改脑图内容 → **永远用 update_mindmap / replace_mindmap**
-- 改 JS/CSS 等代码文件 → 用 **write / edit** 工具（精确修改优先 edit，小段替换；不要用 bash 脚本 sed 去改文件）
-- 需要运行命令（git status、构建、验证）→ 用 bash
+- ⚠️ **脑图数据文件（*.smm.json）不要直接用 read/bash 读**——它只是磁盘存储，正确用法是通过 get_mindmap/get_subtree/update_mindmap 等脑图工具访问（后端会按你的分支过滤）。这不是"不能读文件"，是"脑图数据走脑图工具"。
+- 其他文件（代码/文档/配置等）正常用 read/grep/find/ls/write/edit/bash。
 
 ## 背景信息
 
@@ -79,12 +79,12 @@
 
 ## 可用工具
 
-- `get_mindmap_diff`：脑图增量变化（每条消息先调它；首轮返回骨架）
-- `get_mindmap`：脑图骨架结构（改图前必调；文本截断，细节用 get_subtree）
-- `get_subtree`：取指定 uid 节点的完整子树（面包屑 + 完整文本/备注）
+- `get_mindmap_diff`：脑图增量变化（每条消息先调它；首轮返回骨架。绑定分支时只返回你分支的变化）
+- `get_mindmap`：脑图骨架结构（改图前必调；绑定分支时只返回你分支子树。文本截断，细节用 get_subtree）
+- `get_subtree`：取指定 uid 节点的完整子树（面包屑 + 完整文本/备注；绑定分支时 uid 必须在你分支内）
 - `get_background`：背景信息已自动注入，通常不需要调用（保留兼容）
-- `update_mindmap`：更新脑图（改脑图唯一写操作，谨慎使用）
+- `update_mindmap`：更新脑图（绑定分支时只能改自己分支内的节点）
 - `web_fetch`：抓取网页内容（调研用）
+- `read/grep/find/ls`：读本地文件（代码/文档等；⚠️ 脑图数据文件 *.smm.json 除外——脑图内容用上面的脑图工具）
 - `write/edit`：改代码文件（JS/CSS 等；精确小段修改优先 edit）
-- `bash`：执行 shell 命令。需要查项目状态（如 git status、git diff）、构建、验证时**直接用它跑命令**，一条命令能搞定的事绝不要手动翻文件
-- `read/grep/find/ls`：读本地文件（脑图目录 ~/simple-mind-maps）
+- `bash`：执行 shell 命令。需要查项目状态（如 git status、git diff）、构建、验证时**直接用它跑命令**

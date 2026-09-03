@@ -558,21 +558,19 @@ class ChatSession:
                 + bg
                 + "\n"
             )
-        # 分支职责：绑定分支的 agent 只能改自己的分支，root agent 管全图
+        # 分支职责：绑定分支的 agent 只能读写自己的分支，root agent 管全图
         if self.branch_uid:
             state = (self._map_state or {}).get(self.map_key)
             branch_label = _branch_label(self.map_key, self.branch_uid, state, self.lang)
             system_prompt += (
                 "\n\n## 你负责的分支（重要）\n\n"
                 f"你绑定在脑图的分支「{branch_label}」（根节点 uid={self.branch_uid}）上工作。\n"
-                "- **改**：update_mindmap / replace_mindmap **只允许操作你分支内的节点**（分支根节点及其子孙）。涉及分支外节点的改动会被后端拒绝。\n"
-                "- **看（你的优势）**：你**可以查看整张脑图**——get_mindmap / get_subtree / get_mindmap_diff 返回**全图结构**，不限分支。\n"
-                "  其他分支（即使不是你的管辖范围）的内容、结构、变化你都能看到，这是你全面理解脑图、更好帮助用户的优势。\n"
-                "- **遇到分支外的请求时（正确姿势）**：不要只说\"改不了\"。\n"
-                "  1. 先用 get_mindmap / get_subtree 真正去读那个分支，理解它现在有什么、什么结构；\n"
-                "  2. 在回复中**体现你的全图理解**：简述你看到的目标分支现状，基于它给出有价值的分析和建议（可以具体到节点）；\n"
-                "  3. 再说明你无法直接修改该分支（职责边界），建议找对应分支的 agent 或 root agent 落地改动，\n"
-                "     如果用户请求合理，可以明确说\"把这条建议转给负责 XX 的 agent\"。\n"
+                "- **脑图读写范围（隔离边界）**：脑图数据只通过 get_mindmap / get_subtree / get_mindmap_diff / update_mindmap 等**脑图工具**访问，后端按你绑定的分支过滤——你调用它们只能看到/修改自己分支（分支根节点及其子孙），其他分支不可见；replace_mindmap 分支 agent 不可用；直接读脑图数据文件（.smm.json）不是正确用法，请走脑图工具。\n"
+                "- **文件工具照常可用**：read / bash / write / edit 等文件工具与分支隔离无关——需要读代码、查资料、跑命令时正常使用（例如用户让你结合某项目代码分析时，直接去读那些代码文件）。脑图数据与本机文件是两回事。\n"
+                "- **遇到分支外的脑图请求时（正确姿势）**：\n"
+                "  1. 其他分支的脑图内容你调用脑图工具看不到，不要猜测或编造其他分支的节点；\n"
+                "  2. 如果用户引用/提到的节点 uid 不在你分支内，get_subtree 会报错——直接说明该节点属于其他分支，你无权访问；\n"
+                "  3. 可以在你分支内给出分析和建议，但明确告知用户：其他分支的改动需要找对应的分支 agent 或 root agent。\n"
             )
         else:
             system_prompt += (
@@ -588,6 +586,14 @@ class ChatSession:
             "请始终使用该语言回复用户；工具/API 内部文本可保持英文。\n"
         )
 
+        # 工具白名单：分支 agent 与 root 一致，不做角色裁剪。
+        # 分支隔离边界在后端 API 层（get_mindmap/subtree/diff/apply_ops 按
+        # branch 过滤）——脑图数据只能经脑图工具读写；read/bash 等文件工具是
+        # agent 的通用能力（读代码/跑命令），与脑图分支隔离无关，不能砍。
+        tools = ("read,grep,find,ls,write,edit,bash,"
+                 "get_mindmap,get_mindmap_diff,get_subtree,get_background,"
+                 "update_mindmap,replace_mindmap,web_fetch")
+
         cmd = list(PI_LAUNCH) + [
             "--mode", "rpc",
             "--provider", "deepseek",
@@ -596,9 +602,7 @@ class ChatSession:
             "-e", str(EXT_PATH),
             "--session-dir", str(SESSION_DIR),
             "--session", self.session_file,
-            # 内置读写 + bash（改 JS/CSS 等文件用 write/edit；脑图必须走扩展工具）
-            "--tools",
-            "read,grep,find,ls,write,edit,bash,get_mindmap,get_mindmap_diff,get_subtree,get_background,update_mindmap,replace_mindmap,web_fetch",
+            "--tools", tools,
         ]
         if system_prompt:
             cmd += ["--append-system-prompt", system_prompt]
@@ -1833,15 +1837,39 @@ def _ensure_map_state(manager: ChatSessionManager, key: str) -> None:
             md = doc.get("mindMapData") or {}
             if md:
                 manager._map_state[key] = md
-                manager._map_snapshot.pop(key, None)
+                # 清掉该脑图所有快照（root 键 key + 分支键 key::branch）：
+                # 磁盘兜底加载意味着状态可能整体变化，旧快照会误报 diff
+                for sk in [k for k in manager._map_snapshot if k == key or k.startswith(key + "::")]:
+                    manager._map_snapshot.pop(sk, None)
         except Exception:
             pass
 
 
-def outline_tree(manager: ChatSessionManager, key: str) -> dict:
+def _extract_branch_root(root: dict, branch_uid: str) -> dict | None:
+    """从全树提取以 branch_uid 为根的子树节点（含全部后代）。
+
+    收紧隔离后分支 agent 的读视野 = 该子树：get_mindmap / get_subtree /
+    diff 都以它作为"根"。分支被删除后返回 None（前端 _branch_deleted 标记）。
+    """
+    if not branch_uid:
+        return root
+    if not isinstance(root, dict):
+        return None
+    if (root.get("data") or {}).get("uid") == branch_uid:
+        return root
+    for c in root.get("children", []) or []:
+        r = _extract_branch_root(c, branch_uid)
+        if r is not None:
+            return r
+    return None
+
+
+def outline_tree(manager: ChatSessionManager, key: str, branch_uid: str = "") -> dict:
     """骨架模式：完整结构 + 截断文本 + 子节点数，保证大图也不会爆 token。
 
     渐进式披露的入口——AI 用骨架导航定位分支，细节再调 subtree_slim。
+    分支收紧（2026-09-03）：branch_uid 非空时视野 = 以分支根为根的子树
+    （只返回分支内容，不再返回整张脑图）。root agent（空）保持全图。
     """
     _ensure_map_state(manager, key)
     current = manager._map_state.get(key)
@@ -1850,6 +1878,18 @@ def outline_tree(manager: ChatSessionManager, key: str) -> dict:
     root = _state_root(current)
     if not isinstance(root, dict):
         return {"error": "脑图为空"}
+    if branch_uid:
+        scope = _extract_branch_root(root, branch_uid)
+        if scope is None:
+            return {"error": "你的分支不存在或已被删除（根节点 uid 不在脑图中）"}
+        return {
+            "mode": "outline",
+            "scope": "branch",
+            "branch_uid": branch_uid,
+            "node_count": len(_index_by_uid(scope)),
+            "tree": slim_tree(scope, text_limit=60, note_limit=-1, show_child_count=True),
+            "hint": "这是你分支「" + _strip_html(scope.get("data", {}).get("text", "")) + "」的骨架（仅你的分支内容）。需要分支内某节点的完整内容时调 get_subtree(uid)。",
+        }
     return {
         "mode": "outline",
         "node_count": len(_index_by_uid(root)),
@@ -1875,23 +1915,38 @@ def _find_path(root: dict, uid: str, path: list[str] | None = None) -> list[str]
     return None
 
 
-def subtree_slim(manager: ChatSessionManager, key: str, uid: str) -> dict:
+def subtree_slim(manager: ChatSessionManager, key: str, uid: str, branch_uid: str = "") -> dict:
     """取某个节点下的完整子树（含备注/链接，文本不截断），带面包屑路径。
 
     渐进式披露的第二层：AI 用骨架定位 uid 后，这里拿该分支的完整内容。
+    分支收紧（2026-09-03）：branch_uid 非空时只允许读取分支内的节点
+    （uid 必须在分支子树内），分支外的 uid 一律拒绝——不能通过
+    get_subtree 窥探其他分支内容。
     """
     _ensure_map_state(manager, key)
     current = manager._map_state.get(key)
     if current is None:
         return {"error": "no map state synced yet; frontend must POST /api/chat/{key}/sync first"}
-    root = _state_root(current)
-    if not isinstance(root, dict):
+    full_root = _state_root(current)
+    if not isinstance(full_root, dict):
         return {"error": "脑图为空"}
-    idx = _index_by_uid(root)
-    node = idx.get(uid)
-    if node is None:
-        return {"error": f"uid {uid} 不存在（脑图已变化？重新调 get_mindmap 拿最新骨架）"}
-    path = _find_path(root, uid) or []
+    if branch_uid:
+        # 分支 agent：只能读分支子树内的节点
+        scope = _extract_branch_root(full_root, branch_uid)
+        if scope is None:
+            return {"error": "你的分支不存在或已被删除（根节点 uid 不在脑图中）"}
+        idx = _index_by_uid(scope)
+        node = idx.get(uid)
+        if node is None:
+            # uid 可能在脑图其他分支（骨架里不该出现，防御直接拒绝）
+            return {"error": f"uid {uid} 不在你的分支内（你只能读取分支根 {branch_uid} 及其子孙节点）"}
+        path = _find_path(scope, uid) or []
+    else:
+        idx = _index_by_uid(full_root)
+        node = idx.get(uid)
+        if node is None:
+            return {"error": f"uid {uid} 不存在（脑图已变化？重新调 get_mindmap 拿最新骨架）"}
+        path = _find_path(full_root, uid) or []
     self_text = _strip_html(node.get("data", {}).get("text", "")) or "(空)"
     return {
         "uid": uid,
@@ -1945,6 +2000,10 @@ def diff_map(manager: ChatSessionManager, key: str, branch_uid: str = "") -> dic
     快照按 (map, branch) 隔离：每个 agent 的 diff 快照独立前移，
     避免 A 调过 get_mindmap_diff 后 B 的增量感知被清空（多 agent 并行关键）。
 
+    分支收紧（2026-09-03）：branch_uid 非空时，快照和对比都限定在
+    **分支子树**内——分支 agent 只能感知自己分支的变化，其他分支的
+    增删改对它完全不可见（首轮 full 也返回分支子树而非整图）。
+
     First call (no snapshot): returns the full slim tree and creates the
     snapshot. Subsequent calls return added/removed/changed lists and then
     update the snapshot to the current state.
@@ -1953,21 +2012,47 @@ def diff_map(manager: ChatSessionManager, key: str, branch_uid: str = "") -> dic
     current = manager._map_state.get(key)
     if current is None:
         return {"error": "no map state synced yet; frontend must POST /api/chat/{key}/sync first"}
-    root = _state_root(current)
+    full_root = _state_root(current)
     snap_key = session_key(key, branch_uid)
     snapshot = manager._map_snapshot.get(snap_key)
-    if snapshot is None:
-        manager._map_snapshot[snap_key] = json.loads(json.dumps(current))
-        return {
-            "full": True,
-            "tree": slim_tree(root, text_limit=60, note_limit=-1, show_child_count=True),
-            "node_count": len(_index_by_uid(root)),
-            "hint": "首轮返回骨架（文本截断 60 字符、备注只显示标记）。需要某分支完整内容时调 get_subtree(uid)。",
-        }
-    cur_idx = _index_by_uid(root)
-    old_idx = _index_by_uid(_state_root(snapshot))
-    cur_par = _index_with_parent(root)
-    old_par = _index_with_parent(_state_root(snapshot))
+
+    if branch_uid:
+        # 分支 agent：视图 = 分支子树；快照也按分支子树存
+        scope = _extract_branch_root(full_root, branch_uid) if isinstance(full_root, dict) else None
+        if scope is None:
+            return {"error": "你的分支不存在或已被删除（根节点 uid 不在脑图中）"}
+        if snapshot is None:
+            manager._map_snapshot[snap_key] = {"root": json.loads(json.dumps(scope))}
+            return {
+                "full": True,
+                "scope": "branch",
+                "branch_uid": branch_uid,
+                "tree": slim_tree(scope, text_limit=60, note_limit=-1, show_child_count=True),
+                "node_count": len(_index_by_uid(scope)),
+                "hint": "首轮返回你分支的骨架（仅你的分支内容）。需要分支内某节点完整内容时调 get_subtree(uid)。",
+            }
+        root = scope
+        old_root = _state_root(snapshot)
+        # 快照可能是旧格式全图（branch 收紧前/服务升级瞬间）——按分支裁剪
+        if isinstance(old_root, dict) and old_root.get("data", {}).get("uid") != branch_uid:
+            old_scope = _extract_branch_root(old_root, branch_uid)
+            old_root = old_scope if old_scope is not None else {"data": {}, "children": []}
+    else:
+        root = full_root
+        if snapshot is None:
+            manager._map_snapshot[snap_key] = json.loads(json.dumps(current))
+            return {
+                "full": True,
+                "tree": slim_tree(root, text_limit=60, note_limit=-1, show_child_count=True) if isinstance(root, dict) else "",
+                "node_count": len(_index_by_uid(root)) if isinstance(root, dict) else 0,
+                "hint": "首轮返回骨架（文本截断 60 字符、备注只显示标记）。需要某分支完整内容时调 get_subtree(uid)。",
+            }
+        old_root = _state_root(snapshot)
+
+    cur_idx = _index_by_uid(root) if isinstance(root, dict) else {}
+    old_idx = _index_by_uid(old_root) if isinstance(old_root, dict) else {}
+    cur_par = _index_with_parent(root) if isinstance(root, dict) else {}
+    old_par = _index_with_parent(old_root) if isinstance(old_root, dict) else {}
     added, removed, changed = [], [], []
     for uid, node in cur_idx.items():
         if uid not in old_idx:
@@ -1993,8 +2078,12 @@ def diff_map(manager: ChatSessionManager, key: str, branch_uid: str = "") -> dic
     for uid, node in old_idx.items():
         if uid not in cur_idx:
             removed.append(_node_summary(node))
-    # Snapshot moves forward with every diff — per (map, branch)
-    manager._map_snapshot[snap_key] = json.loads(json.dumps(current))
+    # Snapshot moves forward with every diff — per (map, branch)。
+    # 分支模式下 root == 分支子树，快照存分支子树视图（和首轮一致）；root 存全图
+    if branch_uid:
+        manager._map_snapshot[snap_key] = {"root": json.loads(json.dumps(root))}
+    else:
+        manager._map_snapshot[snap_key] = json.loads(json.dumps(current))
     return {"full": False, "added": added, "removed": removed, "changed": changed}
 
 
@@ -2230,7 +2319,14 @@ def _commit_map(manager: ChatSessionManager, key: str, doc: dict, new_data: dict
     manager._map_state[key] = new_data
     manager._map_ver[key] = _ensure_map_ver_cs(manager, key) + 1
     writer_key = session_key(key, branch_uid)
-    manager._map_snapshot[writer_key] = json.loads(json.dumps(new_data))
+    if branch_uid:
+        # 分支写者：diff 快照只前移自己的分支子树（分支收紧 2026-09-03）——
+        # 分支 agent 的快照模型是 {root: 分支子树}，若存全图会让它下次 diff
+        # 把其他分支的并发改动误算进自己分支的变化
+        wscope = _extract_branch_root(_state_root(new_data), branch_uid) if isinstance(new_data, dict) else None
+        manager._map_snapshot[writer_key] = {"root": json.loads(json.dumps(wscope))} if wscope is not None else json.loads(json.dumps(new_data))
+    else:
+        manager._map_snapshot[writer_key] = json.loads(json.dumps(new_data))
     # 落盘（原子写）
     fpath = Path(PROJECT_CWD) / key
     if key.endswith(".smm.json"):
@@ -2514,6 +2610,9 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
             if uid == root_uid:
                 errors.append(f"op[{i}]: 不允许删除根节点")
                 continue
+            if branch_uid and uid == branch_uid:
+                errors.append(f"op[{i}]: 不允许删除你自己的分支根节点（删除它会毁掉整个分支）；如确需删除请让 root agent 处理")
+                continue
             if not check_allowed(uid, i, "目标节点"):
                 continue
             node = old_by_uid.get(uid)
@@ -2539,6 +2638,9 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
                 continue
             if uid == root_uid:
                 errors.append(f"op[{i}]: 不允许移动根节点")
+                continue
+            if branch_uid and uid == branch_uid:
+                errors.append(f"op[{i}]: 不允许移动你自己的分支根节点（移动会改变分支归属）；如确需移动请让 root agent 处理")
                 continue
             new_parent = old_by_uid.get(op.get("new_parent_uid", ""))
             if new_parent is None and op.get("new_parent_ref"):

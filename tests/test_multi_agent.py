@@ -218,22 +218,129 @@ def test_diff_snapshot_isolated_per_branch(env):
     assert r.json()["added"] == [] and r.json()["removed"] == [] and r.json()["changed"] == []
 
 
-def test_diff_sees_other_branch_changes(env):
-    """分支 A 改完图后，分支 B 的 diff 能看到 A 的改动（快照未被动）。"""
+def test_diff_does_not_see_other_branch_changes(env):
+    """分支收紧（2026-09-03）：分支 B 的 diff 感知不到 A 分支的改动。
+
+    diff 快照与对比都限定在分支子树内——分支 agent 只感知自己分支的变化。
+    root agent 不受限，仍能看到 A 分支的改动（管全图）。
+    """
     client = env
     client.get(f"/api/mindmap/diff?key={MAP_KEY}&branch=a-1")   # A 快照
     client.get(f"/api/mindmap/diff?key={MAP_KEY}&branch=b-1")   # B 快照
+    client.get(f"/api/mindmap/diff?key={MAP_KEY}&branch=")      # root 快照
     # A 分支改 a-1-1
     r = client.post("/api/mindmap/apply_ops", json={
         "key": MAP_KEY, "branch_uid": "a-1",
         "ops": [{"action": "update_text", "uid": "a-1-1", "text": "A1被A改了"}],
     })
     assert r.status_code == 200
-    # B 分支 diff 应看到 a-1-1 变化
+    # B 分支 diff 不应看到 a-1-1 变化（分支隔离）
     r = client.get(f"/api/mindmap/diff?key={MAP_KEY}&branch=b-1")
     assert r.status_code == 200
-    changed = r.json().get("changed", [])
-    assert any(c["uid"] == "a-1-1" for c in changed)
+    body = r.json()
+    changed = body.get("changed", [])
+    assert not any(c["uid"] == "a-1-1" for c in changed), f"B 分支 diff 泄漏了 A 分支改动: {changed}"
+    # B 分支 diff 对自己分支内无变化 → 空增量
+    assert body.get("added") == [] and body.get("removed") == []
+    # A 分支自己的 diff 看不到自己刚提交的改动（写者快照已前移）
+    r = client.get(f"/api/mindmap/diff?key={MAP_KEY}&branch=a-1")
+    assert r.status_code == 200
+    assert not any(c["uid"] == "a-1-1" for c in r.json().get("changed", []))
+    # root agent 的 diff 能看到 a-1-1 变化（root 管全图，不受分支隔离）
+    r = client.get(f"/api/mindmap/diff?key={MAP_KEY}&branch=")
+    assert r.status_code == 200
+    assert any(c["uid"] == "a-1-1" for c in r.json().get("changed", []))
+
+
+def test_outline_branch_only_returns_own_subtree(env):
+    """分支收紧：outline 带 branch 只返回分支子树，看不到其他分支。"""
+    client = env
+    r = client.get(f"/api/mindmap/outline?key={MAP_KEY}&branch=a-1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["scope"] == "branch"
+    tree = body["tree"]
+    assert "节点A" in tree and "节点A1" in tree and "节点A2" in tree   # 分支内容
+    assert "节点B" not in tree and "根节点" not in tree                # 其他分支/根不可见
+    # root（不带 branch）仍能看全图
+    r = client.get(f"/api/mindmap/outline?key={MAP_KEY}")
+    assert r.status_code == 200
+    assert "节点B" in r.json()["tree"]
+
+
+def test_subtree_branch_rejects_outside_uid(env):
+    """分支收紧：subtree 带 branch 时，分支外的 uid 拒绝读取。"""
+    client = env
+    # 分支 A 内读自己节点 → OK
+    r = client.get(f"/api/mindmap/subtree?key={MAP_KEY}&uid=a-1-1&branch=a-1")
+    assert r.status_code == 200
+    assert "节点A1" in r.json()["tree"]
+    # 分支 A 读分支 B 的节点 → 400 拒绝
+    r = client.get(f"/api/mindmap/subtree?key={MAP_KEY}&uid=b-1&branch=a-1")
+    assert r.status_code == 400
+    assert "不在你的分支内" in r.json()["detail"]
+    # root（不带 branch）可读任意节点
+    r = client.get(f"/api/mindmap/subtree?key={MAP_KEY}&uid=b-1")
+    assert r.status_code == 200
+    assert "节点B" in r.json()["tree"]
+
+
+def test_diff_first_full_branch_returns_own_subtree(env):
+    """分支收紧：diff 首轮 full 只返回分支子树骨架（不是整图）。"""
+    client = env
+    r = client.get(f"/api/mindmap/diff?key={MAP_KEY}&branch=a-1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["full"] is True
+    assert body["scope"] == "branch"
+    tree = body["tree"]
+    assert "节点A" in tree and "节点A1" in tree
+    assert "节点B" not in tree and "根节点" not in tree
+
+
+def test_diff_branch_deleted_branch_errors(env):
+    """分支收紧：分支根被删后，outline/subtree/diff 都报错而不是返回全图。"""
+    client = env
+    # root 删除 a-1 分支整棵
+    r = client.post("/api/mindmap/apply_ops", json={
+        "key": MAP_KEY, "branch_uid": "",
+        "ops": [{"action": "delete", "uid": "a-1"}],
+    })
+    assert r.status_code == 200
+    r = client.get(f"/api/mindmap/outline?key={MAP_KEY}&branch=a-1")
+    assert r.status_code == 400
+    assert "分支不存在" in r.json()["detail"]
+    r = client.get(f"/api/mindmap/diff?key={MAP_KEY}&branch=a-1")
+    assert r.status_code == 400
+
+
+def test_branch_agent_cannot_delete_own_branch_root(env):
+    """写路径补漏：分支 agent 不能删除自己的分支根节点。"""
+    client = env
+    r = client.post("/api/mindmap/apply_ops", json={
+        "key": MAP_KEY, "branch_uid": "a-1",
+        "ops": [{"action": "delete", "uid": "a-1"}],
+    })
+    assert r.status_code == 400
+    assert "分支根" in r.text
+    # root agent 可以删（不受限）
+    r = client.post("/api/mindmap/apply_ops", json={
+        "key": MAP_KEY, "branch_uid": "",
+        "ops": [{"action": "delete", "uid": "a-1"}],
+    })
+    assert r.status_code == 200
+    assert r.json()["applied"] == 1
+
+
+def test_branch_agent_cannot_move_own_branch_root(env):
+    """写路径补漏：分支 agent 不能移动自己的分支根节点（改变归属）。"""
+    client = env
+    r = client.post("/api/mindmap/apply_ops", json={
+        "key": MAP_KEY, "branch_uid": "a-1",
+        "ops": [{"action": "move", "uid": "a-1", "new_parent_uid": "b-1"}],
+    })
+    assert r.status_code == 400
+    assert "分支根" in r.text
 
 
 def test_agents_list(env):

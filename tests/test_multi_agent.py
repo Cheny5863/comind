@@ -664,3 +664,22 @@ def test_all_sessions_meta_cache(env, monkeypatch):
         fh.write('{"type":"message","message":{"role":"user","content":"c2"},"timestamp":"2026-07-02T00:00:00.000Z"}\n')
     client.get(f"/api/chat/{MAP_KEY}/all_sessions?limit=0")
     assert calls["n"] == first + 1, "文件变化后缓存未失效"
+
+
+def test_prompt_too_long_rejected(env, monkeypatch):
+    """消息长度上限防呆：超过 30000 字符返回 400（不触达 pi spawn）。
+
+    防呆保险只在超限时生效；30000 放行分支 monkeypatch prompt 防真 spawn
+    （CI 无 pi 二进制，且真调 LLM 浪费）。
+    """
+    import backend as be
+    client = env
+    calls = {"n": 0}
+    monkeypatch.setattr(be.chat_manager, "prompt", lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
+    ok = client.post(f"/api/chat/{MAP_KEY}/prompt", json={"message": "x" * 30000})
+    assert ok.status_code == 200, f"30000 字符应放行: {ok.status_code}"
+    assert calls["n"] == 1, "放行后应进入 prompt"
+    r = client.post(f"/api/chat/{MAP_KEY}/prompt", json={"message": "x" * 30001})
+    assert r.status_code == 400, f"30001 字符应拒绝: {r.status_code}"
+    assert "30000" in r.text
+    assert calls["n"] == 1, "超长应被拦截，不进入 prompt"

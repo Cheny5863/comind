@@ -507,8 +507,8 @@ class OpsBody(BaseModel):
 @app.post("/api/chat/{map_key}/prompt")
 def api_chat_prompt(map_key: str, body: ChatPromptBody, request: Request):
     _check_map_key(map_key)
-    if len(body.message) > 8000:
-        raise HTTPException(400, "消息过长（限 8000 字符） / Message too long (max 8000 chars)")
+    if len(body.message) > 30000:
+        raise HTTPException(400, "消息过长（限 30000 字符） / Message too long (max 30000 chars)")
     lang = request.headers.get("X-Lang") or None
     chat_manager.prompt(map_key, body.message, body.context, lang=lang, branch_uid=body.branch_uid)
     return {"status": "ok"}

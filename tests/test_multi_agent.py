@@ -473,6 +473,35 @@ def test_session_modified_is_last_message_ts(env):
     assert abs(it["modified"] - 1783080000.0) < 2, f"modified={it['modified']}"
 
 
+def test_last_message_ts_long_single_line(env):
+    """bug 回归（2026-09-04 movexbot 实证）：最后一条消息单行 >16KB 时，
+    固定 16KB 尾部窗口被该行截断片段占满 → 解析失败返回 0.0 → session
+    排序沉底（历史列表"凭空消失"）。窗口必须自适应放大。"""
+    import backend as be
+    client = env
+    sd = be.chat_service.SESSION_DIR
+    prefix = safe_key_slug(MAP_KEY) + "__"
+    sf = str(sd / (prefix + "longline.jsonl"))
+    long_msg = {
+        "type": "message",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "x" * 40000}]},
+        "timestamp": "2026-07-03T12:00:00.000Z",
+    }
+    line = json.dumps(long_msg, ensure_ascii=False)
+    assert len(line.encode("utf-8")) > 16384, "测试前提：单行必须超过旧 16KB 窗口"
+    Path(sf).write_text(
+        '{"type":"session","timestamp":"2026-07-01T00:00:00.000Z"}\n'
+        '{"type":"message","message":{"role":"user","content":"a"},"timestamp":"2026-07-02T00:00:00.000Z"}\n'
+        + line + "\n",
+        encoding="utf-8",
+    )
+    items = client.get(f"/api/chat/{MAP_KEY}/all_sessions").json()
+    it = next(i for i in items if i["file"] == sf)
+    assert it["modified"] != 0.0, f"超长行导致 modified 归零: {it}"
+    # 应为最后一条超长消息的时间（07-03T12:00 = 1783080000）
+    assert abs(it["modified"] - 1783080000.0) < 2, f"modified={it['modified']}"
+
+
 def test_active_removed_from_all_sessions(env):
     """bug 回归：all_sessions 不再返回 active 字段（高亮纯前端逻辑）。"""
     client = env

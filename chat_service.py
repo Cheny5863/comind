@@ -1066,36 +1066,43 @@ class ChatSessionManager:
         在加载时写 session 元数据导致 mtime 变化。真正的"最后对话时间"
         应来自 jsonl 里最后一条 message 记录的 timestamp。
 
-        反向扫描：只读文件尾部 16KB（jsonl 追加写，最后一条消息必在尾部），
-        大文件不必全量读入。最后一行可能是不完整的流式半行，json.loads
-        失败跳过即可。返回 0.0 兜底时调用方仍能工作（排序靠后）。
+        反向扫描：从文件尾部小窗口开始（jsonl 追加写，最后消息必在尾部），
+        窗口内找不到完整 message 行就翻倍放大——单条超长消息（如长 thinking
+        回复 >16KB）会占满小窗口且被截断解析失败，固定小窗口会误返回 0.0
+        导致 session 排序沉底（历史列表"凭空消失"）。返回 0.0 兜底时
+        调用方仍能工作（排序靠后）。
         """
         try:
             size = os.path.getsize(session_file)
             if size <= 0:
                 return 0.0
-            tail_size = min(size, 16384)
-            with open(session_file, "rb") as fh:
-                fh.seek(size - tail_size)
-                tail = fh.read().decode("utf-8", errors="replace")
-            for line in reversed(tail.splitlines()):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    e = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if e.get("type") != "message":
-                    continue
-                ts = e.get("timestamp")
-                if isinstance(ts, str):
+            window = 16384
+            while True:
+                tail_size = min(size, window)
+                with open(session_file, "rb") as fh:
+                    fh.seek(size - tail_size)
+                    tail = fh.read().decode("utf-8", errors="replace")
+                for line in reversed(tail.splitlines()):
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
-                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        return dt.timestamp()
-                    except Exception:
-                        pass
-            return 0.0
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if e.get("type") != "message":
+                        continue
+                    ts = e.get("timestamp")
+                    if isinstance(ts, str):
+                        try:
+                            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            return dt.timestamp()
+                        except Exception:
+                            pass
+                # 窗口已覆盖整个文件还没找到完整 message：放弃
+                if tail_size >= size:
+                    return 0.0
+                window *= 4
         except Exception:
             return 0.0
 

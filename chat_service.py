@@ -22,7 +22,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Iterator
+from typing import Callable, Iterator
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -510,6 +510,9 @@ class ChatSession:
         self.lang = lang
         # manager._map_state 的引用（只读用，查分支名）；None 时 _branch_label 走磁盘兜底
         self._map_state = map_state
+        # agent_end 时由宿主结算本轮回调（ChatSessionManager 注入）——轮次 diff 落盘
+        # 挂这里，与"有没有 SSE 消费者"解耦，详见 finalize_turn 的说明
+        self.on_agent_end: Callable[[], None] | None = None
         self.proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.listeners: list[Queue] = []
@@ -670,6 +673,15 @@ class ChatSession:
                         self._in_turn = False
                         self._abort_requested = False
                         self._buffer.clear()
+                        # 本轮回合结束即结算轮次（脑图反向 diff 的数据源）。
+                        # 挂在**pi 进程输出**路径上：只要回合真的结束就落盘，
+                        # 不要求有 SSE 消费者在场。
+                        if ev_type == "agent_end" and self.on_agent_end:
+                            try:
+                                self.on_agent_end()
+                            except Exception as exc:
+                                logger.warning("on_agent_end failed for %s: %s",
+                                               self.map_key, exc)
                 except json.JSONDecodeError:
                     pass
                 # Broadcast to all listeners (drop on full, never remove —
@@ -863,6 +875,8 @@ class ChatSessionManager:
                 self._save_mapping()
                 session_file = None
             sess = ChatSession(map_key, branch_uid, session_file, self._lang_pref.get(skey, "zh"), self._map_state)
+            # 轮次结算回调：agent_end 即落盘本轮 diff，不依赖 SSE 消费者
+            sess.on_agent_end = lambda mk=map_key, bu=branch_uid: self.finalize_turn(mk, bu)
             sess.spawn()
             self._sessions[sess.session_file or ""] = sess
             # Re-apply the user's model choice to the fresh pi process
@@ -946,6 +960,12 @@ class ChatSessionManager:
                             q.put_nowait(end_ev)
                         except Exception:
                             pass
+                    # 强杀也要结算本轮：否则 _turn_before/_turn_ops 残留，
+                    # 被下一轮 pop 走 → 下一轮的 diff 记到上一轮头上
+                    try:
+                        self.finalize_turn(map_key, branch_uid)
+                    except Exception:
+                        pass
                     sess.kill()
             threading.Thread(target=_force_kill, daemon=True).start()
             return True
@@ -1001,9 +1021,10 @@ class ChatSessionManager:
                 try:
                     ev = json.loads(line)
                     ev_type = ev.get("type", "unknown")
-                    # agent_end 先落盘轮次记录再广播：前端收到事件立即查 turns 时数据已就绪
-                    if ev_type == "agent_end":
-                        self.finalize_turn(map_key, branch_uid)
+                    # 轮次落盘已改在 ChatSession._read_stdout 的 agent_end 处结算
+                    # （挂在 pi 进程输出路径，与 SSE 消费者解耦）。这里只负责广播：
+                    # 不能再依赖"有前端连着 /events 才落盘"——外部 agent/CI/cron 驱动
+                    # 没有 SSE 消费者，回滚会失去脑图反向 diff 而只能截断对话。
                     yield f"event: {ev_type}\ndata: {line}\n\n"
                     # Persist mapping on session file discovery / conversation end
                     # 已 detach 的 session 不能回写 mapping，否则会覆盖新 session 的条目

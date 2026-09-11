@@ -947,26 +947,31 @@
     el.textContent = display;
     el.classList.toggle("is-branch", !!_currentBranch);
   }
+  /* 当前分支的活跃 session 收敛进前端状态。
+     `_currentSessionFile` 为空时（刚新建会话 / 刚切分支）用后端已落定的活跃 session 回填，
+     并把 lastView 记成它——刷新后要恢复的就是「用户正在用的那个会话」。
+     仅在用户没有明确查看某个 session 时填充，避免 3s 轮询把用户正在看的会话覆盖掉。 */
+  function reconcileCurrentSession() {
+    const cur = _agents.find((a) => (a.branch_uid || "") === _currentBranch);
+    if (cur && cur.session_file) {
+      if (!_currentSessionFile) {
+        _currentSessionFile = cur.session_file;
+        markRead(_currentSessionFile);  // 正在查看 = 已读，历史列表不显示红点
+        recordLastView(_currentSessionFile, _currentBranch);  // 记住"上次查看"，刷新后恢复
+      }
+    } else if (cur && _currentBranch && !_currentSessionFile) {
+      // 分支已绑定但还没发消息（无 session 文件）——记住分支本身，
+      // 否则关面板重开会丢新分支、恢复旧 session
+      _currentSessionFile = "";
+      recordLastView("", _currentBranch);
+    }
+  }
+
   function refreshAgents(cb) {
     fetch(api("agents")).then((r) => r.json()).then((list) => {
       _agents = list || [];
       loadAgentLabel();
-      // 同步当前查看的 session：仅在用户没有明确查看某个 session 时填充活跃会话
-      // （防止 3s 轮询把 _currentSessionFile 覆盖成"当前分支活跃 session"，导致
-      //  Ctrl+Alt+PageUp/PageDown 翻历史会话时基于错误状态短路/跳错——F5 才恢复）
-      const cur = _agents.find((a) => (a.branch_uid || "") === _currentBranch);
-      if (cur && cur.session_file) {
-        if (!_currentSessionFile) {
-          _currentSessionFile = cur.session_file;
-          markRead(_currentSessionFile);  // 正在查看 = 已读，历史列表不显示红点
-          recordLastView(_currentSessionFile, _currentBranch);  // 记住"上次查看"，刷新后恢复
-        }
-      } else if (cur && _currentBranch && !_currentSessionFile) {
-        // 分支已绑定但还没发消息（无 session 文件）——记住分支本身，
-        // 否则关面板重开会丢新分支、恢复旧 session
-        _currentSessionFile = "";
-        recordLastView("", _currentBranch);
-      }
+      reconcileCurrentSession();
       if (cb) cb(_agents);
     }).catch(() => {});
   }
@@ -992,6 +997,7 @@
       recoverStreamState();
     }
     fetch(api("agents")).then((r) => r.json()).then((list) => {
+      const prevSnap = _agentsSnapshot;   // 先存旧快照：下面要拿它算"上一轮是否在跑"
       const snap = {};
       (list || []).forEach((a) => { snap[a.branch_uid || ""] = !!a.streaming; });
       // 后台 agent 开始/完成 → toast（当前分支的状态由 SSE 管，不重复通知）
@@ -1002,13 +1008,19 @@
         if (cur && !prev) toast(t("agentStarted", { name: agentLabelOf(b, list) }));
         else if (!cur && prev) toast(t("agentDone", { name: agentLabelOf(b, list) }));
       });
-      _agentsSnapshot = snap;
+      // 本函数同时是 _agents 的周期性同步点：has_history / label / session_file
+      // 都从这里读（newAgentFor 判定「已交流过 → 新开一轮」依赖它）。此前只更新
+      // streaming 快照、不写回 _agents，导致「刚聊完 → Ctrl+Alt+N / ＋」读到陈旧的
+      // has_history=false，走幂等分支 —— 快捷键静默不新建会话。
+      _agents = list || [];
+      reconcileCurrentSession();
       // 当前分支 streaming true→false：agent 完成。若 SSE 正常，消息已实时
       // 渲染（loadHistory 检测 box 非空会跳过）；若 SSE 断线（真机移动端常见），
       // box 为空 → loadHistory 从磁盘补拉 → 用户不需要刷新也能看到回复
       const curStreaming = snap[_currentBranch] === undefined ? false : !!snap[_currentBranch];
-      const prevStreaming = _agentsSnapshot[_currentBranch] === undefined ? false : !!_agentsSnapshot[_currentBranch];
+      const prevStreaming = prevSnap[_currentBranch] === undefined ? false : !!prevSnap[_currentBranch];
       if (prevStreaming && !curStreaming && !_streaming) loadHistory();
+      _agentsSnapshot = snap;   // 本轮快照存为下轮的"上一轮"（上面两处对比都用它）
       // header 活跃计数：其他分支正在工作的数量
       const busy = Object.keys(snap).filter((b) => snap[b] && b !== _currentBranch).length;
       const el = document.getElementById("ai-busy");
@@ -1044,6 +1056,17 @@
     newAgentFor(node ? (node.nodeData.data.uid || "") : "");
   }
   function newAgentFor(branch) {
+    // 决策前先取**即时** agents：has_history 随每次对话变化，缓存值可能是陈旧的
+    // false（曾出现「刚聊完按 Ctrl+Alt+N / ＋ 静默不新建会话」）。取不到就用缓存
+    // 兜底，不阻塞新建。pollTick 现在也会写回 _agents，这里再加一道即时读取。
+    fetch(api("agents"))
+      .then((r) => r.json())
+      .then((list) => { _agents = list || []; loadAgentLabel(); })
+      .catch(() => {})
+      .then(() => newAgentForDecided(branch));
+  }
+
+  function newAgentForDecided(branch) {
     // 「+」/ Ctrl+Alt+N 语义（上下文敏感）：
     // - 该分支已交流过（has_history）→ 新开一轮（reset 清会话，旧文件保留在历史）
     //   后端 reset 在 pi 正忙时只 detach（不 kill），旧进程后台跑完不被打断。

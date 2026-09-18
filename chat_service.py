@@ -130,6 +130,11 @@ MAPPING_PATH = SESSION_DIR / "mapping.json"
 # 前端可写的 provider key 存储（本机私有；打包模式放 ~/.comind/private，升级不丢）
 KEYS_PATH = Path(os.environ.get("SMM_KEYS_PATH") or (_DATA_DIR / "private" / "keys.json"))
 MODELS_PATH = SESSION_DIR / "models.json"
+# 思考等级锁定：全局默认等级（独立文件，与服务端 per-map 模型偏好解耦）。
+# 锁定后所有新 spawn 的 pi 会话（新建脑图、新分支会话、重启/驱逐后重建）都用
+# 它作为 --thinking 值，替代硬编码的 max；未锁定时仍用 DEFAULT_THINKING_LEVEL。
+THINKING_LOCK_PATH = SESSION_DIR / "thinking_lock.json"
+DEFAULT_THINKING_LEVEL = "max"
 UISTATE_PATH = SESSION_DIR / "uistate.json"
 MAX_SESSIONS = 5
 IDLE_TIMEOUT = 1800  # 30 min
@@ -503,11 +508,13 @@ class ChatSession:
     """Wraps one pi --mode rpc subprocess for a single (map, branch) pair."""
 
     def __init__(self, map_key: str, branch_uid: str = "", session_file: str | None = None, lang: str = "zh",
-                 map_state: dict | None = None):
+                 map_state: dict | None = None, thinking_level: str = DEFAULT_THINKING_LEVEL):
         self.map_key = map_key
         self.branch_uid = branch_uid or ""  # "" = root agent (full map)
         self.session_file = session_file
         self.lang = lang
+        # spawn 时的 --thinking 值（来自思考等级锁定，未锁定 = 默认 max）
+        self.thinking_level = thinking_level or DEFAULT_THINKING_LEVEL
         # manager._map_state 的引用（只读用，查分支名）；None 时 _branch_label 走磁盘兜底
         self._map_state = map_state
         # agent_end 时由宿主结算本轮回调（ChatSessionManager 注入）——轮次 diff 落盘
@@ -601,7 +608,7 @@ class ChatSession:
             "--mode", "rpc",
             "--provider", "deepseek",
             "--model", "deepseek-v4-flash",
-            "--thinking", "max",
+            "--thinking", self.thinking_level,
             "-e", str(EXT_PATH),
             "--session-dir", str(SESSION_DIR),
             "--session", self.session_file,
@@ -788,6 +795,8 @@ class ChatSessionManager:
         # per-map 写锁：同一脑图的 apply_ops/apply_map 串行化，防多 agent 并发写互相覆盖
         self._write_locks: dict[str, threading.Lock] = {}
         self._model_pref: dict[str, dict] = self._load_json(MODELS_PATH)
+        # 思考等级锁定：{locked: bool, level: str}。锁定后新 spawn 的会话用它作为 --thinking
+        self._thinking_lock: dict = self._load_thinking_lock()
         self._panel_state: dict[str, bool] = self._load_json(UISTATE_PATH)
         self._lang_pref: dict[str, str] = {}  # map_key → 界面语言（zh/en…）
         # per-map 写版本：AI 每次写盘 +1。前端画布版本与此对齐，
@@ -839,6 +848,14 @@ class ChatSessionManager:
                 pass
         return {}
 
+    def _load_thinking_lock(self) -> dict:
+        """读全局思考等级锁定（文件缺失/损坏 → 未锁定 + 默认等级）。"""
+        raw = self._load_json(THINKING_LOCK_PATH) or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        level = str(raw.get("level") or "").strip() or DEFAULT_THINKING_LEVEL
+        return {"locked": bool(raw.get("locked")), "level": level}
+
     @staticmethod
     def _save_json(path: Path, data: dict) -> None:
         try:
@@ -874,7 +891,8 @@ class ChatSessionManager:
                 self._mapping.pop(skey, None)
                 self._save_mapping()
                 session_file = None
-            sess = ChatSession(map_key, branch_uid, session_file, self._lang_pref.get(skey, "zh"), self._map_state)
+            sess = ChatSession(map_key, branch_uid, session_file, self._lang_pref.get(skey, "zh"), self._map_state,
+                               thinking_level=self.effective_thinking_level())
             # 轮次结算回调：agent_end 即落盘本轮 diff，不依赖 SSE 消费者
             sess.on_agent_end = lambda mk=map_key, bu=branch_uid: self.finalize_turn(mk, bu)
             sess.spawn()
@@ -1397,11 +1415,16 @@ class ChatSessionManager:
             models = (ev.get("data") or {}).get("models", [])
         st = self._rpc_request(sess, {"type": "get_state"})
         current = None
-        thinking_level = "max"
+        thinking_level = DEFAULT_THINKING_LEVEL
         if st and st.get("success"):
             current = (st.get("data") or {}).get("model")
-            thinking_level = (st.get("data") or {}).get("thinkingLevel", "max")
-        return {"models": models, "current": current, "thinkingLevel": thinking_level}
+            thinking_level = (st.get("data") or {}).get("thinkingLevel", DEFAULT_THINKING_LEVEL)
+        return {
+            "models": models,
+            "current": current,
+            "thinkingLevel": thinking_level,
+            "thinkingLock": self.get_thinking_lock(),
+        }
 
     def set_model(self, map_key: str, provider: str, model_id: str, branch_uid: str = "") -> bool:
         sess = self.get_or_spawn(map_key, branch_uid)
@@ -1427,6 +1450,24 @@ class ChatSessionManager:
         sess = self.get_or_spawn(map_key, branch_uid)
         ev = self._rpc_request(sess, {"type": "set_thinking_level", "level": level})
         return bool(ev and ev.get("success"))
+
+    # ─── 思考等级锁定（全局：新建脑图/新会话的默认思考等级）───
+
+    def get_thinking_lock(self) -> dict:
+        return dict(self._thinking_lock)
+
+    def set_thinking_lock(self, locked: bool, level: str = "") -> dict:
+        """锁定/解锁默认思考等级。level 为空时沿用已存等级。"""
+        level = (level or "").strip() or self._thinking_lock.get("level") or DEFAULT_THINKING_LEVEL
+        self._thinking_lock = {"locked": bool(locked), "level": level}
+        self._save_json(THINKING_LOCK_PATH, self._thinking_lock)
+        return dict(self._thinking_lock)
+
+    def effective_thinking_level(self) -> str:
+        """新 spawn 会话的 --thinking 值：锁定 → 锁定等级；未锁定 → 默认 max。"""
+        if self._thinking_lock.get("locked"):
+            return self._thinking_lock.get("level") or DEFAULT_THINKING_LEVEL
+        return DEFAULT_THINKING_LEVEL
 
     def _apply_model_pref(self, sess: ChatSession, pref: dict) -> None:
         try:

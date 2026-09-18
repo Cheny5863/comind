@@ -64,6 +64,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(chat_service, "MAPPING_PATH", session_dir / "mapping.json")
     monkeypatch.setattr(chat_service, "MODELS_PATH", session_dir / "models.json")
     monkeypatch.setattr(chat_service, "UISTATE_PATH", session_dir / "uistate.json")
+    monkeypatch.setattr(chat_service, "THINKING_LOCK_PATH", session_dir / "thinking_lock.json")
     monkeypatch.setattr(backend, "WORKSPACE", str(tmp_path))
     backend.chat_manager._map_state.clear()
     backend.chat_manager._map_snapshot.clear()
@@ -71,6 +72,7 @@ def env(tmp_path, monkeypatch):
     backend.chat_manager._mapping.clear()
     backend.chat_manager._sessions.clear()
     backend.chat_manager._model_pref.clear()
+    backend.chat_manager._thinking_lock = {"locked": False, "level": chat_service.DEFAULT_THINKING_LEVEL}
     backend.chat_manager._panel_state.clear()
     doc = sample_doc()
     (tmp_path / MAP_KEY).write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")

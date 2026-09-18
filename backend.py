@@ -611,6 +611,21 @@ def api_chat_thinking_level(map_key: str, body: ThinkingBody, branch: str = ""):
         raise HTTPException(400, "切换思考等级失败 / Thinking level switch failed")
     return {"status": "ok"}
 
+class ThinkingLockBody(BaseModel):
+    locked: bool = True
+    level: str = ""
+
+@app.get("/api/chat/{map_key}/thinking_lock")
+def api_chat_thinking_lock_get(map_key: str):
+    _check_map_key(map_key)
+    return chat_manager.get_thinking_lock()
+
+@app.post("/api/chat/{map_key}/thinking_lock")
+def api_chat_thinking_lock_post(map_key: str, body: ThinkingLockBody):
+    """锁定/解锁思考等级：锁定后所有新建脑图与新会话默认用该等级。"""
+    _check_map_key(map_key)
+    return chat_manager.set_thinking_lock(body.locked, body.level)
+
 class PanelBody(BaseModel):
     open: bool
 

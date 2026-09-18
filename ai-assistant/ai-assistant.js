@@ -40,6 +40,10 @@
       switchFailed: "切换失败",
       thinkingLevel: "思考等级",
       thinkingMax: "最大",
+      thinkingLock: "锁定思考等级",
+      thinkingLockHint: "锁定后所有新建脑图默认使用当前等级",
+      thinkingLocked: "🔒 已锁定 {level}：新建脑图默认用该等级",
+      thinkingUnlocked: "🔓 已解锁思考等级",
       loading: "加载中…",
       loadFailed: "加载失败",
       configured: "已配置 ✓",
@@ -116,6 +120,10 @@
       switchFailed: "Switch failed",
       thinkingLevel: "Thinking",
       thinkingMax: "Max",
+      thinkingLock: "Lock thinking level",
+      thinkingLockHint: "Locked: new mind maps default to the current level",
+      thinkingLocked: "🔒 Locked at {level}: new maps default to it",
+      thinkingUnlocked: "🔓 Thinking level unlocked",
       loading: "Loading…",
       loadFailed: "Load failed",
       configured: "Configured ✓",
@@ -331,6 +339,7 @@
         <select class="ai-provider-select" id="ai-provider" title="${t("providerTitle")}"></select>
         <select class="ai-model-select" id="ai-model" title="${t("modelTitle")}"></select>
         <select class="ai-thinking-select" id="ai-thinking" title="${t("thinkingLevel")}"></select>
+        <button class="ai-tool-btn ai-lock-btn" id="ai-thinking-lock" title="${t("thinkingLockHint")}">🔓</button>
         <button class="ai-tool-btn" id="ai-bg" title="${t("background")}">📝 <span>${t("background")}</span></button>
         <button class="ai-tool-btn" id="ai-settings" title="${t("settings")}">⚙️ <span>${t("settings")}</span></button>
       </div>
@@ -370,6 +379,7 @@
     document.getElementById("ai-provider").addEventListener("change", onProviderChange);
     document.getElementById("ai-model").addEventListener("change", onModelChange);
     document.getElementById("ai-thinking").addEventListener("change", onThinkingChange);
+    document.getElementById("ai-thinking-lock").addEventListener("click", onThinkingLockClick);
     // 点击左上角分支标签 → 脑图聚焦到该分支根节点
     document.getElementById("ai-agent-label").addEventListener("click", focusBranchNode);
 
@@ -1765,7 +1775,8 @@
       if (d.current && d.current.id) {
         sel.value = d.current.provider + "|" + d.current.id;
       }
-      // 加载思考等级
+      // 加载思考等级（含锁定状态）
+      setThinkingLock(d.thinkingLock);
       loadThinkingLevels(d.thinkingLevel || "max");
     }).catch(() => {});
   }
@@ -1810,25 +1821,72 @@
       onModelChange();
     }
   }
+  /* ── 思考等级锁定 ──
+     锁 = 把当前等级存成全局默认值：之后所有新建脑图 / 新分支会话 / 重启后重建的
+     会话，spawn pi 时都用这个等级（服务端 --thinking）。锁定期间切换等级会同步
+     更新默认值（一次操作即可改默认，不用先解锁）。 */
+  let _thinkingLock = { locked: false, level: "" };
+  function lockBtn() { return document.getElementById("ai-thinking-lock"); }
+  function renderThinkingLock() {
+    const btn = lockBtn();
+    if (!btn) return;
+    btn.textContent = _thinkingLock.locked ? "🔒" : "🔓";
+    btn.classList.toggle("locked", !!_thinkingLock.locked);
+    btn.title = _thinkingLock.locked
+      ? t("thinkingLocked", { level: _thinkingLock.level })
+      : t("thinkingLockHint");
+  }
+  function setThinkingLock(d) {
+    if (!d) return;
+    _thinkingLock = { locked: !!d.locked, level: d.level || "" };
+    renderThinkingLock();
+  }
+  function postThinkingLock(locked, level) {
+    return fetch(api("thinking_lock"), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ locked: locked, level: level || "" }),
+    }).then((r) => { if (!r.ok) throw new Error("lock failed"); return r.json(); })
+      .then((d) => { setThinkingLock(d); return d; });
+  }
+  function onThinkingLockClick() {
+    const sel = document.getElementById("ai-thinking");
+    const level = (sel && sel.value) || _thinkingLock.level;
+    const next = !_thinkingLock.locked;
+    postThinkingLock(next, level).then((d) => {
+      if (next) toast(t("thinkingLocked", { level: d.level || level }));
+      else toast(t("thinkingUnlocked"));
+    }).catch(() => toast(t("saveFailed")));
+  }
+
   function loadThinkingLevels(currentLevel) {
     const sel = document.getElementById("ai-thinking");
+    const btn = lockBtn();
     fetch(api("thinking_levels")).then((r) => r.json()).then((d) => {
       const levels = d.levels || [];
       sel.innerHTML = "";
       if (!levels.length) {
-        // 模型不支持 thinking，隐藏下拉框
+        // 模型不支持 thinking，隐藏下拉框与锁定按钮
         sel.style.display = "none";
+        if (btn) btn.style.display = "none";
         return;
       }
       sel.style.display = "";
+      if (btn) btn.style.display = "";
       levels.forEach((lv) => {
         const opt = document.createElement("option");
         opt.value = lv;
         opt.textContent = lv;
         sel.appendChild(opt);
       });
-      sel.value = currentLevel || levels[levels.length - 1] || "max";
-    }).catch(() => { sel.style.display = "none"; });
+      // 当前等级可能不被当前模型支持（如锁定了 Claude 的 xhigh 后切到别的模型）
+      // ——按 当前 → 锁定 → 最高 依次回退，避免下拉框空白
+      sel.value = levels.indexOf(currentLevel) >= 0 ? currentLevel
+        : (_thinkingLock.locked && levels.indexOf(_thinkingLock.level) >= 0) ? _thinkingLock.level
+        : (levels[levels.length - 1] || "max");
+    }).catch(() => {
+      sel.style.display = "none";
+      if (btn) btn.style.display = "none";
+    });
   }
   function onModelChange() {
     const sel = document.getElementById("ai-model");
@@ -1841,8 +1899,9 @@
       body: JSON.stringify({ provider: parts[0], model_id: parts[1] }),
     }).then((r) => {
       status.textContent = r.ok ? "" : t("switchFailed");
-      if (!r.ok) loadModels(); // 还原显示
-      else loadThinkingLevels("max"); // 换模型后刷新 thinking levels
+      // 换模型后重新拉服务端状态（模型/思考等级/锁定）——pi 会按新模型能力钳制等级，
+      // 只有 get_state 是权威值，本地猜测（"max"）会与实际不符
+      loadModels();
     }).catch(() => { status.textContent = t("switchFailed"); });
   }
   function onThinkingChange() {
@@ -1853,6 +1912,8 @@
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ level: level }),
     }).catch(() => {});
+    // 锁定中改等级 = 改全局默认值（否则新脑图还是旧锁定等级）
+    if (_thinkingLock.locked) postThinkingLock(true, level).catch(() => {});
   }
 
   /* ── 初始化 ── */

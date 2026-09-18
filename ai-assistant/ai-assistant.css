@@ -70,6 +70,9 @@
   white-space: nowrap; transition: color .15s, border-color .15s; line-height: 1;
 }
 .ai-tool-btn:hover { color: #409eff; border-color: #409eff; }
+.ai-lock-btn { padding: 5px 7px; font-size: 13px; }
+.ai-lock-btn.locked { color: #e6a23c; border-color: #e6a23c; background: #fdf6ec; }
+.ai-lock-btn.locked:hover { color: #e6a23c; border-color: #e6a23c; }
 
 /* ── 消息区 ── */
 .ai-messages {

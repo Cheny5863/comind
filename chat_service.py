@@ -6,10 +6,12 @@ tools (get_mindmap, get_mindmap_diff, update_mindmap).
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -17,6 +19,7 @@ import time
 import uuid
 import shutil
 import tempfile
+import urllib.request
 from collections import deque
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -602,7 +605,7 @@ class ChatSession:
         # agent 的通用能力（读代码/跑命令），与脑图分支隔离无关，不能砍。
         tools = ("read,grep,find,ls,write,edit,bash,"
                  "get_mindmap,get_mindmap_diff,get_subtree,get_background,"
-                 "update_mindmap,replace_mindmap,web_fetch")
+                 "get_node_image,update_mindmap,replace_mindmap,web_fetch")
 
         cmd = list(PI_LAUNCH) + [
             "--mode", "rpc",
@@ -1845,7 +1848,9 @@ def slim_tree(
         tag = data["tag"]
         extras.append(f"标签: {tag if isinstance(tag, str) else json.dumps(tag, ensure_ascii=False)}")
     if data.get("image"):
-        extras.append("含图片")
+        size = data.get("imageSize") or {}
+        w, h = size.get("width"), size.get("height")
+        extras.append(f"含图片 {w}x{h}" if w and h else "含图片")
     extra_str = (f"  〔{'；'.join(extras)}〕") if extras else ""
     count_str = ""
     if show_child_count:
@@ -1982,6 +1987,51 @@ def _find_path(root: dict, uid: str, path: list[str] | None = None) -> list[str]
         if res is not None:
             return res
     return None
+
+
+def node_image(manager: ChatSessionManager, key: str, uid: str, branch_uid: str = "") -> dict:
+    """读取节点图片（base64 + 真实尺寸），供 agent 的 get_node_image 工具看图。
+
+    分支收紧与 subtree 一致：分支 agent 只能读自己分支内的节点；但 imgMap 在
+    全图根节点上，所以 key 解析始终用全图根（否则分支内节点图片查不到数据）。
+    """
+    _ensure_map_state(manager, key)
+    current = manager._map_state.get(key)
+    if current is None:
+        return {"error": "no map state synced yet; frontend must POST /api/chat/{key}/sync first"}
+    full_root = _state_root(current)
+    if not isinstance(full_root, dict):
+        return {"error": "脑图为空"}
+    if branch_uid:
+        scope = _extract_branch_root(full_root, branch_uid)
+        if scope is None:
+            return {"error": "你的分支不存在或已被删除（根节点 uid 不在脑图中）"}
+        node = _index_by_uid(scope).get(uid)
+        if node is None:
+            return {"error": f"uid {uid} 不在你的分支内（你只能读取分支根 {branch_uid} 及其子孙节点）"}
+    else:
+        node = _index_by_uid(full_root).get(uid)
+        if node is None:
+            return {"error": f"uid {uid} 不存在（脑图已变化？重新调 get_mindmap 拿最新骨架）"}
+    data = node.get("data") or {}
+    src = _node_image_src(node, full_root)
+    if not src:
+        if data.get("image"):
+            return {"error": "该节点的图片数据已丢失（引用的 imgMap key 不存在），可能是历史数据损坏"}
+        return {"error": "该节点没有图片（get_mindmap / get_subtree 里带〔含图片〕的节点才有）"}
+    payload, err = _image_payload(src)
+    if payload is None:
+        return {"error": f"图片读取失败：{err}"}
+    size = data.get("imageSize") or {}
+    return {
+        "uid": uid,
+        "text": _strip_html(data.get("text", ""))[:200],
+        "mime": payload["mime"],
+        "width": int(size.get("width") or payload["width"] or 0),
+        "height": int(size.get("height") or payload["height"] or 0),
+        "bytes": payload["bytes"],
+        "data": payload["b64"],
+    }
 
 
 def subtree_slim(manager: ChatSessionManager, key: str, uid: str, branch_uid: str = "") -> dict:
@@ -2438,6 +2488,10 @@ def apply_map(manager: ChatSessionManager, key: str, tree: dict, branch_uid: str
         doc, file_md, old_by_uid, _ = _load_doc_for_write(manager, key)
         old_root = file_md.get("root", file_md)
         merged_root = _merge_ai_tree(tree, old_by_uid)
+        # 新节点带图（本地路径/URL）→ 解析成 imgMap + key；有错就整次替换失败
+        img_errs = _resolve_new_tree_images(merged_root)
+        if img_errs:
+            return "；".join(img_errs)
         new_data = dict(file_md)
         new_data["root"] = merged_root
         # 轮次 ops 记录：整树替换没有逐条 op，用 old/new diff 补充记录
@@ -2487,10 +2541,264 @@ def _new_node(text: str) -> dict:
     }
 
 
-def _node_from_spec(spec: dict) -> dict:
-    """从 op 描述递归构建子树（text + children）。"""
+# ---------------------------------------------------------------- 节点图片
+# 存储约定（与前端 NodeBase64ImageStorage 插件一致）：
+# - base64/data URL/本地文件 → 去重存进根节点 data.imgMap[key]，节点 data.image 只留 key
+# - http(s) 外链 → 原样存在节点 data.image
+# 这样同一张图被多个节点引用时只存一份，脑图文件也不会重复膨胀。
+IMAGE_MAX_BYTES = 8 * 1024 * 1024  # 单张图片原始字节上限
+_IMAGE_KEY_PREFIX = "smm_img_key_"
+
+
+def _image_mime_from_bytes(buf: bytes) -> str | None:
+    if buf.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if buf.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if buf[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if buf[:4] == b"RIFF" and buf[8:12] == b"WEBP":
+        return "image/webp"
+    if buf[:2] == b"BM":
+        return "image/bmp"
+    return None
+
+
+def _image_size_from_bytes(buf: bytes) -> tuple[int, int]:
+    """读 png/jpeg/gif/webp/bmp 的像素宽高；读不出返回 (0, 0)，由前端按默认尺寸渲染。"""
+    try:
+        if buf.startswith(b"\x89PNG\r\n\x1a\n"):
+            w, h = struct.unpack(">II", buf[16:24])
+            return int(w), int(h)
+        if buf[:6] in (b"GIF87a", b"GIF89a"):
+            w, h = struct.unpack("<HH", buf[6:10])
+            return int(w), int(h)
+        if buf[:2] == b"BM":
+            w, h = struct.unpack("<ii", buf[18:26])
+            return abs(int(w)), abs(int(h))
+        if buf[:4] == b"RIFF" and buf[8:12] == b"WEBP":
+            kind = buf[12:16]
+            if kind == b"VP8X":
+                return (int.from_bytes(buf[24:27], "little") + 1,
+                        int.from_bytes(buf[27:30], "little") + 1)
+            if kind == b"VP8 ":
+                return (int.from_bytes(buf[26:28], "little") & 0x3FFF,
+                        int.from_bytes(buf[28:30], "little") & 0x3FFF)
+            if kind == b"VP8L":
+                b = buf[21:25]
+                return (1 + (((b[1] & 0x3F) << 8) | b[0]),
+                        1 + (((b[3] & 0x0F) << 10) | (b[2] << 2) | ((b[1] & 0xC0) >> 6)))
+        if buf[:2] == b"\xff\xd8":
+            i = 2
+            while i + 9 < len(buf):
+                if buf[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = buf[i + 1]
+                if marker in (0xD8, 0xD9):
+                    i += 2
+                    continue
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    h = int.from_bytes(buf[i + 5:i + 7], "big")
+                    w = int.from_bytes(buf[i + 7:i + 9], "big")
+                    return w, h
+                i += 2 + int.from_bytes(buf[i + 2:i + 4], "big")
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _read_image_source(source: str) -> tuple[bytes | None, str, str]:
+    """读取图片源（本地文件路径 / data URL / http(s) URL）→ (原始字节, mime, 错误)。"""
+    src = (source or "").strip()
+    if not src:
+        return None, "", "图片源为空"
+    if src.startswith("data:"):
+        m = re.match(r"^data:([^;,]+);base64,(.*)$", src, re.S)
+        if not m:
+            return None, "", "不支持的 data URL（只接受 base64 编码的图片）"
+        try:
+            raw = base64.b64decode(m.group(2), validate=False)
+        except Exception:
+            return None, "", "data URL 的 base64 解码失败"
+    elif src.startswith(("http://", "https://")):
+        try:
+            req = urllib.request.Request(src, headers={"User-Agent": "comind-agent/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read(IMAGE_MAX_BYTES + 1)
+        except Exception as exc:
+            return None, "", f"下载图片失败：{exc}"
+    else:
+        path = Path(src).expanduser()
+        if not path.is_file():
+            return None, "", f"图片文件不存在：{src}"
+        try:
+            raw = path.read_bytes()
+        except Exception as exc:
+            return None, "", f"读取图片失败：{exc}"
+    if len(raw) > IMAGE_MAX_BYTES:
+        return None, "", (f"图片过大（{len(raw) // 1024} KB），上限 {IMAGE_MAX_BYTES // 1024} KB；"
+                          "请先压缩/缩小尺寸（例如 matplotlib 用 dpi=100、figsize 不大于 8x5）")
+    mime = _image_mime_from_bytes(raw)
+    if not mime:
+        return None, "", "不是受支持的图片格式（仅支持 png/jpeg/gif/webp/bmp）"
+    return raw, mime, ""
+
+
+def _image_payload(source: str) -> tuple[dict | None, str]:
+    """解析图片源为可直接下发的 payload；失败返回 (None, 错误文本)。"""
+    raw, mime, err = _read_image_source(source)
+    if raw is None:
+        return None, err
+    width, height = _image_size_from_bytes(raw)
+    b64 = base64.b64encode(raw).decode("ascii")
+    return {
+        "dataurl": f"data:{mime};base64,{b64}",
+        "b64": b64,
+        "mime": mime,
+        "width": width,
+        "height": height,
+        "bytes": len(raw),
+    }, ""
+
+
+def _img_map(root: dict) -> dict:
+    root_data = root.setdefault("data", {})
+    img_map = root_data.get("imgMap")
+    if not isinstance(img_map, dict):
+        img_map = {}
+        root_data["imgMap"] = img_map
+    return img_map
+
+
+def _node_image_src(node: dict, root: dict) -> str:
+    """节点图片的真实地址：imgMap key → data URL；其余（外链/内联 base64）原样返回。"""
+    src = (node.get("data") or {}).get("image") or ""
+    if src.startswith(_IMAGE_KEY_PREFIX):
+        return _img_map(root).get(src) or ""
+    return src
+
+
+def _migrate_inline_image(root: dict, node: dict) -> None:
+    """把节点里内联的 base64 图片迁进根节点 imgMap。
+
+    回滚 diff 要记录图片前后值；内联 base64 动辄几百 KB，直接进 turns.json 会把
+    轮次文件撑爆。迁移成短 key 后 diff 只存 key + 单条 imgMap 数据。
+    """
+    data = node.get("data") or {}
+    src = data.get("image") or ""
+    if not src.startswith("data:"):
+        return
+    img_map = _img_map(root)
+    key = next((k for k, v in img_map.items() if v == src), "")
+    if not key:
+        key = _IMAGE_KEY_PREFIX + uuid.uuid4().hex[:12]
+        img_map[key] = src
+    data["image"] = key
+
+
+def _set_node_image(root: dict, node: dict, source: str, title: str = "") -> str:
+    """给节点写入图片。source 支持本地路径 / data URL / http(s) URL，空串 = 删除。
+
+    成功返回空串，失败返回错误文本（调用方必须把错误报给 agent，不能假成功）。
+    """
+    data = node.setdefault("data", {})
+    src = (source or "").strip()
+    if not src:
+        for k in ("image", "imageSize", "imageTitle"):
+            data.pop(k, None)
+        return ""
+    payload, err = _image_payload(src)
+    if payload is None:
+        return err
+    img_map = _img_map(root)
+    key = next((k for k, v in img_map.items() if v == payload["dataurl"]), "")
+    if not key:
+        key = _IMAGE_KEY_PREFIX + uuid.uuid4().hex[:12]
+        img_map[key] = payload["dataurl"]
+    data["image"] = key
+    # custom=False：由前端按主题 imgMaxWidth/imgMaxHeight 等比缩放，图不会被撑爆
+    data["imageSize"] = {
+        "width": payload["width"] or 200,
+        "height": payload["height"] or 200,
+        "custom": False,
+    }
+    if title:
+        data["imageTitle"] = title
+    else:
+        data.pop("imageTitle", None)
+    return ""
+
+
+def _restore_node_image(root: dict, node: dict, before: dict) -> None:
+    """回滚用：把节点图片字段恢复成 before 记录（image/imageSize/imageTitle/imgMap）。"""
+    data = node.setdefault("data", {})
+    before = before or {}
+    img = before.get("image") or ""
+    if not img:
+        for k in ("image", "imageSize", "imageTitle"):
+            data.pop(k, None)
+        return
+    if img.startswith(_IMAGE_KEY_PREFIX):
+        img_map = _img_map(root)
+        for k, v in (before.get("imgMap") or {}).items():
+            if v:
+                img_map[k] = v
+        if img not in img_map:
+            # 图片数据已经丢了（imgMap 被清理），不恢复一个渲染空白的 key
+            data.pop("image", None)
+            return
+    data["image"] = img
+    if before.get("imageSize"):
+        data["imageSize"] = deepcopy(before["imageSize"])
+    if before.get("imageTitle"):
+        data["imageTitle"] = before["imageTitle"]
+    else:
+        data.pop("imageTitle", None)
+
+
+def _resolve_new_tree_images(root: dict) -> list[str]:
+    """replace_mindmap 的收尾：新节点上给的是文件路径/URL 时，转成 imgMap + key。
+
+    replace_mindmap 允许新节点自带 image 字段；若 AI 写的是本地路径，直接落盘会
+    变成渲染不出来的坏链接。这里统一解析（失败返回错误，整次替换不提交）。
+    已有节点（uid 相同）在合并阶段只继承 text，不会走到这里。
+    """
+    errs: list[str] = []
+
+    def walk(node: dict) -> None:
+        data = node.get("data")
+        if isinstance(data, dict):
+            img = data.get("image")
+            if (isinstance(img, str) and img
+                    and not img.startswith(("data:", "http://", "https://", _IMAGE_KEY_PREFIX))):
+                holder = {"data": data, "children": []}
+                err = _set_node_image(root, holder, img, data.get("imageTitle") or "")
+                if err:
+                    errs.append(err)
+                    data.pop("image", None)
+                    data.pop("imageSize", None)
+        for c in node.get("children") or []:
+            if isinstance(c, dict):
+                walk(c)
+
+    walk(root)
+    return errs
+
+
+def _node_from_spec(spec: dict, root: dict | None = None, errs: list[str] | None = None) -> dict:
+    """从 op 描述递归构建子树（text/note/image + children）。"""
     node = _new_node(spec.get("text", ""))
-    node["children"] = [_node_from_spec(c) for c in spec.get("children", []) or []]
+    data = node["data"]
+    if spec.get("note"):
+        data["note"] = spec["note"]
+    if spec.get("hyperlink"):
+        data["hyperlink"] = spec["hyperlink"]
+    if root is not None and "image" in spec and (spec.get("image") or ""):
+        err = _set_node_image(root, node, spec.get("image") or "", spec.get("imageTitle") or spec.get("title") or "")
+        if err and errs is not None:
+            errs.append(err)
+    node["children"] = [_node_from_spec(c, root, errs) for c in spec.get("children", []) or []]
     return node
 
 
@@ -2624,7 +2932,7 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
         action = op.get("action")
         uid = op.get("uid", "")
         # P3: 人类编辑锁——目标节点正被人编辑时跳过该 op（不整批失败）
-        if human_locked_uid and uid and uid == human_locked_uid and action in ("update_text", "delete", "move"):
+        if human_locked_uid and uid and uid == human_locked_uid and action in ("update_text", "delete", "move", "set_image"):
             skipped_human.append(uid)
             continue
         if action == "update_text":
@@ -2658,7 +2966,11 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
             # add 的父节点必须在分支内；新增子节点天然挂在分支内
             if not check_allowed(parent.get("data", {}).get("uid", ""), i, "父节点"):
                 continue
-            node = _node_from_spec(op)
+            node = _node_from_spec(op, root, spec_errs := [])
+            if spec_errs:
+                # 图片解析失败就整条 add 失败：不能只加文字、悄悄丢图（假成功）
+                errors.extend(f"op[{i}]: {e}" for e in spec_errs)
+                continue
             insert_child(parent, node, op.get("index"))
             _register_subtree(node, old_by_uid)
             # 新节点挂在分支内父节点下，天然属于本分支；注册进 parent 链，
@@ -2733,6 +3045,41 @@ def _apply_ops_locked(manager: ChatSessionManager, key: str, ops: list, branch_u
                     "uid": uid, "action": "move",
                     "before": {"parent_uid": old_parent_uid},
                     "after": {"parent_uid": np_uid},
+                })
+        elif action == "set_image":
+            if not check_allowed(uid, i, "目标节点"):
+                continue
+            node = old_by_uid.get(uid)
+            if not node:
+                errors.append(f"op[{i}]: uid {uid} 不存在")
+                continue
+            # 先把内联 base64 迁成 imgMap key，回滚 diff 才不会塞进几百 KB 的图
+            _migrate_inline_image(root, node)
+            old_data = node.get("data") or {}
+            before = {"image": old_data.get("image", "")}
+            for k in ("imageSize", "imageTitle"):
+                if k in old_data:
+                    before[k] = deepcopy(old_data[k])
+            if before["image"].startswith(_IMAGE_KEY_PREFIX):
+                before["imgMap"] = {before["image"]: _node_image_src(node, root)}
+            source = op.get("source", op.get("image", ""))
+            title = op.get("imageTitle", op.get("title", "")) or ""
+            err = _set_node_image(root, node, source, title)
+            if err:
+                errors.append(f"op[{i}]: {err}")
+                continue
+            applied += 1
+            if turn_ops is not None:
+                new_data = node.get("data") or {}
+                after = {"image": new_data.get("image", "")}
+                for k in ("imageSize", "imageTitle"):
+                    if k in new_data:
+                        after[k] = deepcopy(new_data[k])
+                if after["image"].startswith(_IMAGE_KEY_PREFIX):
+                    after["imgMap"] = {after["image"]: _node_image_src(node, root)}
+                turn_ops.append({
+                    "uid": uid, "action": "set_image",
+                    "before": before, "after": after,
                 })
         else:
             errors.append(f"op[{i}]: 未知 action {action!r}")
@@ -2961,11 +3308,15 @@ def _compute_net_diff(before_root: dict, after_root: dict) -> list[dict]:
             continue
         old_d = before_idx[uid].get("data") or {}
         new_d = after_idx[uid].get("data") or {}
-        if old_d.get("text") != new_d.get("text") or old_d.get("note") != new_d.get("note"):
+        if (old_d.get("text") != new_d.get("text")
+                or old_d.get("note") != new_d.get("note")
+                or old_d.get("image") != new_d.get("image")):
             diffs.append({
                 "uid": uid, "action": "update_text",
-                "before": {"text": old_d.get("text", ""), "note": old_d.get("note", "")},
-                "after": {"text": new_d.get("text", ""), "note": new_d.get("note", "")},
+                "before": {"text": old_d.get("text", ""), "note": old_d.get("note", ""),
+                           "image": old_d.get("image", "")},
+                "after": {"text": new_d.get("text", ""), "note": new_d.get("note", ""),
+                          "image": new_d.get("image", "")},
             })
         elif before_parents.get(uid) != after_parents.get(uid):
             diffs.append({
@@ -3016,15 +3367,33 @@ def _build_reverse_ops(later_diffs: list[dict], current_idx: dict, current_paren
         elif action == "update_text":
             node = current_idx.get(uid)
             after_text = (d.get("after") or {}).get("text", "")
+            cur_data = (node or {}).get("data") or {}
             if not node:
                 skipped.append({"uid": uid, "why": "节点已不存在"})
-            elif (node.get("data") or {}).get("text", "") != after_text:
+            elif cur_data.get("text", "") != after_text:
                 skipped.append({"uid": uid, "why": "你已手动修改过该节点"})
+            elif "image" in (d.get("after") or {}) and cur_data.get("image", "") != (d["after"] or {}).get("image", ""):
+                skipped.append({"uid": uid, "why": "你已手动修改过该节点的图片"})
             else:
-                ops.append({
+                op = {
                     "action": "update_text", "uid": uid,
                     "text": d["before"].get("text", ""),
                     "note": d["before"].get("note", ""),
+                }
+                if "image" in d["before"]:
+                    op["image"] = d["before"].get("image", "")
+                ops.append(op)
+        elif action == "set_image":
+            node = current_idx.get(uid)
+            after_img = (d.get("after") or {}).get("image", "")
+            if not node:
+                skipped.append({"uid": uid, "why": "节点已不存在"})
+            elif ((node.get("data") or {}).get("image") or "") != after_img:
+                skipped.append({"uid": uid, "why": "你已手动修改过该节点的图片"})
+            else:
+                ops.append({
+                    "action": "set_image", "uid": uid,
+                    "before": d.get("before") or {},
                 })
         elif action == "move":
             node = current_idx.get(uid)
@@ -3108,6 +3477,14 @@ def _apply_reverse(manager: ChatSessionManager, key: str, later_diffs: list[dict
                 node["data"]["text"] = t
                 if "note" in op:
                     node["data"]["note"] = op.get("note") or ""
+                if "image" in op:
+                    _restore_node_image(root, node, {"image": op.get("image") or ""})
+            elif op["action"] == "set_image":
+                node = old_by_uid.get(uid)
+                if not node:
+                    skipped.append({"uid": uid, "why": "节点已不存在"})
+                    continue
+                _restore_node_image(root, node, op.get("before") or {})
             elif op["action"] == "move":
                 node = old_by_uid.get(uid)
                 new_parent = old_by_uid.get(op.get("parent_uid", ""))

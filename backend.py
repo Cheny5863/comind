@@ -734,6 +734,14 @@ def api_mindmap_subtree(key: str = Query(...), uid: str = Query(...), branch: st
         raise HTTPException(400, result["error"])
     return result
 
+@app.get("/api/mindmap/node_image")
+def api_mindmap_node_image(key: str = Query(...), uid: str = Query(...), branch: str = ""):
+    _check_map_key(key)
+    result = chat_service.node_image(chat_manager, key, uid, branch)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
 @app.get("/api/mindmap/diff")
 def api_mindmap_diff(key: str = Query(...), branch: str = ""):
     _check_map_key(key)

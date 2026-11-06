@@ -77,7 +77,44 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Tool 3: get_background — user-written background info for this map
+  // Tool 3: get_node_image — 看节点图片（多模态，返回真实图片给模型）
+  pi.registerTool({
+    name: "get_node_image",
+    label: "Get Node Image",
+    description:
+      "读取某个节点上的图片，直接把图片内容返回给你看（多模态）。get_mindmap / get_subtree 里标了〔含图片〕的节点才用；uid 必须在你的分支内。图片很大时只用于理解内容，不要尝试把 base64 抄进文本。",
+    parameters: Type.Object({
+      uid: Type.String({ description: "目标节点 uid（来自 get_mindmap / get_subtree / get_mindmap_diff）" }),
+    }),
+    async execute(_toolCallId: string, params: { uid: string }) {
+      const raw = await apiFetch(
+        `/api/mindmap/node_image?key=${K}&uid=${encodeURIComponent(params.uid)}&branch=${B}`
+      );
+      let res: any = null;
+      try {
+        res = JSON.parse(raw);
+      } catch (_) {}
+      if (!res || res.error) {
+        return {
+          content: [{ type: "text" as const, text: `读取节点图片失败：${res?.error || raw}` }],
+          details: {},
+          isError: true,
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `节点「${res.text || res.uid}」的图片（${res.mime}，${res.width}x${res.height}）`,
+          },
+          { type: "image" as const, data: res.data, mimeType: res.mime },
+        ],
+        details: {},
+      };
+    },
+  });
+
+  // Tool 4: get_background — user-written background info for this map
   pi.registerTool({
     name: "get_background",
     label: "Get Background",
@@ -96,14 +133,18 @@ export default function (pi: ExtensionAPI) {
     description:
       "增量修改脑图（首选）。ops 数组：" +
       "{action:'update_text',uid,text} 改节点文本；" +
-      "{action:'add',parent_uid|parent_ref,text,children?,index?,ref?} 新增子节点/子树，ref 给新节点起临时名供同批次后续 op 引用；" +
+      "{action:'add',parent_uid|parent_ref,text,children?,index?,ref?,image?,note?} 新增子节点/子树，ref 给新节点起临时名供同批次后续 op 引用，image 可直接给新节点配图；" +
+      "{action:'set_image',uid,source,imageTitle?} 给节点加/换/删图片（source 为空 = 删图）；" +
       "{action:'delete',uid} 删除节点；" +
       "{action:'move',uid,new_parent_uid|new_parent_ref,index?} 移动节点。" +
-      "小改动只发对应 op，不要给整棵树。⚠️ 若你绑定分支，只能操作你分支内的节点（分支根及其子孙），涉及分支外节点会被后端拒绝；且不能删除/移动你的分支根节点。",
+      "小改动只发对应 op，不要给整棵树。" +
+      "图片：source 可以是本地文件绝对路径（如 /tmp/chart.png）、http(s) URL 或 data URL；" +
+      "支持 png/jpeg/gif/webp/bmp，单张 ≤8MB。要画图就先用 bash 跑脚本（matplotlib 可用）生成 png 再 set_image，不要手写 base64。" +
+      "⚠️ 若你绑定分支，只能操作你分支内的节点（分支根及其子孙），涉及分支外节点会被后端拒绝；且不能删除/移动你的分支根节点。",
     parameters: Type.Object({
       ops: Type.Array(Type.Object({
-        action: Type.String({ description: "update_text / add / delete / move" }),
-        uid: Type.Optional(Type.String({ description: "目标节点 uid（update_text/delete/move 必填）" })),
+        action: Type.String({ description: "update_text / add / delete / move / set_image" }),
+        uid: Type.Optional(Type.String({ description: "目标节点 uid（update_text/delete/move/set_image 必填）" })),
         parent_uid: Type.Optional(Type.String({ description: "父节点 uid（add 时与 parent_ref 二选一）" })),
         parent_ref: Type.Optional(Type.String({ description: "同批次前面 add 的 ref（add 时与 parent_uid 二选一）" })),
         new_parent_uid: Type.Optional(Type.String({ description: "新父节点 uid（move 必填）" })),
@@ -111,7 +152,11 @@ export default function (pi: ExtensionAPI) {
         text: Type.Optional(Type.String({ description: "节点文本（update_text/add 必填）" })),
         index: Type.Optional(Type.Number({ description: "插入位置（add/move 可选，默认末尾）" })),
         ref: Type.Optional(Type.String({ description: "给新节点起临时名（add 可选），同批次可引用" })),
-        children: Type.Optional(Type.Array(Type.Object({}, { additionalProperties: true }), { description: "子树（add 可选），递归 {text, children}" })),
+        image: Type.Optional(Type.String({ description: "图片源（add 可选）：本地路径 / http(s) URL / data URL" })),
+        source: Type.Optional(Type.String({ description: "图片源（set_image 必填，空串 = 删除图片）：本地路径 / http(s) URL / data URL" })),
+        imageTitle: Type.Optional(Type.String({ description: "图片悬停标题（可选）" })),
+        note: Type.Optional(Type.String({ description: "节点备注 HTML（add 可选）" })),
+        children: Type.Optional(Type.Array(Type.Object({}, { additionalProperties: true }), { description: "子树（add 可选），递归 {text, children, image?}" })),
       })),
     }),
     async execute(_toolCallId: string, params: { ops: any[] }) {

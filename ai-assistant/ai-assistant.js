@@ -1489,8 +1489,22 @@
     }
     return false;
   }
+  // 光标移到最后（chip 之后）：insertQuoteChip 里 focus() 会把光标放在内容开头（chip 之前），
+  // 用户接着打字就会打到引用前面，必须显式把选区移到末尾
+  function placeCaretAtEnd(el) {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } catch (_) {}
+  }
   function insertQuoteChip(uid, text, note) {
     const input = document.getElementById("ai-input");
+    // 先聚焦再插入，插入完再把光标放到末尾（chip 之后）
+    input.focus();
     const chip = document.createElement("span");
     chip.className = "ai-quote-chip";
     chip.contentEditable = "false";
@@ -1499,15 +1513,20 @@
     chip.dataset.note = note || "";
     const label = text.length > 20 ? text.slice(0, 20) + "…" : text;
     chip.innerHTML = "<span>📎 " + esc(label) + '</span><span class="x">✕</span>';
+    const space = document.createTextNode(" ");
     chip.querySelector(".x").addEventListener("click", (ev) => {
-      ev.stopPropagation(); chip.remove();
+      // ✕ 手工删时连带清掉插入时的分隔空格，别在输入框里留孤儿空格
+      ev.stopPropagation();
+      chip.remove();
+      if (space.isConnected && !space.textContent.trim()) space.remove();
     });
     chip.addEventListener("click", () => focusNode(uid));
-    const space = document.createTextNode(" ");
     input.appendChild(chip);
     input.appendChild(space);
     _chipUndo.push({ chip, space, typedText: inputTypedText() });
-    input.focus();
+    // 立即 + 下一帧各放一次：先聚焦时库/浏览器可能异步重置选区
+    placeCaretAtEnd(input);
+    requestAnimationFrame(() => placeCaretAtEnd(input));
   }
   function focusNode(uid) {
     if (!_mindMap) return;

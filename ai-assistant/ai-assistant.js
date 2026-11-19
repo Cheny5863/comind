@@ -1451,14 +1451,56 @@
       (e.key === "z" || e.key === "Z" || e.code === "KeyZ");
     if (isUndo && undoQuoteChip()) { e.preventDefault(); return; }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); return; }
-    if (e.key === "Escape") {
-      // Esc：取消输入框对焦回到脑图；有选中节点则居中回到该节点，无选中则仅失焦
+    // Esc 由 installEscBackToCanvas 的 document 级监听统一处理（焦点不在输入框时也要生效）
+  }
+
+  /* ── Esc：退出 AI 面板焦点 → 回到画布 + 居中当前选中节点 ──
+   * 只挂在 #ai-input 上时，聊完天去画布点选节点（焦点在画布）再按 Esc 就什么都不做——
+   * 这是「明明选中了节点，按 Esc 却不居中」的根因。改成 document 级监听：
+   * 面板打开时，除面板里的文本域/节点文字编辑框外，Esc 一律回到画布并居中。
+   */
+  let _lastActiveUid = "";
+  function lastActiveNode() {
+    // 选中列表被清掉时（重渲染/主题切换/setData）兜底：用最近一次点选的节点，
+    // uid 仍存在于当前树才用（节点被删则放弃）
+    if (!_lastActiveUid || !_mindMap || !_mindMap.renderer) return null;
+    return findNodeByUid(_mindMap.renderer.root, _lastActiveUid);
+  }
+  function flipBackToCanvas() {
+    const ae = document.activeElement;
+    if (ae && ae.closest && ae.closest("#ai-panel")) ae.blur();
+    const node = activeNode() || lastActiveNode();
+    if (node) {
+      // 选中列表被外部清空时顺手恢复选中，用户心算的「当前节点」不会丢
+      if (!activeNode()) { try { _mindMap.renderer.addNodeToActiveList(node, true); } catch (_) {} }
+      try { _mindMap.renderer.moveNodeToCenter(node); } catch (_) {}
+    }
+  }
+  function installEscBackToCanvas(mindMap) {
+    mindMap.on("node_active", (node, list) => {
+      const n = (list && list[0]) || node;
+      const uid = n && n.nodeData && n.nodeData.data && n.nodeData.data.uid;
+      if (uid) _lastActiveUid = uid;
+    });
+    // 点画布空白 = 主动取消选中，同时忘掉上次选中（避免 Esc 把老节点又选回来）
+    mindMap.on("draw_click", () => { _lastActiveUid = ""; });
+    document.addEventListener("keydown", (e) => {
+      // 中文输入法组合中 Esc 是用来取消组合的（此时 key 可能是 Process/Unidentified，
+      // keyCode 229 且 isComposing=true）——绝不能抢，否则打字取消拼音就跳出输入框
+      if (e.isComposing) return;
+      const isEsc = e.key === "Escape" || e.keyCode === 27 || e.code === "Escape";
+      if (!isEsc) return;
+      const panel = document.getElementById("ai-panel");
+      if (!panel || panel.classList.contains("hidden")) return;
+      const tag = (e.target.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea") return; // 面板里的文本域自己处理 Esc
+      const ae = document.activeElement;
+      // 正在双击编辑节点文字时不抢
+      if (ae && ae.closest && ae.closest(".smm-richtext-node-edit-wrap, .smm-node-edit-wrap")) return;
       e.preventDefault();
       e.stopPropagation();
-      document.getElementById("ai-input").blur();
-      const node = activeNode();
-      if (node) { try { _mindMap.renderer.moveNodeToCenter(node); } catch (_) {} }
-    }
+      flipBackToCanvas();
+    });
   }
 
   /* ── 节点引用 chip ── */
@@ -2106,6 +2148,7 @@
     installShortcutGuard(mindMap);
     installReservedPadding(mindMap);
     installCenterWithPanel(mindMap);
+    installEscBackToCanvas(mindMap);
     if (document.getElementById("ai-fab")) return;
     createDOM();
     // 暴露给顶栏 AI 按钮（ToolbarNodeBtnList.vue aiAssist）

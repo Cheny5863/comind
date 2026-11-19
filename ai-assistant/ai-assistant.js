@@ -1446,6 +1446,10 @@
   }
 
   function onInputKeydown(e) {
+    // Ctrl/Cmd+Z：删掉最近插入的引用 chip（chip 不在浏览器原生撤销栈里）
+    const isUndo = (e.ctrlKey || e.metaKey) && !e.shiftKey &&
+      (e.key === "z" || e.key === "Z" || e.code === "KeyZ");
+    if (isUndo && undoQuoteChip()) { e.preventDefault(); return; }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); return; }
     if (e.key === "Escape") {
       // Esc：取消输入框对焦回到脑图；有选中节点则居中回到该节点，无选中则仅失焦
@@ -1458,6 +1462,33 @@
   }
 
   /* ── 节点引用 chip ── */
+  // chip 是脚本 appendChild 插进来的 DOM，浏览器的原生撤销栈不记录它 →
+  // 插入后按 Ctrl+Z 没反应。这里自己维护插入栈：Ctrl+Z 按 LIFO 删掉最近插入的
+  // chip（连带插入时的分隔空格）；插入后用户又在输入框打过字则让位给浏览器原生
+  // 撤销（先撤字，再撤 chip），避免「想撤字结果 chip 飞了」。
+  const _chipUndo = [];
+  function inputTypedText() {
+    const input = document.getElementById("ai-input");
+    if (!input) return "";
+    let t = "";
+    input.childNodes.forEach((node) => {
+      if (node.nodeType === Node.TEXT_NODE) t += node.textContent;
+      else if (!(node.classList && node.classList.contains("ai-quote-chip"))) t += (node.textContent || "");
+    });
+    return t.replace(/\s+/g, " ").trim();
+  }
+  function undoQuoteChip() {
+    while (_chipUndo.length) {
+      const rec = _chipUndo[_chipUndo.length - 1];
+      if (!rec.chip.isConnected) { _chipUndo.pop(); continue; }
+      if (inputTypedText() !== rec.typedText) return false; // 插入后打过字 → 交给原生撤销
+      rec.chip.remove();
+      if (rec.space && rec.space.isConnected && !rec.space.textContent.trim()) rec.space.remove();
+      _chipUndo.pop();
+      return true;
+    }
+    return false;
+  }
   function insertQuoteChip(uid, text, note) {
     const input = document.getElementById("ai-input");
     const chip = document.createElement("span");
@@ -1472,8 +1503,10 @@
       ev.stopPropagation(); chip.remove();
     });
     chip.addEventListener("click", () => focusNode(uid));
+    const space = document.createTextNode(" ");
     input.appendChild(chip);
-    input.appendChild(document.createTextNode(" "));
+    input.appendChild(space);
+    _chipUndo.push({ chip, space, typedText: inputTypedText() });
     input.focus();
   }
   function focusNode(uid) {

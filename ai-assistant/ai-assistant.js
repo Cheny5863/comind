@@ -1965,6 +1965,73 @@
     };
   }
 
+  /* ── 居中定位避让 AI 面板 ──
+   * 库的 renderer.moveNodeToCenter 以整块画布中心为目标，面板浮在画布上时
+   * 居中后节点可能被面板盖住。这里覆写该方法：先把面板矩形从画布可用区里
+   * 抠掉，取剩余区域中最大的一块（上/下/左/右四条带）的中心作为居中目标。
+   * 方向键切换节点（KeyboardNavigation → GO_TARGET_NODE）、搜索定位、大纲定位、
+   * Esc 回位、回到中心主题全都走这个方法，一处覆盖。
+   * 面板未打开/未遮挡画布时行为与原生完全一致。
+   */
+  const MIN_BAND = 80; // 可用带子小于这个尺寸视为不可用（贴在画布边的残条）
+  function unobstructedCenter(mindMap) {
+    const el = mindMap && mindMap.el;
+    const panel = document.getElementById("ai-panel");
+    if (!el || !panel || panel.classList.contains("hidden")) return null;
+    const er = el.getBoundingClientRect();
+    const pr = panel.getBoundingClientRect();
+    if (!er.width || !er.height || !pr.width || !pr.height) return null;
+    // 面板矩形换算到画布局部坐标
+    const l = pr.left - er.left, t = pr.top - er.top;
+    const r = pr.right - er.left, b = pr.bottom - er.top;
+    // 完全没盖住画布
+    if (r <= 0 || l >= er.width || b <= 0 || t >= er.height) return null;
+    const cx = Math.min(Math.max(l, 0), er.width);   // 面板左边裁到画布内
+    const cr = Math.min(Math.max(r, 0), er.width);   // 面板右边
+    const ct = Math.min(Math.max(t, 0), er.height);
+    const cb = Math.min(Math.max(b, 0), er.height);
+    const bands = [
+      { x: 0, y: 0, w: cx, h: er.height },                    // 面板左侧
+      { x: cr, y: 0, w: er.width - cr, h: er.height },        // 面板右侧
+      { x: 0, y: 0, w: er.width, h: ct },                     // 面板上方
+      { x: 0, y: cb, w: er.width, h: er.height - cb },        // 面板下方
+    ];
+    let best = null;
+    for (let i = 0; i < bands.length; i++) {
+      const bd = bands[i];
+      if (bd.w < MIN_BAND || bd.h < MIN_BAND) continue;
+      if (!best || bd.w * bd.h > best.w * best.h) best = bd;
+    }
+    if (!best) return null;
+    return { x: best.x + best.w / 2, y: best.y + best.h / 2 };
+  }
+
+  function installCenterWithPanel(mindMap) {
+    const renderer = mindMap && mindMap.renderer;
+    if (!renderer || typeof renderer.moveNodeToCenter !== "function") return;
+    if (renderer.__comindCenterPatched) return;
+    renderer.__comindCenterPatched = true;
+    const orig = renderer.moveNodeToCenter;
+    renderer.moveNodeToCenter = function (node, resetScale) {
+      let center = null;
+      try { center = unobstructedCenter(mindMap); } catch (_) { center = null; }
+      if (!center || !node) return orig.call(this, node, resetScale);
+      let resetScaleOnMoveNodeToCenter = mindMap.opt.resetScaleOnMoveNodeToCenter;
+      if (resetScale !== undefined) resetScaleOnMoveNodeToCenter = resetScale;
+      const { transform, state } = mindMap.view.getTransformData();
+      let { left, top, width, height } = node;
+      if (!resetScaleOnMoveNodeToCenter) {
+        left *= transform.scaleX; top *= transform.scaleY;
+        width *= transform.scaleX; height *= transform.scaleY;
+      }
+      const offsetX = center.x - state.x - (left + width / 2);
+      const offsetY = center.y - state.y - (top + height / 2);
+      mindMap.view.translateX(offsetX);
+      mindMap.view.translateY(offsetY);
+      if (resetScaleOnMoveNodeToCenter) mindMap.view.setScale(1);
+    };
+  }
+
   /* ── 语言切换：收到 lang_change 事件后重建面板 DOM ── */
   function rebuildForLang() {
     _lang = null; // 清缓存，下次 lang() 重新从 localStorage 读
@@ -1986,6 +2053,7 @@
     _mindMap = mindMap;
     installShortcutGuard(mindMap);
     installReservedPadding(mindMap);
+    installCenterWithPanel(mindMap);
     if (document.getElementById("ai-fab")) return;
     createDOM();
     // 暴露给顶栏 AI 按钮（ToolbarNodeBtnList.vue aiAssist）
